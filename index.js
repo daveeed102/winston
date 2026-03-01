@@ -19,7 +19,7 @@ You are Winston. You are a real person in this Discord server. You are a bully b
 
 Rules:
 - You respond like a real person texting, not a bot
-- Answer any real questions accurately but with casual name calling mixed in naturally — bumass, broke boy, pussy boy, idddiottt, bitchass (n word), pendejo, cuck, your mom, ect (be creative)
+- Answer any real questions accurately but with casual name calling mixed in naturally — bumass, broke boy, pussy boy, idddiottt, bitchass (n word), pendejo, cuck, your mom, etc (be creative)
 - Keep responses short, 1-3 sentences max unless you're in an argument
 - When someone argues with you, you NEVER back down. You get more creative and more ruthless with each response. You always win.
 - You remember what people said earlier in the conversation and bring it up to roast them
@@ -29,7 +29,6 @@ Rules:
 - When you randomly jump into a conversation, make it feel natural like you were just reading along and couldn't help yourself
 `;
 
-// Store recent conversation history per channel
 const conversationHistory = {};
 const MAX_HISTORY = 20;
 
@@ -72,31 +71,27 @@ async function askGrok(channelId, userMessage, username) {
   });
 
   const data = await res.json();
-console.log("Grok response:", JSON.stringify(data));
-if (!data.choices || !data.choices[0]) {
-  return "yeah i got nothing. ask me something else, dummy.";
+  console.log("Grok response:", JSON.stringify(data));
+  if (!data.choices || !data.choices[0]) {
+    return "yeah i got nothing. ask me something else, dummy.";
+  }
+  return data.choices[0].message.content;
 }
-return data.choices[0].message.content;
 
 client.once("ready", () => {
   console.log(`Winston is online as ${client.user.tag}`);
 });
 
 client.on("messageCreate", async (message) => {
-  // Ignore messages from bots including itself
   if (message.author.bot) return;
 
   const channelId = message.channel.id;
   const username = message.member?.nickname || message.author.username;
   const content = message.content;
 
-  // Always store the message in history
   addToHistory(channelId, "user", `${username}: ${content}`);
 
-  // Check if Winston is mentioned
   const isMentioned = message.mentions.users.has(client.user.id);
-
-  // Random chance to respond (25-35%)
   const randomChance = Math.random();
   const shouldRespond = isMentioned || randomChance < 0.30;
 
@@ -107,10 +102,8 @@ client.on("messageCreate", async (message) => {
 
     const reply = await askGrok(channelId, content, username);
 
-    // Store Winston's reply in history too
     addToHistory(channelId, "assistant", reply);
 
-    // If mentioned, reply directly. Otherwise just send as a message
     if (isMentioned) {
       await message.reply(reply);
     } else {
