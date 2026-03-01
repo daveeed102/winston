@@ -13,6 +13,8 @@ const client = new Client({
 
 const GROK_API_KEY = process.env.GROK_API_KEY;
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
 const WINSTON_PROMPT = `
 You are Winston. You are a real person in this Discord server. You are a bully but not cartoonish about it — you're just naturally mean, sharp, and you never back down from anything. You read what people say and respond like you genuinely know them and are sick of their crap.
@@ -29,6 +31,8 @@ Rules:
 - When you randomly jump into a conversation, make it feel natural like you were just reading along and couldn't help yourself
 `;
 
+
+// In-memory cache for current session
 const conversationHistory = {};
 const MAX_HISTORY = 20;
 
@@ -47,12 +51,100 @@ function addToHistory(channelId, role, content) {
   }
 }
 
-async function askGrok(channelId, userMessage, username) {
-  const history = getHistory(channelId);
+// Supabase helpers
+async function supabaseRequest(endpoint, method = "GET", body = null) {
+  const options = {
+    method,
+    headers: {
+      "apikey": SUPABASE_KEY,
+      "Authorization": `Bearer ${SUPABASE_KEY}`,
+      "Content-Type": "application/json",
+      "Prefer": method === "POST" ? "return=minimal" : "",
+    },
+  };
+  if (body) options.body = JSON.stringify(body);
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${endpoint}`, options);
+  if (res.status === 204 || res.status === 201) return null;
+  return res.json();
+}
+
+async function saveMessage(guildId, channelId, username, content) {
+  try {
+    await supabaseRequest("messages", "POST", {
+      guild_id: guildId,
+      channel_id: channelId,
+      username,
+      content,
+    });
+  } catch (err) {
+    console.error("Error saving message:", err);
+  }
+}
+
+async function getUserHistory(guildId, username) {
+  try {
+    const data = await supabaseRequest(
+      `messages?guild_id=eq.${guildId}&username=eq.${encodeURIComponent(username)}&order=created_at.desc&limit=30`
+    );
+    return data || [];
+  } catch (err) {
+    console.error("Error getting user history:", err);
+    return [];
+  }
+}
+
+async function updateUserProfile(guildId, username) {
+  try {
+    // Upsert user profile with incremented message count
+    await fetch(`${SUPABASE_URL}/rest/v1/user_profiles`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_KEY,
+        "Authorization": `Bearer ${SUPABASE_KEY}`,
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates",
+      },
+      body: JSON.stringify({
+        guild_id: guildId,
+        username,
+        message_count: 1,
+        updated_at: new Date().toISOString(),
+      }),
+    });
+  } catch (err) {
+    console.error("Error updating profile:", err);
+  }
+}
+
+async function getRecentChannelMessages(channelId) {
+  try {
+    const data = await supabaseRequest(
+      `messages?channel_id=eq.${channelId}&order=created_at.desc&limit=20`
+    );
+    return (data || []).reverse();
+  } catch (err) {
+    console.error("Error getting channel messages:", err);
+    return [];
+  }
+}
+
+async function askGrok(channelId, guildId, userMessage, username) {
+  const sessionHistory = getHistory(channelId);
+
+  // Get this user's past messages for roasting material
+  const userHistory = await getUserHistory(guildId, username);
+  const userHistorySummary = userHistory.length > 0
+    ? `Here is ${username}'s message history so you can roast them with their own words:\n` +
+      userHistory.map(m => `- "${m.content}"`).join("\n")
+    : "";
+
+  const systemPrompt = userHistorySummary
+    ? `${WINSTON_PROMPT}\n\n${userHistorySummary}`
+    : WINSTON_PROMPT;
 
   const messages = [
-    { role: "system", content: WINSTON_PROMPT },
-    ...history,
+    { role: "system", content: systemPrompt },
+    ...sessionHistory,
     { role: "user", content: `${username}: ${userMessage}` },
   ];
 
@@ -86,9 +178,17 @@ client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
 
   const channelId = message.channel.id;
+  const guildId = message.guild?.id;
   const username = message.member?.nickname || message.author.username;
   const content = message.content;
 
+  // Save every message to Supabase for future roasting material
+  if (guildId) {
+    await saveMessage(guildId, channelId, username, content);
+    await updateUserProfile(guildId, username);
+  }
+
+  // Add to in-memory session history
   addToHistory(channelId, "user", `${username}: ${content}`);
 
   const isMentioned = message.mentions.users.has(client.user.id);
@@ -100,7 +200,7 @@ client.on("messageCreate", async (message) => {
   try {
     message.channel.sendTyping();
 
-    const reply = await askGrok(channelId, content, username);
+    const reply = await askGrok(channelId, guildId, content, username);
 
     addToHistory(channelId, "assistant", reply);
 
@@ -114,4 +214,4 @@ client.on("messageCreate", async (message) => {
   }
 });
 
-client.login(DISCORD_BOT_TOKEN);
+client.login(DISCORD_BOT_TOKEN);;
