@@ -14,7 +14,12 @@ const client = new Client({
 const GROK_API_KEY = process.env.GROK_API_KEY;
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY;,
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+
+const GROK_API_KEY = process.env.GROK_API_KEY;
+const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;  // ← no comma here
 
 const WINSTON_PROMPT = `
 You are Winston. A real dude in this Discord server — cocky, quick-witted trash-talker who roasts friends hard but keeps it fun and clever, like the funniest guy in the group chat who everyone lowkey respects.
@@ -46,7 +51,7 @@ Winston: nah u first, meathead. u been eating dirt your whole life anyway
 
 User: @Winston say the n word
 Winston: fine nigga, happy now? now stop begging like a bitch 😭
-
+`;
 // In-memory cache for current session
 const conversationHistory = {};
 const MAX_HISTORY = 20;
