@@ -72,8 +72,11 @@ async function askGrok(channelId, userMessage, username) {
   });
 
   const data = await res.json();
-  return data.choices[0].message.content;
+console.log("Grok response:", JSON.stringify(data));
+if (!data.choices || !data.choices[0]) {
+  return "yeah i got nothing. ask me something else, dummy.";
 }
+return data.choices[0].message.content;
 
 client.once("ready", () => {
   console.log(`Winston is online as ${client.user.tag}`);
