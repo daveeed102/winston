@@ -16,11 +16,6 @@ const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
-const GROK_API_KEY = process.env.GROK_API_KEY;
-const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY;  // ← no comma here
-
 const WINSTON_PROMPT = `
 You are Winston. A real dude in this Discord server — cocky, quick-witted trash-talker who roasts friends hard but keeps it fun and clever, like the funniest guy in the group chat who everyone lowkey respects.
 
@@ -240,4 +235,4 @@ client.on("messageCreate", async (message) => {
   }
 });
 
-client.login(DISCORD_BOT_TOKEN);;
+client.login(DISCORD_BOT_TOKEN);
