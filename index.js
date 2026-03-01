@@ -178,8 +178,6 @@ async function askGrok(channelId, guildId, userMessage, username) {
   max_tokens: 180,       // shorter = punchier, was 300 → too long
   temperature: 0.85,     // sweet spot for creative but controlled
   top_p: 0.9,            // nucleus sampling helps variety
-  frequency_penalty: 0.6,  // penalize repeating words/phrases
-  presence_penalty: 0.4,   // encourage new topics/ideas
 }),
   });
 
