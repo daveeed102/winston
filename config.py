@@ -6,7 +6,7 @@ ALPACA_SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
 
 # Paper trading — flip to live URL when ready:
 # ALPACA_BASE_URL = "https://api.alpaca.markets"
-ALPACA_BASE_URL   = "https://paper-api.alpaca.markets"
+ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
 
 # ── Grok ─────────────────────────────────────────────────────────────────────
 GROK_API_KEY  = os.environ["GROK_API_KEY"]
