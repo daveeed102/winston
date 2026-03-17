@@ -1,6 +1,5 @@
-alpaca-py==0.26.0
-pandas==2.0.3
-numpy==1.24.4
-pandas-ta==0.3.14b0
-requests==2.32.3
-pytz==2024.1
+alpaca-py
+pandas
+numpy
+requests
+pytz
