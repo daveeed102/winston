@@ -1,44 +1,45 @@
 import os
 
-# ── Alpaca ────────────────────────────────────────────────────────────────────
+# ── Alpaca (LIVE money) ───────────────────────────────────────────────────────
 ALPACA_API_KEY    = os.environ["ALPACA_API_KEY"]
 ALPACA_SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
-
-# Paper trading — flip to live URL when ready:
-# ALPACA_BASE_URL = "https://api.alpaca.markets"
-ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
+ALPACA_BASE_URL   = "https://api.alpaca.markets"   # LIVE - real money
 
 # ── Grok ─────────────────────────────────────────────────────────────────────
 GROK_API_KEY  = os.environ["GROK_API_KEY"]
 GROK_MODEL    = "grok-3-mini"
 
-# ── Strategy ─────────────────────────────────────────────────────────────────
-TICKER        = "SPY"
-BAR_TIMEFRAME = "5Min"   # 5-minute bars for intraday signals
-BAR_LIMIT     = 60       # look back 60 bars (~5 hours of data)
+# ── Trade sizing ──────────────────────────────────────────────────────────────
+MAX_TRADE_DOLLARS  = 2.00    # max $ spent per trade (fractional shares)
+MAX_OPEN_POSITIONS = 5       # max simultaneous positions across all tickers
 
-EMA_FAST      = 9
-EMA_SLOW      = 21
-RSI_PERIOD    = 14
-RSI_OVERSOLD  = 40       # buy zone floor  (not in freefall)
-RSI_OVERBOUGHT= 65       # buy zone ceiling (not already pumped)
-ATR_PERIOD    = 14       # for dynamic stop-loss/take-profit sizing
+# ── Schedule (all times in ET) ────────────────────────────────────────────────
+MARKET_OPEN_ET       = "09:31"   # start 1 min after open
+MARKET_CLOSE_ET      = "15:55"   # stop 5 min before close
+RUN_INTERVAL_SECS    = 60        # check every 60 seconds
+
+# ── Ticker watchlist (locked to SPY and QQQ) ─────────────────────────────────
+TICKER_REFRESH_MINS  = 99999     # never auto-refresh — list is locked
+MAX_TICKERS          = 2
+FALLBACK_TICKERS     = ["SPY", "QQQ"]
+
+# ── Technical indicators ──────────────────────────────────────────────────────
+BAR_TIMEFRAME    = "5Min"
+BAR_LIMIT        = 60
+EMA_FAST         = 9
+EMA_SLOW         = 21
+RSI_PERIOD       = 14
+RSI_OVERSOLD     = 35
+RSI_OVERBOUGHT   = 68
+ATR_PERIOD       = 14
 
 # ── Risk controls ─────────────────────────────────────────────────────────────
-MAX_POSITION_PCT   = 0.10   # max 10% of portfolio per trade
-STOP_LOSS_MULT     = 1.5    # stop-loss  = entry - (ATR * multiplier)
-TAKE_PROFIT_MULT   = 2.5    # take-profit = entry + (ATR * multiplier)
-MAX_OPEN_POSITIONS = 1      # one trade at a time — keeps it simple & safe
+STOP_LOSS_MULT   = 1.5
+TAKE_PROFIT_MULT = 2.5
 
-# ── Grok sentiment thresholds ────────────────────────────────────────────────
-# Grok returns a score -1.0 (very bearish) → +1.0 (very bullish)
-SENTIMENT_BUY_MIN  =  0.1   # must be at least slightly bullish to enter
-SENTIMENT_SELL_MAX = -0.1   # exit if sentiment flips bearish
+# ── Sentiment thresholds ──────────────────────────────────────────────────────
+SENTIMENT_BUY_MIN  =  0.15
+SENTIMENT_SELL_MAX = -0.10
 
 # ── Notifications ─────────────────────────────────────────────────────────────
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
-
-# ── Schedule ──────────────────────────────────────────────────────────────────
-RUN_INTERVAL_MINS = 5
-MARKET_OPEN_ET    = "09:35"  # skip first 5 min of open (most volatile)
-MARKET_CLOSE_ET   = "15:50"  # stop 10 min before close (avoid MOC chaos)
