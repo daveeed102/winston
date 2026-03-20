@@ -1,18 +1,14 @@
 """
 bot.py - Main trading loop
-Features:
-  - Long AND short positions on SPY and QQQ
-  - Trailing stop-loss that locks in gains
-  - Persistent positions via PostgreSQL (survives restarts)
-  - Daily P&L summary at market close
+Tuned for SPY/QQQ intraday trading on a small account.
 
-Changes from v1:
-  - Grok sentiment REMOVED from entry decision (it has no real-time data
-    and was blocking every trade). Now entry is purely technical.
-  - Grok sentiment KEPT as a soft exit filter only (bearish flip exits long, etc.)
-  - Added dedup guard so the same ticker can't open a new position within
-    ENTRY_COOLDOWN_MINS of closing one (avoids whipsaw re-entries)
-  - Cleaned up _is_near_close() alignment with MARKET_CLOSE_ET
+Key philosophy:
+  - Entry is 100% technical. Grok is NOT used to gate entries.
+  - Grok is only used as a soft exit filter on open positions.
+  - One position at a time — focused, not spread thin.
+  - Skip first 30 min of trading (chaotic opens).
+  - 5-min cooldown after any close to avoid whipsaw re-entries.
+  - Tight stop, 1:2+ risk/reward so even a 40% win rate is profitable.
 """
 
 import time
@@ -29,13 +25,13 @@ from logger import (log, notify, notify_buy, notify_close,
 
 ET = pytz.timezone("America/New_York")
 
-_watchlist    = list(config.FALLBACK_TICKERS)
-_last_scan    = None
-_positions    = {}
-_last_closed  = {}   # ticker -> datetime — cooldown after close to avoid whipsaws
+_watchlist        = list(config.FALLBACK_TICKERS)
+_last_scan        = None
+_positions        = {}
+_last_closed      = {}   # ticker -> datetime ET — cooldown tracker
 _shorting_enabled = False
 
-ENTRY_COOLDOWN_MINS = 5   # don't re-enter a ticker within 5 min of closing it
+ENTRY_COOLDOWN_MINS = 5
 
 
 def _now_et():
@@ -52,7 +48,6 @@ def _is_market_hours():
     return config.MARKET_OPEN_ET <= t <= config.MARKET_CLOSE_ET
 
 def _is_near_close():
-    # Aligned with MARKET_CLOSE_ET = "15:50"
     return _time_str() >= config.MARKET_CLOSE_ET
 
 def _needs_ticker_refresh():
@@ -76,7 +71,6 @@ def _refresh_tickers():
 
 
 def _update_trailing_stop(ticker: str, state: dict, current_price: float, atr: float):
-    """Ratchet stop-loss up (long) or down (short) as price moves in our favor."""
     side = state["side"]
     peak = state["peak_price"]
 
@@ -119,7 +113,7 @@ def _close_trade(ticker: str, current_price: float, reason: str):
     )
     database.delete_position(ticker)
     del _positions[ticker]
-    _last_closed[ticker] = _now_et()   # start cooldown
+    _last_closed[ticker] = _now_et()
     notify_close(ticker, side, reason, pnl)
 
 
@@ -133,12 +127,12 @@ def _process_ticker(ticker: str):
     current_price = float(df["close"].iloc[-1])
     signal, atr, info = strategy.get_signal(df, ticker)
 
-    # ── Close all positions near end of day ──────────────────────────────
+    # ── EOD close ────────────────────────────────────────────────────────────
     if _is_near_close() and ticker in _positions:
         _close_trade(ticker, current_price, "EOD_CLOSE")
         return
 
-    # ── Manage existing position ──────────────────────────────────────────
+    # ── Manage open position ─────────────────────────────────────────────────
     if ticker in _positions:
         state = _positions[ticker]
         side  = state["side"]
@@ -154,7 +148,7 @@ def _process_ticker(ticker: str):
             if current_price >= state["take_profit"]:
                 _close_trade(ticker, current_price, "TAKE_PROFIT")
                 return
-            # Soft sentiment exit — only if Grok is strongly bearish
+            # Grok soft exit — only on strongly bearish reading
             score, _ = grok.get_sentiment(ticker)
             if score <= config.SENTIMENT_SELL_MAX:
                 _close_trade(ticker, current_price, "SENTIMENT_EXIT")
@@ -167,27 +161,24 @@ def _process_ticker(ticker: str):
             if current_price <= state["take_profit"]:
                 _close_trade(ticker, current_price, "TAKE_PROFIT")
                 return
-            # Soft sentiment exit — only if Grok is strongly bullish
             score, _ = grok.get_sentiment(ticker)
             if score >= config.SENTIMENT_COVER_MIN:
                 _close_trade(ticker, current_price, "SENTIMENT_EXIT")
                 return
         return
 
-    # ── No position — check for entry ─────────────────────────────────────
+    # ── Entry logic ──────────────────────────────────────────────────────────
     if len(_positions) >= config.MAX_OPEN_POSITIONS:
         return
 
     if _in_cooldown(ticker):
-        log(f"[BOT] {ticker} in cooldown — skipping entry.")
+        log(f"[BOT] {ticker} in cooldown — skipping.")
         return
-
-    # Entry is PURELY TECHNICAL now — no Grok gate on the way in.
-    # Grok only triggers early exits (above).
 
     if signal == "LONG":
         stop = round(current_price - (atr * config.STOP_LOSS_MULT), 4) if atr else round(current_price * 0.98, 4)
         tp   = round(current_price + (atr * config.TAKE_PROFIT_MULT), 4) if atr else round(current_price * 1.02, 4)
+        rr   = round((tp - current_price) / (current_price - stop), 2) if stop != current_price else 0
         try:
             broker.place_long(ticker, config.MAX_TRADE_DOLLARS)
             state = {
@@ -201,13 +192,14 @@ def _process_ticker(ticker: str):
             }
             _positions[ticker] = state
             database.save_position(ticker, "LONG", current_price, stop, tp, config.MAX_TRADE_DOLLARS)
-            notify_buy(ticker, "LONG", config.MAX_TRADE_DOLLARS, current_price, stop, tp, 0.0, "Technical entry")
+            notify_buy(ticker, "LONG", config.MAX_TRADE_DOLLARS, current_price, stop, tp, rr, f"Technical entry | R:R={rr}")
         except Exception as e:
             notify_error(f"Long order failed {ticker}: {e}")
 
     elif signal == "SHORT" and _shorting_enabled:
         stop = round(current_price + (atr * config.STOP_LOSS_MULT), 4) if atr else round(current_price * 1.02, 4)
         tp   = round(current_price - (atr * config.TAKE_PROFIT_MULT), 4) if atr else round(current_price * 0.98, 4)
+        rr   = round((current_price - tp) / (stop - current_price), 2) if stop != current_price else 0
         try:
             broker.place_short(ticker, config.MAX_TRADE_DOLLARS)
             state = {
@@ -221,7 +213,7 @@ def _process_ticker(ticker: str):
             }
             _positions[ticker] = state
             database.save_position(ticker, "SHORT", current_price, stop, tp, config.MAX_TRADE_DOLLARS)
-            notify_buy(ticker, "SHORT", config.MAX_TRADE_DOLLARS, current_price, stop, tp, 0.0, "Technical entry")
+            notify_buy(ticker, "SHORT", config.MAX_TRADE_DOLLARS, current_price, stop, tp, rr, f"Technical entry | R:R={rr}")
         except Exception as e:
             notify_error(f"Short order failed {ticker}: {e}")
 
@@ -241,7 +233,10 @@ def run():
     _shorting_enabled = broker.is_account_shorting_enabled()
     log(f"[BOT] Shorting enabled: {_shorting_enabled}")
 
-    notify("Winston v2 started — SPY & QQQ, $2/trade, technical entry only. Watching every 60s.")
+    notify(
+        "Winston v3 🚀 | SPY & QQQ | $25/trade | Technical entry only\n"
+        "Trading 10:00am–3:50pm ET | 1 position at a time | Tight stops"
+    )
     log("[BOT] Starting main loop...")
 
     summary_sent = False
@@ -255,7 +250,6 @@ def run():
                 time.sleep(300)
                 continue
 
-            # Send daily summary once at/after close
             if _is_near_close() and not summary_sent:
                 summary = database.get_summary()
                 notify_summary(
