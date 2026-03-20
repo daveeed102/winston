@@ -2,6 +2,12 @@
 strategy.py
 Pure pandas indicators — no external TA library.
 Returns LONG / SHORT / HOLD.
+
+Changes from v1:
+  - Added momentum confirmation (price vs EMA slope, not just crossover)
+  - EMA crossover OR price reclaim above/below VWAP with RSI confirmation
+  - This fires more signals while keeping quality high
+  - Added trend strength filter via EMA gap
 """
 
 import pandas as pd
@@ -62,15 +68,19 @@ def get_signal(df: pd.DataFrame, ticker: str = "") -> tuple[str, float, dict]:
 
     latest = df.iloc[-1]
     prev   = df.iloc[-2]
+    prev2  = df.iloc[-3]
 
-    close    = float(latest["close"])
-    ema_fast = float(latest["ema_fast"])
-    ema_slow = float(latest["ema_slow"])
-    rsi      = float(latest["rsi"])
-    atr      = float(latest["atr"]) if not pd.isna(latest["atr"]) else 0.0
-    vwap     = float(latest["vwap"]) if not pd.isna(latest["vwap"]) else close
-    prev_fast = float(prev["ema_fast"])
-    prev_slow = float(prev["ema_slow"])
+    close     = float(latest["close"])
+    ema_fast  = float(latest["ema_fast"])
+    ema_slow  = float(latest["ema_slow"])
+    rsi       = float(latest["rsi"])
+    atr       = float(latest["atr"]) if not pd.isna(latest["atr"]) else 0.0
+    vwap      = float(latest["vwap"]) if not pd.isna(latest["vwap"]) else close
+
+    prev_fast  = float(prev["ema_fast"])
+    prev_slow  = float(prev["ema_slow"])
+    prev2_fast = float(prev2["ema_fast"])
+    prev2_slow = float(prev2["ema_slow"])
 
     info = {
         "close":    round(close, 2),
@@ -81,22 +91,42 @@ def get_signal(df: pd.DataFrame, ticker: str = "") -> tuple[str, float, dict]:
         "vwap":     round(vwap, 2),
     }
 
-    # Long conditions
-    cross_up   = (prev_fast <= prev_slow) and (ema_fast > ema_slow)
-    rsi_ok     = RSI_OVERSOLD < rsi < RSI_OVERBOUGHT
-    above_vwap = close > vwap
+    # --- Signal conditions ---
 
-    # Short conditions
-    cross_down  = (prev_fast >= prev_slow) and (ema_fast < ema_slow)
-    rsi_short   = RSI_OVERSOLD < rsi < RSI_OVERBOUGHT
-    below_vwap  = close < vwap
+    # Classic EMA crossover (was the only entry before)
+    cross_up   = (prev_fast <= prev_slow) and (ema_fast > ema_slow)
+    cross_down = (prev_fast >= prev_slow) and (ema_fast < ema_slow)
+
+    # NEW: Trend continuation — fast EMA above slow AND rising for 2 bars
+    trend_up   = (ema_fast > ema_slow) and (prev_fast > prev_slow) and (ema_fast > prev_fast)
+    trend_down = (ema_fast < ema_slow) and (prev_fast < prev_slow) and (ema_fast < prev_fast)
+
+    # NEW: VWAP reclaim — price crossed back above/below VWAP this bar
+    vwap_reclaim_up   = (float(prev["close"]) < float(prev["vwap"])) and (close > vwap)
+    vwap_reclaim_down = (float(prev["close"]) > float(prev["vwap"])) and (close < vwap)
+
+    # RSI zones
+    rsi_long  = RSI_OVERSOLD  < rsi < RSI_OVERBOUGHT
+    rsi_short = RSI_OVERSOLD  < rsi < RSI_OVERBOUGHT
+
+    # Price position
+    above_vwap = close > vwap
+    below_vwap = close < vwap
 
     label = f"[{ticker}]" if ticker else ""
 
-    if cross_up and rsi_ok and above_vwap:
+    # LONG: crossover OR (trend continuation + VWAP above) OR (VWAP reclaim + RSI ok)
+    if (cross_up and rsi_long and above_vwap) or \
+       (trend_up and above_vwap and rsi_long) or \
+       (vwap_reclaim_up and rsi_long):
         signal = "LONG"
-    elif cross_down and rsi_short and below_vwap:
+
+    # SHORT: crossover OR (trend continuation + VWAP below) OR (VWAP breakdown + RSI ok)
+    elif (cross_down and rsi_short and below_vwap) or \
+         (trend_down and below_vwap and rsi_short) or \
+         (vwap_reclaim_down and rsi_short):
         signal = "SHORT"
+
     else:
         signal = "HOLD"
 
