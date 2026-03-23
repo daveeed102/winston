@@ -31,7 +31,12 @@ def get_bars(ticker: str, timeframe_str: str = "5Min", limit: int = BAR_LIMIT) -
     tf = tf_map.get(timeframe_str, TimeFrame(5, TimeFrameUnit.Minute))
 
     # Pull 3x the needed window to guarantee enough bars for all indicators
-    # MACD needs 26 bars min, Bollinger needs 20 — this ensures we always get enough
+    # Bar duration in minutes
+    bar_minutes = {
+        "1Min": 1, "5Min": 5, "15Min": 15, "1Hour": 60
+    }.get(timeframe_str, 5)
+
+    # Pull 3x window so MACD (26 bars) and Bollinger (20 bars) always have enough data
     now   = datetime.now(pytz.utc)
     start = now - timedelta(minutes=limit * bar_minutes * 3)
 
@@ -58,8 +63,9 @@ def get_bars(ticker: str, timeframe_str: str = "5Min", limit: int = BAR_LIMIT) -
     # Staleness guard — log a warning if newest bar is more than 2 minutes old
     latest_bar_time = bars.df.index.get_level_values("timestamp")[-1]
     age_seconds = (now - latest_bar_time.to_pydatetime()).total_seconds()
-    if age_seconds > 120:
-        log(f"[BROKER] WARNING: Stale data for {ticker} — last bar is {int(age_seconds)}s old")
+    stale_threshold = bar_minutes * 60 * 1.5
+    if age_seconds > stale_threshold:
+        log(f"[BROKER] WARNING: Stale data for {ticker} — last bar is {int(age_seconds)}s old (threshold {int(stale_threshold)}s)")
 
     return df
 
