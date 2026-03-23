@@ -1,8 +1,15 @@
 """
-strategy.py — Winston v8 — 10-Vote Statistical Engine
+strategy.py — Winston v9 — Momentum-Confirmed Voting Engine
 
-10 independent indicators each cast one vote: LONG or SHORT.
-Minimum votes to trade set by MIN_VOTE_SCORE in config.py (currently 4).
+Key changes from v8:
+  - Removed permanent LONG bias from candle vote (doji = ABSTAIN)
+  - Added trend strength filter: ADX check, skip choppy markets
+  - Replaced RSI Level with RSI Extreme (only votes when RSI is actually
+    oversold/overbought, otherwise abstains — no more contradictory signals)
+  - Replaced simple volume vote with OBV slope (on-balance volume direction)
+  - Added momentum confirmation: EMA trend must agree with MACD direction
+    or the signal gets downgraded
+  - Votes can now ABSTAIN — meaning 4/10 actually requires conviction
 
 The 10 Votes:
   ── Trend ──────────────────────────────────────────────────
@@ -11,20 +18,22 @@ The 10 Votes:
 
   ── Momentum ───────────────────────────────────────────────
   3.  MACD Cross        — MACD line above/below signal line
-  4.  MACD Histogram    — histogram growing or shrinking
-  5.  RSI Direction     — RSI rising or falling this bar
-  6.  RSI Level         — RSI below 55 (room up) or above (room down)
+  4.  MACD Histogram    — histogram accelerating or decelerating
+  5.  RSI Direction     — RSI slope over last 3 bars (smoothed)
+  6.  RSI Extreme       — ABSTAIN in neutral zone, votes at extremes only
 
   ── Price Structure ────────────────────────────────────────
   7.  VWAP Position     — price above/below VWAP
-  8.  Bollinger Position — price in lower or upper half of bands
+  8.  Bollinger Band    — near lower band = LONG, near upper = SHORT,
+                          middle = ABSTAIN
 
   ── Volume & Candles ───────────────────────────────────────
-  9.  Volume Trend      — volume heavier on up bars or down bars
-  10. Candle Pattern    — bar closed near high (bullish) or near low (bearish)
+  9.  OBV Slope         — on-balance volume trending up or down
+  10. Candle Pattern    — strong close near high/low, doji = ABSTAIN
 """
 
 import pandas as pd
+import numpy as np
 from config import (
     EMA_FAST, EMA_SLOW, RSI_PERIOD,
     RSI_OVERSOLD, RSI_OVERBOUGHT, ATR_PERIOD,
@@ -82,6 +91,50 @@ def _vwap(df: pd.DataFrame) -> pd.Series:
     return cum_tp_vol / cum_vol
 
 
+def _obv(df: pd.DataFrame) -> pd.Series:
+    """On-Balance Volume — cumulative volume weighted by price direction."""
+    direction = np.sign(df["close"].diff())
+    return (df["volume"] * direction).cumsum()
+
+
+def _trend_strength(df: pd.DataFrame, period: int = 14) -> float:
+    """
+    ADX (Average Directional Index) — measures trend strength from 0-100.
+    Above 20 = trending, below 20 = choppy/ranging.
+    """
+    high  = df["high"]
+    low   = df["low"]
+    close = df["close"]
+
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs()
+    ], axis=1).max(axis=1)
+
+    up_move   = high - high.shift(1)
+    down_move = low.shift(1) - low
+
+    plus_dm  = pd.Series(
+        np.where((up_move > down_move) & (up_move > 0), up_move, 0),
+        index=df.index
+    )
+    minus_dm = pd.Series(
+        np.where((down_move > up_move) & (down_move > 0), down_move, 0),
+        index=df.index
+    )
+
+    atr_smooth = tr.ewm(alpha=1/period, adjust=False).mean()
+    plus_di    = 100 * plus_dm.ewm(alpha=1/period, adjust=False).mean() / atr_smooth
+    minus_di   = 100 * minus_dm.ewm(alpha=1/period, adjust=False).mean() / atr_smooth
+
+    dx  = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1)
+    adx = dx.ewm(alpha=1/period, adjust=False).mean()
+
+    return float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else 0.0
+
+
 def _resample_to_15min(df: pd.DataFrame) -> pd.DataFrame:
     df15 = df.copy().reset_index(drop=True)
     df15 = df15.groupby(df15.index // 3).agg({
@@ -102,6 +155,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["atr"]       = _atr(df, ATR_PERIOD)
     df["vwap"]      = _vwap(df)
     df["vol_avg"]   = df["volume"].rolling(20).mean()
+    df["obv"]       = _obv(df)
 
     macd, sig, hist  = _macd(df["close"])
     df["macd"]       = macd
@@ -125,7 +179,6 @@ def get_vote_score(df: pd.DataFrame, ticker: str = "") -> dict:
     latest = df.iloc[-1]
     prev   = df.iloc[-2]
     prev2  = df.iloc[-3]
-    prev3  = df.iloc[-4]
 
     close     = float(latest["close"])
     high      = float(latest["high"])
@@ -134,28 +187,34 @@ def get_vote_score(df: pd.DataFrame, ticker: str = "") -> dict:
     ema_slow  = float(latest["ema_slow"])
     rsi       = float(latest["rsi"])
     prev_rsi  = float(prev["rsi"])
-    vwap      = float(latest["vwap"])    if not pd.isna(latest["vwap"])    else close
-    atr       = float(latest["atr"])     if not pd.isna(latest["atr"])     else 0.0
-    macd      = float(latest["macd"])    if not pd.isna(latest["macd"])    else 0.0
-    macd_sig  = float(latest["macd_sig"]) if not pd.isna(latest["macd_sig"]) else 0.0
+    prev2_rsi = float(prev2["rsi"])
+    vwap      = float(latest["vwap"])      if not pd.isna(latest["vwap"])      else close
+    atr       = float(latest["atr"])       if not pd.isna(latest["atr"])       else 0.0
+    macd      = float(latest["macd"])      if not pd.isna(latest["macd"])      else 0.0
+    macd_sig  = float(latest["macd_sig"])  if not pd.isna(latest["macd_sig"])  else 0.0
     macd_hist = float(latest["macd_hist"]) if not pd.isna(latest["macd_hist"]) else 0.0
     prev_hist = float(prev["macd_hist"])   if not pd.isna(prev["macd_hist"])   else 0.0
-    bb_upper  = float(latest["bb_upper"]) if not pd.isna(latest["bb_upper"]) else close + 1
-    bb_lower  = float(latest["bb_lower"]) if not pd.isna(latest["bb_lower"]) else close - 1
+    bb_upper  = float(latest["bb_upper"])  if not pd.isna(latest["bb_upper"])  else close + 1
+    bb_lower  = float(latest["bb_lower"])  if not pd.isna(latest["bb_lower"])  else close - 1
+    bb_mid    = float(latest["bb_mid"])    if not pd.isna(latest["bb_mid"])    else close
     volume    = float(latest["volume"])
-    vol_avg   = float(latest["vol_avg"]) if not pd.isna(latest["vol_avg"]) else volume
+    vol_avg   = float(latest["vol_avg"])   if not pd.isna(latest["vol_avg"])   else volume
 
-    closes  = [float(prev3["close"]), float(prev2["close"]),
-                float(prev["close"]), close]
-    volumes = [float(prev3["volume"]), float(prev2["volume"]),
-                float(prev["volume"]), volume]
+    # ── Trend strength gate ──────────────────────────────────────────────────
+    adx = _trend_strength(df)
+    if adx < 20:
+        label = f"[{ticker}]" if ticker else ""
+        log(f"[STRATEGY]{label} HOLD — choppy market (ADX={adx:.1f}, need 20+)")
+        return {"long_votes": 0, "short_votes": 0, "signal": "HOLD",
+                "votes": {}, "info": {"close": round(close, 2), "adx": round(adx, 1)},
+                "atr": atr}
 
     votes = {}
 
-    # Vote 1: EMA Trend
+    # ── Vote 1: EMA Trend ────────────────────────────────────────────────────
     votes["ema_trend"] = "LONG" if ema_fast > ema_slow else "SHORT"
 
-    # Vote 2: Higher Timeframe (15-min)
+    # ── Vote 2: Higher Timeframe (15-min) ────────────────────────────────────
     try:
         df15 = _resample_to_15min(df)
         if len(df15) >= 5:
@@ -167,52 +226,84 @@ def get_vote_score(df: pd.DataFrame, ticker: str = "") -> dict:
     except Exception:
         votes["higher_tf"] = votes["ema_trend"]
 
-    # Vote 3: MACD Cross
+    # ── Vote 3: MACD Cross ───────────────────────────────────────────────────
     votes["macd_cross"] = "LONG" if macd > macd_sig else "SHORT"
 
-    # Vote 4: MACD Histogram direction
-    votes["macd_histogram"] = "LONG" if macd_hist > prev_hist else "SHORT"
+    # ── Vote 4: MACD Histogram momentum ──────────────────────────────────────
+    hist_delta = macd_hist - prev_hist
+    if abs(hist_delta) > 0.001:
+        votes["macd_histogram"] = "LONG" if hist_delta > 0 else "SHORT"
+    else:
+        votes["macd_histogram"] = "ABSTAIN"
 
-    # Vote 5: RSI Direction
-    votes["rsi_direction"] = "LONG" if rsi > prev_rsi else "SHORT"
+    # ── Vote 5: RSI Direction (smoothed over 3 bars) ─────────────────────────
+    rsi_slope = rsi - prev2_rsi
+    if abs(rsi_slope) > 0.5:
+        votes["rsi_direction"] = "LONG" if rsi_slope > 0 else "SHORT"
+    else:
+        votes["rsi_direction"] = "ABSTAIN"
 
-    # Vote 6: RSI Level
-    votes["rsi_level"] = "LONG" if rsi < 55 else "SHORT"
+    # ── Vote 6: RSI Extreme ──────────────────────────────────────────────────
+    if rsi <= RSI_OVERSOLD:
+        votes["rsi_extreme"] = "LONG"
+    elif rsi >= RSI_OVERBOUGHT:
+        votes["rsi_extreme"] = "SHORT"
+    else:
+        votes["rsi_extreme"] = "ABSTAIN"
 
-    # Vote 7: VWAP Position
+    # ── Vote 7: VWAP Position ────────────────────────────────────────────────
     votes["vwap_position"] = "LONG" if close > vwap else "SHORT"
 
-    # Vote 8: Bollinger Band position
-    bb_midpoint = (bb_upper + bb_lower) / 2
-    votes["bollinger"] = "LONG" if close < bb_midpoint else "SHORT"
+    # ── Vote 8: Bollinger Band position ──────────────────────────────────────
+    bb_range = bb_upper - bb_lower
+    if bb_range > 0:
+        bb_pct = (close - bb_lower) / bb_range
+        if bb_pct <= 0.25:
+            votes["bollinger"] = "LONG"
+        elif bb_pct >= 0.75:
+            votes["bollinger"] = "SHORT"
+        else:
+            votes["bollinger"] = "ABSTAIN"
+    else:
+        votes["bollinger"] = "ABSTAIN"
 
-    # Vote 9: Volume Trend
-    up_vol   = sum(volumes[i] for i in range(1, len(closes))
-                   if closes[i] > closes[i-1])
-    down_vol = sum(volumes[i] for i in range(1, len(closes))
-                   if closes[i] < closes[i-1])
-    votes["volume_trend"] = "LONG" if up_vol >= down_vol else "SHORT"
+    # ── Vote 9: OBV Slope ────────────────────────────────────────────────────
+    obv_now  = float(df["obv"].iloc[-1]) if not pd.isna(df["obv"].iloc[-1]) else 0
+    obv_prev = float(df["obv"].iloc[-5]) if not pd.isna(df["obv"].iloc[-5]) else 0
+    obv_delta = obv_now - obv_prev
+    if abs(obv_delta) > 0:
+        votes["obv_slope"] = "LONG" if obv_delta > 0 else "SHORT"
+    else:
+        votes["obv_slope"] = "ABSTAIN"
 
-    # Vote 10: Candle Pattern
+    # ── Vote 10: Candle Pattern ──────────────────────────────────────────────
     bar_range = high - low
     if bar_range > 0:
-        close_position = (close - low) / bar_range
-        if close_position >= 0.6:
+        close_pct = (close - low) / bar_range
+        if close_pct >= 0.65:
             votes["candle"] = "LONG"
-        elif close_position <= 0.4:
+        elif close_pct <= 0.35:
             votes["candle"] = "SHORT"
         else:
-            votes["candle"] = "LONG"   # doji — slight long bias
+            votes["candle"] = "ABSTAIN"
     else:
-        votes["candle"] = "LONG"
+        votes["candle"] = "ABSTAIN"
 
-    # Tally
-    long_votes  = sum(1 for v in votes.values() if v == "LONG")
-    short_votes = sum(1 for v in votes.values() if v == "SHORT")
+    # ── Tally (only count actual votes, not abstentions) ─────────────────────
+    active_votes = {k: v for k, v in votes.items() if v != "ABSTAIN"}
+    long_votes   = sum(1 for v in active_votes.values() if v == "LONG")
+    short_votes  = sum(1 for v in active_votes.values() if v == "SHORT")
+    abstentions  = 10 - len(active_votes)
 
-    if long_votes >= MIN_VOTE_SCORE:
+    # ── Momentum confirmation ────────────────────────────────────────────────
+    # EMA trend and MACD must agree — if they disagree, market is conflicted
+    ema_dir  = votes.get("ema_trend", "ABSTAIN")
+    macd_dir = votes.get("macd_cross", "ABSTAIN")
+    momentum_confirmed = (ema_dir == macd_dir) and ema_dir != "ABSTAIN"
+
+    if long_votes >= MIN_VOTE_SCORE and momentum_confirmed:
         signal = "LONG"
-    elif short_votes >= MIN_VOTE_SCORE:
+    elif short_votes >= MIN_VOTE_SCORE and momentum_confirmed:
         signal = "SHORT"
     else:
         signal = "HOLD"
@@ -227,16 +318,19 @@ def get_vote_score(df: pd.DataFrame, ticker: str = "") -> dict:
         "bb_upper": round(bb_upper, 2),
         "bb_lower": round(bb_lower, 2),
         "atr":      round(atr, 4),
+        "adx":      round(adx, 1),
     }
 
     label = f"[{ticker}]" if ticker else ""
-    log(f"[STRATEGY]{label} {signal} | {long_votes}L/{short_votes}S | "
+    conf_str = "confirmed" if momentum_confirmed else "conflicted"
+    log(f"[STRATEGY]{label} {signal} | {long_votes}L/{short_votes}S "
+        f"({abstentions} abstain) | momentum={conf_str} | ADX={adx:.1f} | "
         f"close={close} rsi={rsi:.1f} "
         f"macd={'▲' if macd > macd_sig else '▼'} "
         f"vwap={'↑' if close > vwap else '↓'}")
 
     vote_str = " ".join(
-        f"{k}={'🟢' if v == 'LONG' else '🔴'}"
+        f"{k}={'🟢' if v == 'LONG' else '🔴' if v == 'SHORT' else '⚪'}"
         for k, v in votes.items()
     )
     log(f"[VOTES]{label} {vote_str}")
