@@ -11,7 +11,7 @@ from alpaca.trading.client   import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums    import OrderSide, TimeInForce
 from alpaca.data.historical  import StockHistoricalDataClient
-from alpaca.data.requests    import StockBarsRequest
+from alpaca.data.requests    import StockBarsRequest, StockLatestTradeRequest
 from alpaca.data.timeframe   import TimeFrame, TimeFrameUnit
 from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, BAR_LIMIT
 from logger import log
@@ -68,6 +68,16 @@ def get_bars(ticker: str, timeframe_str: str = "5Min", limit: int = BAR_LIMIT) -
         log(f"[BROKER] WARNING: Stale data for {ticker} — last bar is {int(age_seconds)}s old (threshold {int(stale_threshold)}s)")
 
     return df
+
+
+def get_latest_price(ticker: str) -> float:
+    """Get the most recent trade price — real-time, not bar-based."""
+    req = StockLatestTradeRequest(symbol_or_symbols=ticker, feed="sip")
+    trade = _data.get_stock_latest_trade(req)
+    # Response is a dict keyed by symbol
+    if isinstance(trade, dict):
+        return float(trade[ticker].price)
+    return float(trade.price)
 
 
 def get_account():
