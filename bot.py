@@ -223,8 +223,8 @@ def _run_5min_cycle():
         bar_count = len(df)
         log(f"[BOT] {ticker} — got {bar_count} bars")
 
-        if bar_count < 30:
-            log(f"[BOT] {ticker} — not enough bars ({bar_count}/30 needed) — skipping")
+        if bar_count < 20:
+            log(f"[BOT] {ticker} — not enough bars ({bar_count}/20 needed) — skipping")
             continue
 
         result = strategy.get_vote_score(df, ticker)
@@ -250,7 +250,7 @@ def _run_5min_cycle():
     if best_ticker is None:
         log("[BOT] ⏸️  No clear signal — skipping cycle")
         notify(f"⏸️ Skipped — need {config.MIN_VOTE_SCORE}/10 votes, "
-               f"neither ticker qualified")
+               f"neither ticker qualified (min 20 bars)")
         return
 
     log(f"[BOT] 🎯 {best_direction} {best_ticker} @ {best_price:.2f} "
