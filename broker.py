@@ -72,7 +72,7 @@ def get_bars(ticker: str, timeframe_str: str = "5Min", limit: int = BAR_LIMIT) -
 
 def get_latest_price(ticker: str) -> float:
     """Get the most recent trade price — real-time, not bar-based."""
-    req = StockLatestTradeRequest(symbol_or_symbols=ticker, feed="sip")
+    req = StockLatestTradeRequest(symbol_or_symbols=ticker, feed="iex")
     trade = _data.get_stock_latest_trade(req)
     # Response is a dict keyed by symbol
     if isinstance(trade, dict):
