@@ -57,10 +57,9 @@ def get_candles(product_id: str = config.PRODUCT_ID,
         granularity=granularity,
     )
 
-    # Parse the response into a DataFrame
-    candles = candles_resp.get("candles", candles_resp)
-    if hasattr(candles, "candles"):
-        candles = candles.candles
+    # SDK returns BaseResponse objects — convert to dict for reliable access
+    data = candles_resp.to_dict() if hasattr(candles_resp, 'to_dict') else candles_resp
+    candles = data.get("candles", []) if isinstance(data, dict) else []
 
     rows = []
     for c in candles:
@@ -74,14 +73,14 @@ def get_candles(product_id: str = config.PRODUCT_ID,
                 "volume": float(c.get("volume", 0)),
             })
         else:
-            # Object with attributes
+            d = c.to_dict() if hasattr(c, 'to_dict') else {}
             rows.append({
-                "timestamp": int(getattr(c, "start", 0)),
-                "open":   float(getattr(c, "open", 0)),
-                "high":   float(getattr(c, "high", 0)),
-                "low":    float(getattr(c, "low", 0)),
-                "close":  float(getattr(c, "close", 0)),
-                "volume": float(getattr(c, "volume", 0)),
+                "timestamp": int(d.get("start", 0)),
+                "open":   float(d.get("open", 0)),
+                "high":   float(d.get("high", 0)),
+                "low":    float(d.get("low", 0)),
+                "close":  float(d.get("close", 0)),
+                "volume": float(d.get("volume", 0)),
             })
 
     if not rows:
@@ -98,30 +97,42 @@ def get_candles(product_id: str = config.PRODUCT_ID,
 def get_latest_price(product_id: str = config.PRODUCT_ID) -> float:
     """Get the current price from Coinbase product ticker."""
     product = _client.get_product(product_id=product_id)
-    if isinstance(product, dict):
-        return float(product.get("price", 0))
+    data = product.to_dict() if hasattr(product, 'to_dict') else product
+    if isinstance(data, dict):
+        return float(data.get("price", 0))
     return float(getattr(product, "price", 0))
 
 
 def get_balance(currency: str = "USD") -> float:
-    """Get available balance for a currency."""
+    """Get available balance for a currency. Also checks USDC if USD requested."""
     try:
-        accounts = _client.get_accounts()
-        acct_list = accounts.get("accounts", []) if isinstance(accounts, dict) else getattr(accounts, "accounts", [])
+        accounts_resp = _client.get_accounts(limit=250)
+        data = accounts_resp.to_dict() if hasattr(accounts_resp, 'to_dict') else accounts_resp
+        acct_list = data.get("accounts", []) if isinstance(data, dict) else []
+
+        found_balance = 0.0
         for acct in acct_list:
             if isinstance(acct, dict):
                 curr = acct.get("currency", "")
                 avail = acct.get("available_balance", {})
                 bal = float(avail.get("value", 0)) if isinstance(avail, dict) else 0
             else:
-                curr = getattr(acct, "currency", "")
-                avail = getattr(acct, "available_balance", None)
-                if avail:
-                    bal = float(getattr(avail, "value", 0) if not isinstance(avail, dict) else avail.get("value", 0))
-                else:
-                    bal = 0
+                ad = acct.to_dict() if hasattr(acct, 'to_dict') else {}
+                curr = ad.get("currency", "")
+                avail = ad.get("available_balance", {})
+                bal = float(avail.get("value", 0)) if isinstance(avail, dict) else 0
+
+            # Log non-zero balances for debugging
+            if bal > 0:
+                log(f"[BROKER] Found balance: {curr} = {bal}")
+
             if curr == currency:
-                return bal
+                found_balance = bal
+            # Coinbase unifies USD/USDC — check both if looking for USD
+            elif currency == "USD" and curr == "USDC" and found_balance == 0:
+                found_balance = bal
+
+        return found_balance
     except Exception as e:
         log(f"[BROKER] Error getting balance: {e}")
     return 0.0
@@ -135,7 +146,8 @@ def place_buy(product_id: str, dollars: float) -> str:
         product_id=product_id,
         quote_size=str(round(dollars, 2)),
     )
-    order_id = order.get("order_id", "") if isinstance(order, dict) else getattr(order, "order_id", "")
+    data = order.to_dict() if hasattr(order, 'to_dict') else order
+    order_id = data.get("order_id", "") if isinstance(data, dict) else ""
     log(f"[BROKER] BUY ${dollars:.2f} of {product_id} — {order_id}")
     return order_id
 
@@ -148,7 +160,8 @@ def place_sell(product_id: str, base_size: str) -> str:
         product_id=product_id,
         base_size=base_size,
     )
-    order_id = order.get("order_id", "") if isinstance(order, dict) else getattr(order, "order_id", "")
+    data = order.to_dict() if hasattr(order, 'to_dict') else order
+    order_id = data.get("order_id", "") if isinstance(data, dict) else ""
     log(f"[BROKER] SELL {base_size} of {product_id} — {order_id}")
     return order_id
 

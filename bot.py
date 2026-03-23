@@ -55,10 +55,12 @@ def _open_position(price: float, long_votes: int, short_votes: int, votes: dict)
     global _position, _high_water
 
     try:
-        # Check we have enough USD
+        # Check we have enough USD/USDC
         usd_balance = broker.get_balance("USD")
         if usd_balance < config.MAX_TRADE_DOLLARS:
-            log(f"[BOT] Insufficient USD balance: ${usd_balance:.2f} < ${config.MAX_TRADE_DOLLARS:.2f}")
+            usd_balance = broker.get_balance("USDC")
+        if usd_balance < config.MAX_TRADE_DOLLARS:
+            log(f"[BOT] Insufficient balance: ${usd_balance:.2f} < ${config.MAX_TRADE_DOLLARS:.2f}")
             notify(f"⚠️ Can't trade — only ${usd_balance:.2f} available (need ${config.MAX_TRADE_DOLLARS:.2f})")
             return False
 
@@ -293,8 +295,11 @@ def run():
                 log(f"[BOT] Emergency sell on restart also failed: {e2}")
 
     # Get starting balance
-    usd_balance = broker.get_balance("USD")
-    xrp_balance = broker.get_balance("XRP")
+    usd_balance  = broker.get_balance("USD")
+    usdc_balance = broker.get_balance("USDC")
+    xrp_balance  = broker.get_balance("XRP")
+    cash_display = usd_balance if usd_balance > 0 else usdc_balance
+    cash_label   = "USD" if usd_balance > 0 else "USDC"
 
     notify(
         "Winston v10 🚀 XRP Momentum Mode\n"
@@ -303,7 +308,7 @@ def run():
         f"Hard stop: {config.HARD_STOP_PCT*100:.1f}% | "
         f"Trail: {config.TRAIL_DISTANCE_PCT*100:.1f}% after {config.TRAIL_ACTIVATE_PCT*100:.1f}% profit\n"
         f"Max hold: {config.MAX_HOLD_SECS//60} min | ADX threshold: {config.ADX_THRESHOLD}\n"
-        f"💰 Balance: ${usd_balance:.2f} USD | {xrp_balance:.4f} XRP"
+        f"💰 Balance: ${cash_display:.2f} {cash_label} | {xrp_balance:.4f} XRP"
     )
     log("[BOT] Winston v10 XRP started — 24/7 mode")
 
