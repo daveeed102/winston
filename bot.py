@@ -258,9 +258,16 @@ def _run_cycle():
         return
 
     # ── Grok AI gate ─────────────────────────────────────────────────────
+    # Get real-time price first — this is what we'd actually buy at
+    try:
+        entry_price = broker.get_latest_price(config.PRODUCT_ID)
+    except Exception:
+        entry_price = price
+
     # Technical indicators say GO — now ask Grok if it agrees
     vote_summary = f"{result['long_votes']}L/{result['short_votes']}S"
     grok_says_buy = grok.predict_price_direction(
+        entry_price=entry_price,
         current_price=price,
         vote_summary=vote_summary,
         indicator_info=result["info"],
@@ -272,12 +279,6 @@ def _run_cycle():
         return
 
     log(f"[BOT] 🤖 Grok says YES — proceeding with entry")
-
-    # Get real-time price for entry
-    try:
-        entry_price = broker.get_latest_price(config.PRODUCT_ID)
-    except Exception:
-        entry_price = price
 
     log(f"[BOT] 🎯 LONG {config.PRODUCT_ID} @ {entry_price:.4f} "
         f"| {result['long_votes']}L/{result['short_votes']}S")
