@@ -220,6 +220,13 @@ def _run_5min_cycle():
             log(f"[BOT] Bar fetch failed {ticker}: {e}")
             continue
 
+        bar_count = len(df)
+        log(f"[BOT] {ticker} — got {bar_count} bars")
+
+        if bar_count < 30:
+            log(f"[BOT] {ticker} — not enough bars ({bar_count}/30 needed) — skipping")
+            continue
+
         result = strategy.get_vote_score(df, ticker)
         signal = result["signal"]
         price  = result["info"].get("close", 0)
@@ -345,6 +352,11 @@ def run():
 
             notify_scan(_watchlist)
             _run_5min_cycle()
+
+            # Always sleep 5 minutes after a cycle — whether we traded or skipped.
+            # Without this the loop fires hundreds of times per second on skip.
+            log("[BOT] Cycle complete — waiting 5 min for next bar...")
+            time.sleep(config.RUN_INTERVAL_SECS)
 
         except Exception as e:
             notify_error(str(e))
