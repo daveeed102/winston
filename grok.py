@@ -66,30 +66,31 @@ def predict_price_direction(
 
         # Build the prompt
         system_prompt = (
-            "You are a quantitative crypto trading analyst. You analyze multi-timeframe "
-            "price data and technical indicators to predict very short-term price direction. "
-            "You are decisive and direct. You must respond with ONLY a JSON object, "
-            "no markdown, no backticks, no explanation outside the JSON:\n"
-            '{"prediction": "YES" or "NO", "confidence": <0.0 to 1.0>, "reason": "<one sentence>"}\n\n'
-            "YES means you believe the price will be HIGHER than the current price.\n"
-            "NO means you believe it will be LOWER or FLAT.\n"
-            "Be honest — if the data is unclear, say NO with low confidence."
+            "You are an aggressive short-term crypto scalping analyst. Your job is to act as "
+            "a TIEBREAKER for a trading bot. The bot's technical indicators have ALREADY signaled "
+            "a buy — your role is to confirm or reject based on the price action data.\n\n"
+            "IMPORTANT RULES:\n"
+            "- You should DEFAULT to YES. The technicals already passed. You are the final check.\n"
+            "- Only say NO if you see something clearly dangerous: a sharp selloff in progress, "
+            "a breakdown through support, a volume spike on red candles, or a clear reversal pattern.\n"
+            "- A negative MACD or RSI below 50 alone is NOT a reason to say NO. These are lagging "
+            "indicators and the bot already accounts for them in its vote system.\n"
+            "- Flat/consolidating price action is fine — say YES. Small dips are fine — say YES.\n"
+            "- You are looking for SHORT-TERM bounces and micro-momentum, not long-term trends.\n\n"
+            "Respond with ONLY a JSON object, no markdown, no backticks:\n"
+            '{"prediction": "YES" or "NO", "confidence": <0.0 to 1.0>, "reason": "<one sentence>"}'
         )
 
         user_prompt = (
-            f"Will XRP-USD be HIGHER than ${current_price:.4f} in exactly 4 minutes and 30 seconds?\n\n"
+            f"The trading bot's technical indicators voted {vote_summary} in favor of buying XRP-USD.\n"
+            f"Should we proceed with the buy? Will price hold or go up in the next 4.5 minutes?\n\n"
             f"CURRENT PRICE: ${current_price:.4f}\n"
-            f"TECHNICAL VOTE: {vote_summary}\n"
-            f"RSI: {indicator_info.get('rsi', 'N/A')}\n"
-            f"MACD: {indicator_info.get('macd', 'N/A')}\n"
-            f"VWAP: {indicator_info.get('vwap', 'N/A')}\n"
-            f"ADX (trend strength): {indicator_info.get('adx', 'N/A')}\n"
-            f"ATR (volatility): {indicator_info.get('atr', 'N/A')}\n"
-            f"Bollinger Upper: {indicator_info.get('bb_upper', 'N/A')}\n"
-            f"Bollinger Lower: {indicator_info.get('bb_lower', 'N/A')}\n\n"
+            f"RSI: {indicator_info.get('rsi', 'N/A')} | "
+            f"MACD: {indicator_info.get('macd', 'N/A')} | "
+            f"VWAP: {indicator_info.get('vwap', 'N/A')} | "
+            f"ADX: {indicator_info.get('adx', 'N/A')}\n\n"
             f"{candle_data}\n\n"
-            f"Based on this multi-timeframe data, will XRP be above ${current_price:.4f} "
-            f"in 4 minutes 30 seconds? Respond with JSON only."
+            f"Remember: DEFAULT to YES unless you see active danger. Respond with JSON only."
         )
 
         headers = {
@@ -102,7 +103,7 @@ def predict_price_direction(
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "temperature": 0.1,  # Low temp for more deterministic predictions
+            "temperature": 0.3,  # Slightly higher for less conservative predictions
         }
 
         log("[GROK] Asking Grok for price prediction...")
