@@ -19,44 +19,40 @@ MAX_OPEN_POSITIONS = 1        # One position at a time
 PRODUCT_ID = "XRP-USD"
 
 # ── Schedule ─────────────────────────────────────────────────────────────────
-# Crypto is 24/7 — no market hours restriction
-# But we scan every 2 minutes for faster reaction to momentum
-SCAN_INTERVAL_SECS = 120      # 2 minutes between scans
+# Scan every 5 min — less churn, bigger moves between checks
+SCAN_INTERVAL_SECS = 300      # 5 minutes between scans
 
 # ── Candle settings ──────────────────────────────────────────────────────────
-CANDLE_GRANULARITY = "FIVE_MINUTE"    # 5-min candles
-CANDLE_LIMIT       = 100              # How many candles to fetch (max 300)
+CANDLE_GRANULARITY = "FIFTEEN_MINUTE"   # 15-min candles — less noise, bigger signals
+CANDLE_LIMIT       = 100                # How many candles to fetch (max 300)
 
 # ── Technical indicators ─────────────────────────────────────────────────────
 EMA_FAST       = 9
 EMA_SLOW       = 21
 RSI_PERIOD     = 14
-RSI_OVERSOLD   = 35       # XRP is more volatile — wider bands
+RSI_OVERSOLD   = 35
 RSI_OVERBOUGHT = 75
 ATR_PERIOD     = 14
 
 # ── Voting system ────────────────────────────────────────────────────────────
-# 10 total votes. Need 5+ to enter (higher than SPY because XRP is noisier).
-# But ADX threshold is lower (15) so we still get trades.
 MIN_VOTE_SCORE = 4
 
 # ── Stops ────────────────────────────────────────────────────────────────────
-# XRP is more volatile than SPY — wider stops to avoid getting shaken out
-HARD_STOP_PCT      = 0.012    # 1.2% hard stop
+HARD_STOP_PCT      = 0.012    # 1.2% hard stop — still cut losers fast
 EMERGENCY_STOP_PCT = 0.025    # 2.5% emergency stop (flash crash)
 
 # ── Trailing stop ────────────────────────────────────────────────────────────
-# Once we're up 0.5%, activate trailing stop at 0.4% behind peak
-# This lets winners run instead of cutting at exactly 5 min
-TRAIL_ACTIVATE_PCT = 0.005    # Activate trailing after 0.5% profit
-TRAIL_DISTANCE_PCT = 0.004    # Trail 0.4% behind the high water mark
+# Activate after 1.0% profit — don't lock in until the move is real
+# Trail 0.6% behind peak — wider so you don't get shaken out on noise
+TRAIL_ACTIVATE_PCT = 0.010    # Activate trailing after 1.0% profit
+TRAIL_DISTANCE_PCT = 0.006    # Trail 0.6% behind the high water mark
 
 # ── Max hold time ────────────────────────────────────────────────────────────
-MAX_HOLD_SECS     = 600       # 10 minutes max hold (crypto moves faster)
-HOLD_CHECK_SECS   = 15        # Check price every 15 seconds during hold
+MAX_HOLD_SECS     = 3600      # 1 hour max hold — give the trade room to work
+HOLD_CHECK_SECS   = 30        # Check price every 30 seconds during hold
 
 # ── ADX threshold ────────────────────────────────────────────────────────────
-ADX_THRESHOLD = 15            # Lower than SPY (20) — XRP trends differently
+ADX_THRESHOLD = 15
 
 # ── Discord ──────────────────────────────────────────────────────────────────
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")

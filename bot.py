@@ -17,7 +17,7 @@ import config
 import broker
 import strategy
 import database
-import grok
+import grok  # momentum filter (not AI anymore)
 from logger import log, notify_buy, notify_sell, notify_summary, notify_startup, notify_error
 
 
@@ -66,6 +66,10 @@ def _open_position(price: float, long_votes: int, short_votes: int, votes: dict)
             return False
 
         order_id = broker.place_buy(config.PRODUCT_ID, config.MAX_TRADE_DOLLARS)
+
+        if not order_id:
+            log("[BOT] Buy order rejected (post-only) — will retry next cycle")
+            return False
 
         # Calculate how much XRP we got (approximate)
         base_size = f"{config.MAX_TRADE_DOLLARS / price:.6f}"
@@ -254,20 +258,12 @@ def _run_cycle():
     except Exception:
         entry_price = price
 
-    # Technical indicators say GO — now ask Grok if it agrees
-    vote_summary = f"{result['long_votes']}L/{result['short_votes']}S"
-    grok_says_buy = grok.predict_price_direction(
-        entry_price=entry_price,
-        current_price=price,
-        vote_summary=vote_summary,
-        indicator_info=result["info"],
-    )
+    # Technical indicators say GO — check momentum confirmation
+    momentum_ok = grok.check_momentum(df)
 
-    if not grok_says_buy:
-        log(f"[BOT] 🤖 Grok says NO — skipping despite {vote_summary} votes")
+    if not momentum_ok:
+        log(f"[BOT] ⏸️ Momentum check failed — skipping")
         return
-
-    log(f"[BOT] 🤖 Grok says YES — proceeding with entry")
 
     log(f"[BOT] 🎯 LONG {config.PRODUCT_ID} @ {entry_price:.4f} "
         f"| {result['long_votes']}L/{result['short_votes']}S")

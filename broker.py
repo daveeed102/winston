@@ -139,16 +139,14 @@ def get_balance(currency: str = "USD") -> float:
 
 
 def place_buy(product_id: str, dollars: float) -> str:
-    """Place a limit buy order for $X of product at current price. Returns order_id.
-    Uses limit orders instead of market orders for lower maker fees (0.40% vs 0.60%).
-    Sets limit price slightly above current price to ensure immediate fill."""
+    """Place a post-only limit buy order for maker fees only.
+    post_only=True means the order is rejected if it would be a taker.
+    Returns order_id, or empty string if rejected."""
     client_order_id = str(uuid.uuid4())
 
-    # Get current price to calculate base_size and set limit
+    # Get current price — set limit at current price so it sits on the book
     price = get_latest_price(product_id)
-    # Set limit 0.1% above current price — fills immediately but as limit order
-    limit_price = round(price * 1.001, 4)
-    # Calculate how much XRP we can buy (minus a tiny buffer for rounding)
+    limit_price = round(price, 4)
     base_size = round(dollars / limit_price, 6)
 
     order = _client.limit_order_gtc_buy(
@@ -156,10 +154,16 @@ def place_buy(product_id: str, dollars: float) -> str:
         product_id=product_id,
         base_size=str(base_size),
         limit_price=str(limit_price),
+        post_only=True,
     )
     data = order.to_dict() if hasattr(order, 'to_dict') else order
 
-    # Check for success/error response format
+    # Check if order was rejected (post_only rejection)
+    if isinstance(data, dict) and data.get("success") is False:
+        error = data.get("error_response", {})
+        log(f"[BROKER] Post-only BUY rejected (would be taker) — {error}")
+        return ""
+
     if isinstance(data, dict) and "success_response" in data:
         order_id = data["success_response"].get("order_id", "")
     elif isinstance(data, dict) and "order_id" in data:
@@ -167,26 +171,46 @@ def place_buy(product_id: str, dollars: float) -> str:
     else:
         order_id = data.get("order_id", "") if isinstance(data, dict) else ""
 
-    log(f"[BROKER] LIMIT BUY {base_size} {product_id} @ ${limit_price} — {order_id}")
+    log(f"[BROKER] LIMIT BUY (post-only) {base_size} {product_id} @ ${limit_price} — {order_id}")
     return order_id
 
 
 def place_sell(product_id: str, base_size: str) -> str:
-    """Place a limit sell order. Returns order_id.
-    Sets limit price slightly below current price to ensure immediate fill."""
+    """Place a post-only limit sell order for maker fees only.
+    Returns order_id, or empty string if rejected."""
     client_order_id = str(uuid.uuid4())
 
-    # Get current price and set limit slightly below for immediate fill
     price = get_latest_price(product_id)
-    limit_price = round(price * 0.999, 4)
+    limit_price = round(price, 4)
 
     order = _client.limit_order_gtc_sell(
         client_order_id=client_order_id,
         product_id=product_id,
         base_size=base_size,
         limit_price=str(limit_price),
+        post_only=True,
     )
     data = order.to_dict() if hasattr(order, 'to_dict') else order
+
+    if isinstance(data, dict) and data.get("success") is False:
+        error = data.get("error_response", {})
+        log(f"[BROKER] Post-only SELL rejected (would be taker) — {error}")
+        # Fall back to regular limit sell slightly below price so we don't get stuck holding
+        fallback_id = str(uuid.uuid4())
+        limit_price_fallback = round(price * 0.999, 4)
+        order2 = _client.limit_order_gtc_sell(
+            client_order_id=fallback_id,
+            product_id=product_id,
+            base_size=base_size,
+            limit_price=str(limit_price_fallback),
+        )
+        data2 = order2.to_dict() if hasattr(order2, 'to_dict') else order2
+        if isinstance(data2, dict) and "success_response" in data2:
+            order_id = data2["success_response"].get("order_id", "")
+        else:
+            order_id = data2.get("order_id", "") if isinstance(data2, dict) else ""
+        log(f"[BROKER] LIMIT SELL (fallback) {base_size} {product_id} @ ${limit_price_fallback} — {order_id}")
+        return order_id
 
     if isinstance(data, dict) and "success_response" in data:
         order_id = data["success_response"].get("order_id", "")
@@ -195,7 +219,7 @@ def place_sell(product_id: str, base_size: str) -> str:
     else:
         order_id = data.get("order_id", "") if isinstance(data, dict) else ""
 
-    log(f"[BROKER] LIMIT SELL {base_size} {product_id} @ ${limit_price} — {order_id}")
+    log(f"[BROKER] LIMIT SELL (post-only) {base_size} {product_id} @ ${limit_price} — {order_id}")
     return order_id
 
 

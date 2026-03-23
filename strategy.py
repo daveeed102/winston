@@ -127,16 +127,17 @@ def _trend_strength(df: pd.DataFrame, period: int = 14) -> float:
     return float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else 0.0
 
 
-def _resample_to_15min(df: pd.DataFrame) -> pd.DataFrame:
-    df15 = df.copy().reset_index(drop=True)
-    df15 = df15.groupby(df15.index // 3).agg({
+def _resample_to_higher_tf(df: pd.DataFrame) -> pd.DataFrame:
+    """Resample to higher timeframe. With 15-min candles, groups of 4 = 1 hour."""
+    dfh = df.copy().reset_index(drop=True)
+    dfh = dfh.groupby(dfh.index // 4).agg({
         "open":   "first",
         "high":   "max",
         "low":    "min",
         "close":  "last",
         "volume": "sum",
     })
-    return df15
+    return dfh
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -208,7 +209,7 @@ def get_vote_score(df: pd.DataFrame, ticker: str = "") -> dict:
 
     # Vote 2: Higher Timeframe
     try:
-        df15 = _resample_to_15min(df)
+        df15 = _resample_to_higher_tf(df)
         if len(df15) >= 5:
             ema_fast_15 = float(_ema(df15["close"], EMA_FAST).iloc[-1])
             ema_slow_15 = float(_ema(df15["close"], EMA_SLOW).iloc[-1])
