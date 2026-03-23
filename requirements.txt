@@ -1,5 +1,3 @@
 coinbase-advanced-py
-pandas
-numpy
 requests
 psycopg2-binary

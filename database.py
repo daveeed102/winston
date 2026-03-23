@@ -1,9 +1,5 @@
 """
-database.py — PostgreSQL persistence for Winston XRP
-
-Tracks:
-  - Open positions (survives restarts)
-  - Trade history (for daily summaries)
+database.py — PostgreSQL persistence for Winston v11 Degen Mode
 """
 
 import psycopg2
@@ -20,27 +16,24 @@ def init_db():
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS xrp_positions (
-                    ticker TEXT PRIMARY KEY,
-                    side TEXT NOT NULL,
+                CREATE TABLE IF NOT EXISTS degen_holdings (
+                    product_id TEXT PRIMARY KEY,
                     entry_price DOUBLE PRECISION NOT NULL,
-                    stop_price DOUBLE PRECISION,
-                    target_price DOUBLE PRECISION,
                     dollars DOUBLE PRECISION NOT NULL,
-                    base_size TEXT DEFAULT '',
+                    base_size DOUBLE PRECISION NOT NULL,
                     entry_time TIMESTAMP DEFAULT NOW()
                 )
             """)
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS xrp_trades (
+                CREATE TABLE IF NOT EXISTS degen_trades (
                     id SERIAL PRIMARY KEY,
-                    ticker TEXT NOT NULL,
-                    side TEXT NOT NULL,
+                    product_id TEXT NOT NULL,
                     entry_price DOUBLE PRECISION NOT NULL,
                     exit_price DOUBLE PRECISION NOT NULL,
                     dollars DOUBLE PRECISION NOT NULL,
                     pnl DOUBLE PRECISION NOT NULL,
-                    reason TEXT NOT NULL,
+                    pnl_pct DOUBLE PRECISION NOT NULL,
+                    hold_hours DOUBLE PRECISION NOT NULL,
                     entry_time TIMESTAMP,
                     exit_time TIMESTAMP DEFAULT NOW()
                 )
@@ -49,75 +42,76 @@ def init_db():
     log("[DB] Tables ready.")
 
 
-def save_position(ticker: str, side: str, entry_price: float,
-                  stop_price: float, target_price: float,
-                  dollars: float, base_size: str = ""):
+def save_holding(product_id: str, entry_price: float, dollars: float, base_size: float):
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO xrp_positions (ticker, side, entry_price, stop_price, target_price, dollars, base_size)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (ticker) DO UPDATE SET
-                    side=EXCLUDED.side, entry_price=EXCLUDED.entry_price,
-                    stop_price=EXCLUDED.stop_price, target_price=EXCLUDED.target_price,
-                    dollars=EXCLUDED.dollars, base_size=EXCLUDED.base_size,
-                    entry_time=NOW()
-            """, (ticker, side, entry_price, stop_price, target_price, dollars, base_size))
+                INSERT INTO degen_holdings (product_id, entry_price, dollars, base_size)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (product_id) DO UPDATE SET
+                    entry_price=EXCLUDED.entry_price, dollars=EXCLUDED.dollars,
+                    base_size=EXCLUDED.base_size, entry_time=NOW()
+            """, (product_id, entry_price, dollars, base_size))
         conn.commit()
-    log(f"[DB] Saved {side} position for {ticker}")
 
 
-def load_positions() -> dict:
-    positions = {}
+def load_holdings() -> dict:
+    holdings = {}
     try:
         with _conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT ticker, side, entry_price, dollars, base_size, entry_time FROM xrp_positions")
+                cur.execute("SELECT product_id, entry_price, dollars, base_size, entry_time FROM degen_holdings")
                 for row in cur.fetchall():
-                    positions[row[0]] = {
-                        "side": row[1],
-                        "entry_price": row[2],
-                        "dollars": row[3],
-                        "base_size": row[4] or "",
-                        "entry_time": row[5],
+                    holdings[row[0]] = {
+                        "entry_price": row[1],
+                        "dollars": row[2],
+                        "base_size": row[3],
+                        "entry_time": row[4],
                     }
     except Exception as e:
-        log(f"[DB] Error loading positions: {e}")
-    log(f"[DB] Loaded {len(positions)} open positions.")
-    return positions
+        log(f"[DB] Error loading holdings: {e}")
+    log(f"[DB] Loaded {len(holdings)} holdings.")
+    return holdings
 
 
-def delete_position(ticker: str):
+def delete_holding(product_id: str):
     with _conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM xrp_positions WHERE ticker = %s", (ticker,))
+            cur.execute("DELETE FROM degen_holdings WHERE product_id = %s", (product_id,))
         conn.commit()
 
 
-def record_trade(ticker: str, side: str, entry_price: float,
-                 exit_price: float, dollars: float, pnl: float,
-                 reason: str, entry_time=None):
+def clear_all_holdings():
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM degen_holdings")
+        conn.commit()
+
+
+def record_trade(product_id: str, entry_price: float, exit_price: float,
+                 dollars: float, pnl: float, pnl_pct: float,
+                 hold_hours: float, entry_time=None):
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO xrp_trades (ticker, side, entry_price, exit_price, dollars, pnl, reason, entry_time)
+                INSERT INTO degen_trades (product_id, entry_price, exit_price, dollars, pnl, pnl_pct, hold_hours, entry_time)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """, (ticker, side, entry_price, exit_price, dollars, pnl, reason, entry_time))
+            """, (product_id, entry_price, exit_price, dollars, pnl, pnl_pct, hold_hours, entry_time))
         conn.commit()
 
 
-def get_summary() -> dict:
+def get_daily_summary() -> dict:
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT COUNT(*), COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0),
                        COALESCE(SUM(pnl), 0)
-                FROM xrp_trades
+                FROM degen_trades
                 WHERE exit_time >= CURRENT_DATE
             """)
             row = cur.fetchone()
             return {
-                "total_trades":   row[0],
+                "total_trades": row[0],
                 "winning_trades": row[1],
-                "total_pnl":      row[2],
+                "total_pnl": row[2],
             }

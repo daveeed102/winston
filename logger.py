@@ -1,13 +1,6 @@
 """
-logger.py — Logging + Discord notifications for Winston XRP
-
-Discord only gets the essentials:
-  - BOUGHT $20 of XRP at $X.XXXX
-  - SOLD for $X.XX  +$0.XX / -$0.XX
-  - Daily summary
-  - Errors
-
-Everything else goes to Railway logs only.
+logger.py — Winston v11 Degen Mode logging
+Discord only gets: picks, sells, and summaries.
 """
 
 import requests
@@ -16,7 +9,6 @@ import config
 
 
 def log(msg: str):
-    """Print to Railway logs only — Discord never sees this."""
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
@@ -30,34 +22,37 @@ def _discord(content: str):
         pass
 
 
-def notify_buy(price: float, dollars: float):
-    msg = f"🟢 BOUGHT ${dollars:.0f} worth of XRP at ${price:.4f}"
+def notify_picks(picks: list, reasons: dict):
+    lines = ["🎰 **DEGEN PICKS — Next 6 Hours**"]
+    for coin in picks:
+        reason = reasons.get(coin, "")
+        lines.append(f"  💎 **{coin}** — ${config.DOLLARS_PER_PICK:.0f} — {reason}")
+    msg = "\n".join(lines)
     log(f"[DISCORD] {msg}")
     _discord(msg)
 
 
-def notify_sell(sell_price: float, pnl: float):
+def notify_sell(coin: str, pnl: float, pnl_pct: float):
     sign = "+" if pnl >= 0 else ""
     emoji = "✅" if pnl >= 0 else "❌"
-    msg = f"{emoji} SOLD XRP at ${sell_price:.4f}  {sign}${pnl:.4f}"
+    msg = f"{emoji} SOLD **{coin}** {sign}${pnl:.2f} ({sign}{pnl_pct:.1f}%)"
     log(f"[DISCORD] {msg}")
     _discord(msg)
 
 
-def notify_summary(total: int, wins: int, pnl: float):
-    sign = "+" if pnl >= 0 else ""
-    wr   = (wins / total * 100) if total > 0 else 0
-    msg = (
-        f"📊 **Daily Summary**\n"
-        f"Trades: {total} | Wins: {wins} ({wr:.0f}%)\n"
-        f"Net P&L: {sign}${pnl:.4f}"
-    )
+def notify_cycle_summary(total_pnl: float, results: list):
+    sign = "+" if total_pnl >= 0 else ""
+    emoji = "🟢" if total_pnl >= 0 else "🔴"
+    lines = [f"{emoji} **Cycle Done** — Net: {sign}${total_pnl:.2f}"]
+    for r in results:
+        s = "+" if r["pnl"] >= 0 else ""
+        lines.append(f"  {r['coin']}: {s}${r['pnl']:.2f} ({s}{r['pnl_pct']:.1f}%)")
+    msg = "\n".join(lines)
     log(f"[DISCORD] {msg}")
     _discord(msg)
 
 
 def notify_startup(msg: str):
-    """Startup message only — sent once when bot boots."""
     log(f"[DISCORD] {msg}")
     _discord(msg)
 

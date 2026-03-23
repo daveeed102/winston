@@ -1,237 +1,146 @@
 """
-broker.py — Coinbase Advanced Trade API wrapper for Winston XRP
+broker.py — Coinbase Advanced Trade wrapper for Winston v11 Degen Mode
 
-Handles:
-  - Fetching candles (OHLCV) as pandas DataFrames
-  - Getting real-time price via get_product
-  - Placing market buy/sell orders
-  - Account balance queries
+Handles buying/selling multiple coins, getting prices, listing available products.
 """
 
-import pandas as pd
 import uuid
-from datetime import datetime, timezone, timedelta
 from coinbase.rest import RESTClient
 
 import config
 from logger import log
 
-# Initialize the Coinbase client
 _client = RESTClient(
     api_key=config.COINBASE_API_KEY,
     api_secret=config.COINBASE_API_SECRET,
 )
 
 
-def get_candles(product_id: str = config.PRODUCT_ID,
-                granularity: str = config.CANDLE_GRANULARITY,
-                limit: int = config.CANDLE_LIMIT) -> pd.DataFrame:
-    """
-    Fetch OHLCV candles from Coinbase.
-    Returns a pandas DataFrame with columns: open, high, low, close, volume
-    """
-    # Coinbase wants UNIX timestamps as strings
-    now   = datetime.now(timezone.utc)
+def get_available_coins() -> list:
+    """Get all tradeable USD pairs on Coinbase. Returns list of product_ids like ['BTC-USD', 'ETH-USD', ...]"""
+    try:
+        resp = _client.get_products(product_type="SPOT")
+        data = resp.to_dict() if hasattr(resp, 'to_dict') else resp
+        products = data.get("products", []) if isinstance(data, dict) else []
 
-    # Calculate how far back we need to go based on granularity
-    granularity_seconds = {
-        "ONE_MINUTE": 60,
-        "FIVE_MINUTE": 300,
-        "FIFTEEN_MINUTE": 900,
-        "THIRTY_MINUTE": 1800,
-        "ONE_HOUR": 3600,
-        "TWO_HOUR": 7200,
-        "SIX_HOUR": 21600,
-        "ONE_DAY": 86400,
-    }
-    secs = granularity_seconds.get(granularity, 300)
-    start = now - timedelta(seconds=secs * limit)
+        coins = []
+        for p in products:
+            if isinstance(p, dict):
+                pid = p.get("product_id", "")
+                status = p.get("status", "")
+                is_disabled = p.get("is_disabled", False)
+                trading_disabled = p.get("trading_disabled", False)
+            else:
+                pd_dict = p.to_dict() if hasattr(p, 'to_dict') else {}
+                pid = pd_dict.get("product_id", "")
+                status = pd_dict.get("status", "")
+                is_disabled = pd_dict.get("is_disabled", False)
+                trading_disabled = pd_dict.get("trading_disabled", False)
 
-    start_str = str(int(start.timestamp()))
-    end_str   = str(int(now.timestamp()))
+            if pid.endswith("-USD") and not is_disabled and not trading_disabled:
+                coins.append(pid)
 
-    candles_resp = _client.get_candles(
-        product_id=product_id,
-        start=start_str,
-        end=end_str,
-        granularity=granularity,
-    )
-
-    # SDK returns BaseResponse objects — convert to dict for reliable access
-    data = candles_resp.to_dict() if hasattr(candles_resp, 'to_dict') else candles_resp
-    candles = data.get("candles", []) if isinstance(data, dict) else []
-
-    rows = []
-    for c in candles:
-        if isinstance(c, dict):
-            rows.append({
-                "timestamp": int(c.get("start", 0)),
-                "open":   float(c.get("open", 0)),
-                "high":   float(c.get("high", 0)),
-                "low":    float(c.get("low", 0)),
-                "close":  float(c.get("close", 0)),
-                "volume": float(c.get("volume", 0)),
-            })
-        else:
-            d = c.to_dict() if hasattr(c, 'to_dict') else {}
-            rows.append({
-                "timestamp": int(d.get("start", 0)),
-                "open":   float(d.get("open", 0)),
-                "high":   float(d.get("high", 0)),
-                "low":    float(d.get("low", 0)),
-                "close":  float(d.get("close", 0)),
-                "volume": float(d.get("volume", 0)),
-            })
-
-    if not rows:
-        raise ValueError(f"No candle data returned for {product_id}")
-
-    df = pd.DataFrame(rows)
-    # Coinbase returns newest first — sort oldest first for indicator calc
-    df = df.sort_values("timestamp").reset_index(drop=True)
-    df = df[["open", "high", "low", "close", "volume"]].astype(float)
-
-    return df
+        log(f"[BROKER] Found {len(coins)} tradeable USD pairs")
+        return coins
+    except Exception as e:
+        log(f"[BROKER] Error fetching products: {e}")
+        return []
 
 
-def get_latest_price(product_id: str = config.PRODUCT_ID) -> float:
-    """Get the current price from Coinbase product ticker."""
+def get_price(product_id: str) -> float:
+    """Get current price for a product."""
     product = _client.get_product(product_id=product_id)
     data = product.to_dict() if hasattr(product, 'to_dict') else product
-    if isinstance(data, dict):
-        return float(data.get("price", 0))
-    return float(getattr(product, "price", 0))
+    return float(data.get("price", 0)) if isinstance(data, dict) else 0.0
 
 
-def get_balance(currency: str = "USD") -> float:
-    """Get available balance for a currency. Also checks USDC if USD requested."""
+def get_balance(currency: str) -> float:
+    """Get available balance for a currency."""
     try:
         accounts_resp = _client.get_accounts(limit=250)
         data = accounts_resp.to_dict() if hasattr(accounts_resp, 'to_dict') else accounts_resp
         acct_list = data.get("accounts", []) if isinstance(data, dict) else []
 
-        found_balance = 0.0
         for acct in acct_list:
-            if isinstance(acct, dict):
-                curr = acct.get("currency", "")
-                avail = acct.get("available_balance", {})
-                bal = float(avail.get("value", 0)) if isinstance(avail, dict) else 0
-            else:
-                ad = acct.to_dict() if hasattr(acct, 'to_dict') else {}
+            ad = acct.to_dict() if hasattr(acct, 'to_dict') else acct
+            if isinstance(ad, dict):
                 curr = ad.get("currency", "")
                 avail = ad.get("available_balance", {})
                 bal = float(avail.get("value", 0)) if isinstance(avail, dict) else 0
-
-            # Log only the currency we're looking for
-            if curr == currency and bal > 0:
-                log(f"[BROKER] {curr} balance: {bal}")
-
-            if curr == currency:
-                found_balance = bal
-            # Coinbase unifies USD/USDC — check both if looking for USD
-            elif currency == "USD" and curr == "USDC" and found_balance == 0:
-                found_balance = bal
-
-        return found_balance
+                if curr == currency:
+                    return bal
     except Exception as e:
-        log(f"[BROKER] Error getting balance: {e}")
+        log(f"[BROKER] Error getting {currency} balance: {e}")
     return 0.0
 
 
-def place_buy(product_id: str, dollars: float) -> str:
-    """Place a post-only limit buy order for maker fees only.
-    post_only=True means the order is rejected if it would be a taker.
-    Returns order_id, or empty string if rejected."""
-    client_order_id = str(uuid.uuid4())
+def buy_coin(product_id: str, dollars: float) -> dict:
+    """Buy $X of a coin using market order. Returns {order_id, price, base_size} or empty dict on failure."""
+    try:
+        client_order_id = str(uuid.uuid4())
+        order = _client.market_order_buy(
+            client_order_id=client_order_id,
+            product_id=product_id,
+            quote_size=str(round(dollars, 2)),
+        )
+        data = order.to_dict() if hasattr(order, 'to_dict') else order
 
-    # Get current price — set limit at current price so it sits on the book
-    price = get_latest_price(product_id)
-    limit_price = round(price, 4)
-    base_size = round(dollars / limit_price, 6)
+        if isinstance(data, dict) and data.get("success") is False:
+            error = data.get("error_response", {})
+            log(f"[BROKER] BUY {product_id} failed: {error}")
+            return {}
 
-    order = _client.limit_order_gtc_buy(
-        client_order_id=client_order_id,
-        product_id=product_id,
-        base_size=str(base_size),
-        limit_price=str(limit_price),
-        post_only=True,
-    )
-    data = order.to_dict() if hasattr(order, 'to_dict') else order
+        if isinstance(data, dict) and "success_response" in data:
+            order_id = data["success_response"].get("order_id", "")
+        else:
+            order_id = data.get("order_id", "") if isinstance(data, dict) else ""
 
-    # Check if order was rejected (post_only rejection)
-    if isinstance(data, dict) and data.get("success") is False:
-        error = data.get("error_response", {})
-        log(f"[BROKER] Post-only BUY rejected (would be taker) — {error}")
-        return ""
+        price = get_price(product_id)
+        base_size = dollars / price if price > 0 else 0
 
-    if isinstance(data, dict) and "success_response" in data:
-        order_id = data["success_response"].get("order_id", "")
-    elif isinstance(data, dict) and "order_id" in data:
-        order_id = data["order_id"]
-    else:
-        order_id = data.get("order_id", "") if isinstance(data, dict) else ""
+        log(f"[BROKER] BOUGHT ${dollars:.2f} of {product_id} @ ${price:.6f} — {order_id}")
+        return {"order_id": order_id, "price": price, "base_size": base_size}
 
-    log(f"[BROKER] LIMIT BUY (post-only) {base_size} {product_id} @ ${limit_price} — {order_id}")
-    return order_id
+    except Exception as e:
+        log(f"[BROKER] BUY {product_id} error: {e}")
+        return {}
 
 
-def place_sell(product_id: str, base_size: str) -> str:
-    """Place a post-only limit sell order for maker fees only.
-    Returns order_id, or empty string if rejected."""
-    client_order_id = str(uuid.uuid4())
+def sell_coin(product_id: str) -> dict:
+    """Sell entire holding of a coin. Returns {price, pnl_pct} or empty dict."""
+    try:
+        base_currency = product_id.split("-")[0]
+        balance = get_balance(base_currency)
 
-    price = get_latest_price(product_id)
-    limit_price = round(price, 4)
+        if balance <= 0:
+            log(f"[BROKER] No {base_currency} to sell")
+            return {}
 
-    order = _client.limit_order_gtc_sell(
-        client_order_id=client_order_id,
-        product_id=product_id,
-        base_size=base_size,
-        limit_price=str(limit_price),
-        post_only=True,
-    )
-    data = order.to_dict() if hasattr(order, 'to_dict') else order
+        # Format base_size — different coins need different precision
+        price = get_price(product_id)
+        if price >= 1000:
+            base_size = f"{balance:.8f}"
+        elif price >= 1:
+            base_size = f"{balance:.6f}"
+        else:
+            base_size = f"{balance:.2f}"
 
-    if isinstance(data, dict) and data.get("success") is False:
-        error = data.get("error_response", {})
-        log(f"[BROKER] Post-only SELL rejected (would be taker) — {error}")
-        # Fall back to regular limit sell slightly below price so we don't get stuck holding
-        fallback_id = str(uuid.uuid4())
-        limit_price_fallback = round(price * 0.999, 4)
-        order2 = _client.limit_order_gtc_sell(
-            client_order_id=fallback_id,
+        client_order_id = str(uuid.uuid4())
+        order = _client.market_order_sell(
+            client_order_id=client_order_id,
             product_id=product_id,
             base_size=base_size,
-            limit_price=str(limit_price_fallback),
         )
-        data2 = order2.to_dict() if hasattr(order2, 'to_dict') else order2
-        if isinstance(data2, dict) and "success_response" in data2:
-            order_id = data2["success_response"].get("order_id", "")
-        else:
-            order_id = data2.get("order_id", "") if isinstance(data2, dict) else ""
-        log(f"[BROKER] LIMIT SELL (fallback) {base_size} {product_id} @ ${limit_price_fallback} — {order_id}")
-        return order_id
+        data = order.to_dict() if hasattr(order, 'to_dict') else order
 
-    if isinstance(data, dict) and "success_response" in data:
-        order_id = data["success_response"].get("order_id", "")
-    elif isinstance(data, dict) and "order_id" in data:
-        order_id = data["order_id"]
-    else:
-        order_id = data.get("order_id", "") if isinstance(data, dict) else ""
+        if isinstance(data, dict) and data.get("success") is False:
+            error = data.get("error_response", {})
+            log(f"[BROKER] SELL {product_id} failed: {error}")
+            return {}
 
-    log(f"[BROKER] LIMIT SELL (post-only) {base_size} {product_id} @ ${limit_price} — {order_id}")
-    return order_id
+        log(f"[BROKER] SOLD {base_size} of {product_id} @ ${price:.6f}")
+        return {"price": price}
 
-
-def sell_all(product_id: str = config.PRODUCT_ID):
-    """Sell entire holding of the base currency (e.g., XRP)."""
-    base_currency = product_id.split("-")[0]  # "XRP" from "XRP-USD"
-    balance = get_balance(base_currency)
-    if balance > 0:
-        # Round down to avoid "insufficient funds" due to rounding
-        # XRP has 6 decimal places on Coinbase
-        base_size = f"{balance:.6f}"
-        return place_sell(product_id, base_size)
-    else:
-        log(f"[BROKER] No {base_currency} balance to sell")
-        return ""
+    except Exception as e:
+        log(f"[BROKER] SELL {product_id} error: {e}")
+        return {}

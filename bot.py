@@ -1,13 +1,14 @@
 """
-bot.py — Winston v10 — XRP Momentum Bot
+bot.py — Winston v11 — AI Degen Mode
 
-24/7 XRP trading on Coinbase with:
-  - 2-minute scan interval
-  - Momentum-confirmed entries (v9 strategy engine)
-  - Trailing stop to let winners run
-  - Hard stop at 1.2% to cut losers fast
-  - 10-minute max hold time
-  - Discord alerts for everything
+Every 6 hours:
+  1. Sell whatever we're currently holding
+  2. Ask Grok to pick 5 coins based on crypto Twitter hype
+  3. Buy $10 of each pick ($50 total)
+  4. Hold for 6 hours
+  5. Repeat
+
+Discord gets: what was picked, P&L when sold, cycle summary.
 """
 
 import time
@@ -15,328 +16,203 @@ from datetime import datetime, timezone
 
 import config
 import broker
-import strategy
+import grok
 import database
-import grok  # momentum filter (not AI anymore)
-from logger import log, notify_buy, notify_sell, notify_summary, notify_startup, notify_error
+from logger import (log, notify_picks, notify_sell, notify_cycle_summary,
+                    notify_startup, notify_error)
 
 
-_position     = {}     # Current open position (max 1)
-_high_water   = 0.0    # Highest price since entry (for trailing stop)
-_daily_trades = 0
+_holdings = {}   # {product_id: {entry_price, dollars, base_size, entry_time}}
 
 
-def _votes_to_emoji(votes: dict) -> str:
-    labels = {
-        "ema_trend":      "EMA",
-        "higher_tf":      "HTF",
-        "macd_cross":     "MACD",
-        "macd_histogram": "MACDhist",
-        "rsi_direction":  "RSIdir",
-        "rsi_extreme":    "RSIext",
-        "vwap_position":  "VWAP",
-        "bollinger":      "BB",
-        "obv_slope":      "OBV",
-        "candle":         "Candle",
-    }
-    parts = []
-    for key, label in labels.items():
-        if key in votes:
-            if votes[key] == "LONG":
-                emoji = "🟢"
-            elif votes[key] == "SHORT":
-                emoji = "🔴"
+def _sell_all_holdings() -> list:
+    """Sell everything we're holding. Returns list of results."""
+    global _holdings
+    results = []
+
+    for product_id, holding in list(_holdings.items()):
+        try:
+            sell_result = broker.sell_coin(product_id)
+            if sell_result:
+                exit_price = sell_result["price"]
+                entry_price = holding["entry_price"]
+                dollars = holding["dollars"]
+
+                if entry_price > 0:
+                    pnl_pct = (exit_price - entry_price) / entry_price * 100
+                    pnl = pnl_pct / 100 * dollars
+                else:
+                    pnl_pct = 0
+                    pnl = 0
+
+                # Calculate hold time
+                entry_time = holding.get("entry_time", datetime.now(timezone.utc))
+                if entry_time:
+                    if hasattr(entry_time, 'tzinfo') and entry_time.tzinfo is None:
+                        hold_secs = (datetime.utcnow() - entry_time).total_seconds()
+                    else:
+                        hold_secs = (datetime.now(timezone.utc) - entry_time).total_seconds()
+                    hold_hours = hold_secs / 3600
+                else:
+                    hold_hours = config.HOLD_HOURS
+
+                database.record_trade(
+                    product_id, entry_price, exit_price,
+                    dollars, pnl, pnl_pct, hold_hours, entry_time
+                )
+                database.delete_holding(product_id)
+
+                notify_sell(product_id.replace("-USD", ""), pnl, pnl_pct)
+                results.append({"coin": product_id.replace("-USD", ""), "pnl": pnl, "pnl_pct": pnl_pct})
+
+                log(f"[BOT] Sold {product_id}: entry=${entry_price:.6f} exit=${exit_price:.6f} "
+                    f"P&L={'+' if pnl >= 0 else ''}${pnl:.2f} ({'+' if pnl_pct >= 0 else ''}{pnl_pct:.1f}%)")
             else:
-                emoji = "⚪"
-            parts.append(f"{label}{emoji}")
-    return " ".join(parts)
-
-
-def _open_position(price: float, long_votes: int, short_votes: int, votes: dict) -> bool:
-    global _position, _high_water
-
-    try:
-        # Check we have enough USD/USDC
-        usd_balance = broker.get_balance("USD")
-        if usd_balance < config.MAX_TRADE_DOLLARS:
-            usd_balance = broker.get_balance("USDC")
-        if usd_balance < config.MAX_TRADE_DOLLARS:
-            log(f"[BOT] Insufficient balance: ${usd_balance:.2f} < ${config.MAX_TRADE_DOLLARS:.2f}")
-            notify_error(f"Can't trade — only ${usd_balance:.2f} available")
-            return False
-
-        order_id = broker.place_buy(config.PRODUCT_ID, config.MAX_TRADE_DOLLARS)
-
-        if not order_id:
-            log("[BOT] Buy order rejected (post-only) — will retry next cycle")
-            return False
-
-        # Calculate how much XRP we got (approximate)
-        base_size = f"{config.MAX_TRADE_DOLLARS / price:.6f}"
-
-        _position = {
-            "side":        "LONG",
-            "entry_price": price,
-            "dollars":     config.MAX_TRADE_DOLLARS,
-            "base_size":   base_size,
-            "entry_time":  datetime.now(timezone.utc),
-            "order_id":    order_id,
-        }
-        _high_water = price
-
-        database.save_position(
-            config.PRODUCT_ID, "LONG", price,
-            round(price * (1 - config.HARD_STOP_PCT), 6),
-            round(price * (1 + config.TRAIL_ACTIVATE_PCT), 6),
-            config.MAX_TRADE_DOLLARS,
-            base_size,
-        )
-
-        notify_buy(price, config.MAX_TRADE_DOLLARS)
-
-        log(f"[BOT] ✅ Opened LONG {config.PRODUCT_ID} @ {price:.4f} "
-            f"| {long_votes}L/{short_votes}S | hard stop={config.HARD_STOP_PCT*100:.1f}%")
-        return True
-
-    except Exception as e:
-        notify_error(f"Order failed: {e}")
-        return False
-
-
-def _close_position(current_price: float, reason: str):
-    global _position
-
-    if not _position:
-        return
-
-    entry = _position["entry_price"]
-    pnl   = (current_price - entry) / entry * _position["dollars"]
-
-    try:
-        broker.sell_all(config.PRODUCT_ID)
-    except Exception as e:
-        log(f"[BOT] Sell failed: {e}")
-        # Try to get the actual base_size from balance
-        try:
-            xrp_balance = broker.get_balance("XRP")
-            if xrp_balance > 0:
-                broker.place_sell(config.PRODUCT_ID, f"{xrp_balance:.6f}")
-        except Exception as e2:
-            notify_error(f"Emergency sell also failed: {e2}")
-
-    database.record_trade(
-        config.PRODUCT_ID, "LONG", entry, current_price,
-        _position["dollars"], pnl, reason, _position["entry_time"]
-    )
-    database.delete_position(config.PRODUCT_ID)
-
-    notify_sell(current_price, pnl)
-    sign = "+" if pnl >= 0 else ""
-    log(f"[BOT] {'✅' if pnl >= 0 else '❌'} Closed LONG {config.PRODUCT_ID} "
-        f"@ {current_price:.4f} | {reason} | P&L: {sign}${pnl:.4f}")
-
-    _position = {}
-
-
-def _hold_loop():
-    """
-    Monitor position every 15 seconds.
-    - Hard stop: bail at 1.2% loss
-    - Emergency stop: bail at 2.5% loss
-    - Trailing stop: once up 0.5%, trail 0.4% behind peak
-    - Max hold: close after 10 minutes regardless
-    """
-    global _high_water
-
-    if not _position:
-        return
-
-    entry     = _position["entry_price"]
-    intervals = config.MAX_HOLD_SECS // config.HOLD_CHECK_SECS
-    trailing_active = False
-
-    for i in range(intervals):
-        time.sleep(config.HOLD_CHECK_SECS)
-
-        if not _position:
-            log(f"[BOT] Position already closed at check {i+1}/{intervals}")
-            return
-
-        try:
-            current_price = broker.get_latest_price(config.PRODUCT_ID)
+                log(f"[BOT] Failed to sell {product_id}")
+                database.delete_holding(product_id)
         except Exception as e:
-            log(f"[BOT] Price fetch failed: {e}")
-            continue
+            log(f"[BOT] Error selling {product_id}: {e}")
+            database.delete_holding(product_id)
 
-        # Update high water mark
-        if current_price > _high_water:
-            _high_water = current_price
+    _holdings = {}
+    return results
 
-        move_pct   = (current_price - entry) / entry
-        from_peak  = (_high_water - current_price) / _high_water if _high_water > 0 else 0
 
-        # ── Emergency stop (2.5%) ────────────────────────────────────────
-        if move_pct <= -config.EMERGENCY_STOP_PCT:
-            log(f"[BOT] ⚠️ EMERGENCY STOP — {config.PRODUCT_ID} down {abs(move_pct):.2%}")
-            _close_position(current_price, "EMERGENCY_STOP")
-            return
+def _buy_picks(picks: list, reasons: dict):
+    """Buy each pick."""
+    global _holdings
 
-        # ── Hard stop (1.2%) ─────────────────────────────────────────────
-        if move_pct <= -config.HARD_STOP_PCT:
-            loss = abs(move_pct) * _position["dollars"]
-            log(f"[BOT] 🛑 HARD STOP — {config.PRODUCT_ID} down {abs(move_pct):.2%} "
-                f"(${loss:.4f} loss)")
-            _close_position(current_price, "HARD_STOP")
-            return
+    dollars_per = config.TOTAL_BANKROLL / len(picks)
 
-        # ── Trailing stop ────────────────────────────────────────────────
-        if move_pct >= config.TRAIL_ACTIVATE_PCT:
-            if not trailing_active:
-                trailing_active = True
-                log(f"[BOT] 📈 Trailing stop ACTIVATED — up {move_pct:.2%}, "
-                    f"will trail {config.TRAIL_DISTANCE_PCT*100:.1f}% behind peak")
-
-            if from_peak >= config.TRAIL_DISTANCE_PCT:
-                profit = move_pct * _position["dollars"]
-                log(f"[BOT] 📉 TRAILING STOP — peaked at ${_high_water:.4f}, "
-                    f"now ${current_price:.4f} ({from_peak:.2%} from peak)")
-                _close_position(current_price, "TRAILING_STOP")
-                return
-
-        # ── Log status ───────────────────────────────────────────────────
-        status = "up" if move_pct >= 0 else "down"
-        trail_str = f" | trailing={from_peak:.2%} from peak" if trailing_active else ""
-        log(f"[BOT] 👀 {config.PRODUCT_ID} — {status} {abs(move_pct):.3%} "
-            f"(${move_pct * _position['dollars']:.4f}){trail_str}")
-
-    # ── Max hold time reached ────────────────────────────────────────────
-    if _position:
+    for product_id in picks:
         try:
-            exit_price = broker.get_latest_price(config.PRODUCT_ID)
-        except Exception:
-            exit_price = entry
-            log("[BOT] Could not fetch exit price — using entry as fallback")
+            result = broker.buy_coin(product_id, dollars_per)
+            if result:
+                _holdings[product_id] = {
+                    "entry_price": result["price"],
+                    "dollars": dollars_per,
+                    "base_size": result["base_size"],
+                    "entry_time": datetime.now(timezone.utc),
+                }
+                database.save_holding(
+                    product_id, result["price"], dollars_per, result["base_size"]
+                )
+                log(f"[BOT] Bought ${dollars_per:.2f} of {product_id} @ ${result['price']:.6f}")
+            else:
+                log(f"[BOT] Failed to buy {product_id} — skipping")
+        except Exception as e:
+            log(f"[BOT] Error buying {product_id}: {e}")
 
-        _close_position(exit_price, "MAX_HOLD")
+    log(f"[BOT] Holding {len(_holdings)} coins for {config.HOLD_HOURS} hours")
 
 
 def _run_cycle():
-    """Run one scan + potential trade cycle."""
-    global _position
+    """One full cycle: sell old → pick new → buy → hold → repeat."""
+    global _holdings
 
-    # Don't enter if we already have a position
-    if _position:
-        log("[BOT] Already in a position — skipping scan")
+    # ── Step 1: Sell everything we're holding ────────────────────────────
+    if _holdings:
+        log(f"[BOT] Selling {len(_holdings)} holdings from previous cycle...")
+        results = _sell_all_holdings()
+        if results:
+            total_pnl = sum(r["pnl"] for r in results)
+            notify_cycle_summary(total_pnl, results)
+    else:
+        log("[BOT] No holdings to sell — fresh start")
+
+    # ── Step 2: Check balance ────────────────────────────────────────────
+    usd = broker.get_balance("USD")
+    log(f"[BOT] USD balance: ${usd:.2f}")
+
+    if usd < config.TOTAL_BANKROLL * 0.5:
+        notify_error(f"Low balance: ${usd:.2f} — need ~${config.TOTAL_BANKROLL:.0f}")
+        # Still try with what we have
+        if usd < 5:
+            log("[BOT] Balance too low to trade — waiting for next cycle")
+            return
+
+    # ── Step 3: Get available coins ──────────────────────────────────────
+    available = broker.get_available_coins()
+    if len(available) < 10:
+        log("[BOT] Not enough tradeable coins found — retrying next cycle")
         return
 
-    try:
-        df = broker.get_candles(config.PRODUCT_ID)
-    except Exception as e:
-        log(f"[BOT] Candle fetch failed: {e}")
+    # ── Step 4: Ask Grok for picks ───────────────────────────────────────
+    pick_result = grok.pick_coins(available)
+    if not pick_result or not pick_result.get("picks"):
+        log("[BOT] Grok returned no picks — retrying next cycle")
+        notify_error("Grok couldn't pick coins — will retry in 30 min")
+        time.sleep(1800)
         return
 
-    bar_count = len(df)
-    log(f"[BOT] {config.PRODUCT_ID} — got {bar_count} candles")
+    picks = pick_result["picks"]
+    reasons = pick_result["reasons"]
 
-    if bar_count < 30:
-        log(f"[BOT] Not enough candles ({bar_count}/30) — skipping")
-        return
+    # ── Step 5: Notify Discord ───────────────────────────────────────────
+    notify_picks(
+        [p.replace("-USD", "") for p in picks],
+        {p.replace("-USD", ""): r for p, r in reasons.items()}
+    )
 
-    result = strategy.get_vote_score(df, config.PRODUCT_ID)
-    signal = result["signal"]
-    price  = result["info"].get("close", 0)
+    # ── Step 6: Buy ──────────────────────────────────────────────────────
+    _buy_picks(picks, reasons)
 
-    if signal != "LONG":
-        log(f"[BOT] ⏸️ No signal — {result['long_votes']}L/{result['short_votes']}S "
-            f"(need {config.MIN_VOTE_SCORE})")
-        return
+    # ── Step 7: Hold ─────────────────────────────────────────────────────
+    log(f"[BOT] 💎🙌 Holding for {config.HOLD_HOURS} hours...")
+    checks = config.HOLD_SECS // config.CHECK_INTERVAL
 
-    # ── Grok AI gate ─────────────────────────────────────────────────────
-    # Get real-time price first — this is what we'd actually buy at
-    try:
-        entry_price = broker.get_latest_price(config.PRODUCT_ID)
-    except Exception:
-        entry_price = price
+    for i in range(checks):
+        time.sleep(config.CHECK_INTERVAL)
 
-    # Technical indicators say GO — check momentum confirmation
-    momentum_ok = grok.check_momentum(df)
+        # Log portfolio status every 30 min
+        if (i + 1) % 6 == 0:  # Every 6 checks = 30 min
+            total_value = 0
+            total_cost = 0
+            for pid, h in _holdings.items():
+                try:
+                    current = broker.get_price(pid)
+                    if h["entry_price"] > 0:
+                        coin_pnl_pct = (current - h["entry_price"]) / h["entry_price"] * 100
+                    else:
+                        coin_pnl_pct = 0
+                    total_value += h["dollars"] * (1 + coin_pnl_pct / 100)
+                    total_cost += h["dollars"]
+                    log(f"[BOT] 👀 {pid}: ${current:.6f} ({'+' if coin_pnl_pct >= 0 else ''}{coin_pnl_pct:.1f}%)")
+                except Exception:
+                    total_value += h["dollars"]
+                    total_cost += h["dollars"]
 
-    if not momentum_ok:
-        log(f"[BOT] ⏸️ Momentum check failed — skipping")
-        return
-
-    log(f"[BOT] 🎯 LONG {config.PRODUCT_ID} @ {entry_price:.4f} "
-        f"| {result['long_votes']}L/{result['short_votes']}S")
-
-    opened = _open_position(entry_price, result["long_votes"],
-                            result["short_votes"], result["votes"])
-    if opened:
-        _hold_loop()
+            if total_cost > 0:
+                total_pnl = total_value - total_cost
+                log(f"[BOT] 📊 Portfolio: ${total_value:.2f} ({'+' if total_pnl >= 0 else ''}${total_pnl:.2f})")
 
 
 def run():
-    global _position
+    global _holdings
 
     database.init_db()
 
-    # Load any leftover position from restart
-    positions = database.load_positions()
-    if config.PRODUCT_ID in positions:
-        _position = positions[config.PRODUCT_ID]
-        notify_startup(f"Restarted — found open {config.PRODUCT_ID} position, closing it")
-        try:
-            price = broker.get_latest_price(config.PRODUCT_ID)
-            _close_position(price, "RESTART_CLOSE")
-        except Exception as e:
-            log(f"[BOT] Could not close on restart: {e}")
-            # Try selling whatever XRP we have
-            try:
-                broker.sell_all(config.PRODUCT_ID)
-                database.delete_position(config.PRODUCT_ID)
-                _position = {}
-            except Exception as e2:
-                log(f"[BOT] Emergency sell on restart also failed: {e2}")
+    # Load any existing holdings from previous run
+    _holdings = database.load_holdings()
+    if _holdings:
+        log(f"[BOT] Found {len(_holdings)} holdings from previous run")
 
-    # Get starting balance
-    usd_balance  = broker.get_balance("USD")
-    usdc_balance = broker.get_balance("USDC")
-    xrp_balance  = broker.get_balance("XRP")
-    cash_display = usd_balance if usd_balance > 0 else usdc_balance
-    cash_label   = "USD" if usd_balance > 0 else "USDC"
-
+    usd = broker.get_balance("USD")
     notify_startup(
-        f"🚀 Winston v10 started | ${config.MAX_TRADE_DOLLARS:.0f}/trade | 💰 ${cash_display:.2f} {cash_label}"
+        f"🎰 Winston v11 — DEGEN MODE\n"
+        f"${config.TOTAL_BANKROLL:.0f} across {config.NUM_PICKS} AI picks every {config.HOLD_HOURS}h\n"
+        f"💰 Balance: ${usd:.2f} USD"
     )
-    log("[BOT] Winston v10 XRP started — 24/7 mode")
-
-    last_summary_hour = -1
+    log("[BOT] Winston v11 Degen Mode started — LFG")
 
     while True:
         try:
-            # Send daily summary at midnight UTC
-            now = datetime.now(timezone.utc)
-            if now.hour == 0 and last_summary_hour != 0:
-                summary = database.get_summary()
-                notify_summary(
-                    summary["total_trades"],
-                    summary["winning_trades"],
-                    summary["total_pnl"],
-                )
-                last_summary_hour = 0
-            elif now.hour != 0:
-                last_summary_hour = now.hour
-
-            # Run a scan cycle
             _run_cycle()
-
-            # Wait for next scan
-            log(f"[BOT] Cycle complete — waiting {config.SCAN_INTERVAL_SECS}s...")
-            time.sleep(config.SCAN_INTERVAL_SECS)
-
+            log(f"[BOT] Cycle complete — next picks in {config.HOLD_HOURS} hours")
         except Exception as e:
             notify_error(str(e))
             log(f"[BOT] Unhandled error: {e}")
-            time.sleep(30)
+            time.sleep(300)
 
 
 if __name__ == "__main__":
