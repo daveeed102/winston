@@ -292,8 +292,10 @@ def get_vote_score(df: pd.DataFrame, ticker: str = "") -> dict:
     macd_dir = votes.get("macd_cross", "ABSTAIN")
     momentum_confirmed = (ema_dir == macd_dir) and ema_dir != "ABSTAIN"
 
-    # XRP is long-only on Coinbase (no shorting), so only LONG signals
-    if long_votes >= MIN_VOTE_SCORE and momentum_confirmed and ema_dir == "LONG":
+    # XRP is long-only on Coinbase (no shorting)
+    # Enter LONG if we have enough votes — momentum confirmation is logged
+    # but NOT required (the vote count already captures momentum indicators)
+    if long_votes >= MIN_VOTE_SCORE:
         signal = "LONG"
     else:
         signal = "HOLD"
@@ -333,3 +335,4 @@ def get_vote_score(df: pd.DataFrame, ticker: str = "") -> dict:
         "info":        info,
         "atr":         atr,
     }
+
