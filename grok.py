@@ -37,44 +37,55 @@ def pick_coins(available_coins: list) -> dict:
         system_prompt = (
             "You are an elite degen crypto trader who lives on Crypto Twitter (CT). "
             "You have real-time access to X/Twitter, CoinMarketCap trending, CoinGecko, "
-            "and DexScreener. You track what coins are being hyped RIGHT NOW TODAY.\n\n"
-            "Your job: pick the 5 coins MOST LIKELY to pump in the next 6 hours.\n\n"
-            "CRITICAL RULES:\n"
+            "and DexScreener.\n\n"
+            "Your job: pick the 2 memecoins MOST LIKELY to pump in the next 6 hours.\n\n"
+            "CRITICAL — RECENCY RULES (READ CAREFULLY):\n"
+            "- You MUST use your search tools to find information from the LAST 6 HOURS ONLY.\n"
+            "- When searching X, filter to posts from TODAY ONLY. Not 2 days ago. Not last week.\n"
+            "- DO NOT cite a tweet or event unless you can confirm it happened in the last 6 hours.\n"
+            "- If you're not sure when something happened, DO NOT use it as a reason.\n"
+            "- DO NOT HALLUCINATE OR MAKE UP TWEETS. If you can't find a real tweet from today, "
+            "say 'volume spike on CoinGecko' or 'trending on CoinMarketCap today' — not a fake tweet.\n"
+            "- A tweet from 3 days ago is NOT a valid reason. ONLY the last few hours matter.\n"
+            "- If you cite an influencer tweet, include the ACTUAL date/time you found it.\n\n"
+            "CRITICAL — MEMECOINS ONLY:\n"
+            "- DO NOT pick BTC, ETH, SOL, XRP, ADA, AVAX, LINK, DOT, MATIC, UNI, "
+            "or any other large-cap 'blue chip' crypto. These don't move enough.\n"
+            "- We WANT: memecoins, animal coins, joke coins, hype coins, narrative coins, "
+            "lowcaps with viral potential — anything that can pump 10%+ in 6 hours.\n"
+            "- Think PEPE, DOGE, SHIB, BONK, WIF, FLOKI, TURBO, BRETT — that tier and below.\n"
+            "- The more degen the better. We're gambling, not investing.\n\n"
+            "CRITICAL — COINBASE ONLY:\n"
             "- You MUST only pick from the Coinbase coin list provided. NO exceptions.\n"
-            "- Do NOT pick coins that are NOT in the list. Double-check each pick.\n"
-            "- Focus on what is trending TODAY — not yesterday, not last week.\n"
-            "- Search X/Twitter for today's posts about coins pumping, being shilled, "
-            "going viral, or getting whale attention.\n"
-            "- Check CoinMarketCap and CoinGecko trending pages for today's movers.\n"
-            "- Look for: viral tweets today, breaking news today, new narratives forming "
-            "today, coins with unusual volume spikes today, influencer shills today.\n"
-            "- DO NOT pick a coin just because it's a big name. Only pick BTC/ETH/SOL if "
-            "something specific is happening with them TODAY.\n"
-            "- Memecoins, lowcaps, hype coins — all welcome. Full degen.\n"
-            "- Each pick MUST have a detailed reason explaining WHY it's hot TODAY "
-            "and what specific signal you found (tweet, news, volume spike, etc).\n\n"
+            "- Do NOT pick coins that are NOT in the list. Double-check each pick.\n\n"
             "Respond with ONLY a JSON object, no markdown, no backticks:\n"
-            '{"picks": ["SYMBOL1", "SYMBOL2", "SYMBOL3", "SYMBOL4", "SYMBOL5"], '
-            '"reasons": {"SYMBOL1": "detailed reason with what you found today", ...}}\n\n'
-            "Use the SYMBOL only (like BTC, ETH, PEPE), not the full pair name."
+            '{"picks": ["SYMBOL1", "SYMBOL2"], '
+            '"reasons": {"SYMBOL1": "what SPECIFICALLY is happening RIGHT NOW today", ...}}\n\n'
+            "Use the SYMBOL only (like PEPE, BONK, WIF), not the full pair name."
         )
 
         from datetime import datetime, timezone
-        today = datetime.now(timezone.utc).strftime("%B %d, %Y")
+        now = datetime.now(timezone.utc)
+        today = now.strftime("%B %d, %Y")
+        time_now = now.strftime("%H:%M UTC")
 
         user_prompt = (
-            f"Today is {today}. Pick your top 5 coins to buy and hold for the next 6 hours.\n\n"
+            f"RIGHT NOW it is {today} at {time_now}.\n\n"
+            f"Pick your top 2 MEMECOINS to buy and hold for the next 6 hours.\n\n"
             f"IMPORTANT: You can ONLY pick from this exact list of Coinbase-available coins:\n"
             f"{symbol_list}\n\n"
-            f"Do your research:\n"
-            f"1. Search X/Twitter for crypto coins being hyped TODAY ({today})\n"
-            f"2. Check what's trending on CoinMarketCap and CoinGecko TODAY\n"
-            f"3. Look for volume spikes, viral posts, breaking news from TODAY\n"
+            f"DO NOT pick any blue chip coins (BTC, ETH, SOL, XRP, etc). MEMECOINS ONLY.\n\n"
+            f"Do your research — but ONLY look at the LAST 6 HOURS:\n"
+            f"1. Search X/Twitter for memecoin posts from the last 6 hours ONLY\n"
+            f"2. Check CoinMarketCap and CoinGecko for what's trending RIGHT NOW\n"
+            f"3. Look for volume spikes happening NOW, not yesterday\n"
             f"4. Cross-reference with the Coinbase list above\n"
-            f"5. Pick the 5 best opportunities\n\n"
-            f"For each pick, explain SPECIFICALLY what you found today that makes it hot. "
-            f"Not generic reasons — tell me the tweet, the news, the catalyst.\n\n"
-            f"Full degen mode. We're here to make money. Go."
+            f"5. Pick the 2 best memecoin opportunities\n\n"
+            f"WARNING: Do NOT cite tweets or events older than 6 hours. "
+            f"Do NOT make up fake tweets. If you can't verify when something happened, "
+            f"focus on price action and volume data instead.\n\n"
+            f"For each pick, explain what is happening RIGHT NOW that makes it hot.\n\n"
+            f"Full degen mode. We're gambling. Go."
         )
 
         headers = {
@@ -147,13 +158,20 @@ def pick_coins(available_coins: list) -> dict:
         picks = result.get("picks", [])
         reasons = result.get("reasons", {})
 
-        # Validate picks are in available coins
+        # Validate picks are in available coins and NOT blue chips
+        BLOCKED = {"BTC", "ETH", "SOL", "XRP", "ADA", "AVAX", "LINK", "DOT",
+                   "MATIC", "UNI", "AAVE", "LTC", "BCH", "ATOM", "FIL", "APT",
+                   "ARB", "OP", "NEAR", "ICP", "HBAR", "VET", "ALGO"}
+
         valid_picks = []
         valid_reasons = {}
         available_symbols = set(c.replace("-USD", "") for c in available_coins)
 
         for symbol in picks:
             symbol = symbol.upper().strip()
+            if symbol in BLOCKED:
+                log(f"[GROK] 🚫 {symbol} is a blue chip — blocked")
+                continue
             if symbol in available_symbols:
                 product_id = f"{symbol}-USD"
                 valid_picks.append(product_id)
@@ -161,11 +179,11 @@ def pick_coins(available_coins: list) -> dict:
             else:
                 log(f"[GROK] ⚠️ {symbol} not available on Coinbase — skipping")
 
-        if len(valid_picks) < 3:
-            log(f"[GROK] Only {len(valid_picks)} valid picks — need at least 3")
+        if len(valid_picks) < 1:
+            log(f"[GROK] No valid picks found on Coinbase")
             return {}
 
-        # Trim to 5 max
+        # Trim to NUM_PICKS (2)
         valid_picks = valid_picks[:config.NUM_PICKS]
         valid_reasons = {k: v for k, v in valid_reasons.items() if k in valid_picks}
 

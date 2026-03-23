@@ -12,9 +12,9 @@ GROK_MODEL   = "grok-3-mini-fast"
 DATABASE_URL = os.environ["DATABASE_URL"]
 
 # ── Trade sizing ─────────────────────────────────────────────────────────────
-TOTAL_BANKROLL     = 50.00    # Total to spread across picks
-NUM_PICKS          = 5        # How many coins Grok picks each cycle
-DOLLARS_PER_PICK   = TOTAL_BANKROLL / NUM_PICKS   # $10 each
+TOTAL_BANKROLL     = 40.00    # Total to spread across picks
+NUM_PICKS          = 2        # 2 meme coin picks per cycle
+DOLLARS_PER_PICK   = TOTAL_BANKROLL / NUM_PICKS   # $20 each
 
 # ── Cycle timing ─────────────────────────────────────────────────────────────
 HOLD_HOURS         = 6        # Hold each batch for 6 hours
