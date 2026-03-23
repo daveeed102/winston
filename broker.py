@@ -45,7 +45,7 @@ def get_bars(ticker: str, timeframe_str: str = "5Min", limit: int = BAR_LIMIT) -
         timeframe=tf,
         limit=limit,
         start=start,
-        feed="iex",
+        feed="sip",
         adjustment="raw",
     )
 
