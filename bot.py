@@ -22,7 +22,8 @@ Times (MST):
 """
 
 import time
-from datetime import datetime
+import random
+from datetime import datetime, timezone
 import pytz
 
 import config
@@ -105,7 +106,7 @@ def _open_position(ticker: str, direction: str, current_price: float,
             "side":        direction,
             "entry_price": current_price,
             "dollars":     config.MAX_TRADE_DOLLARS,
-            "entry_time":  datetime.utcnow(),
+            "entry_time":  datetime.now(timezone.utc),
         }
         database.save_position(
             ticker, direction, current_price,
@@ -162,8 +163,7 @@ def _check_stops(ticker: str) -> bool:
         return False
 
     try:
-        df            = broker.get_bars(ticker, config.BAR_TIMEFRAME, 5)
-        current_price = float(df["close"].iloc[-1])
+        current_price = broker.get_latest_price(ticker)
     except Exception:
         return False
 
@@ -238,7 +238,7 @@ def _run_5min_cycle():
 
         margin = abs(result["long_votes"] - result["short_votes"])
 
-        if margin > best_margin:
+        if margin > best_margin or (margin == best_margin and margin > 0 and random.random() < 0.5):
             best_margin    = margin
             best_ticker    = ticker
             best_direction = signal
@@ -282,8 +282,7 @@ def _run_5min_cycle():
     # ── 5 minutes up — close regardless ──────────────────────────────────────
     if best_ticker in _positions:
         try:
-            df         = broker.get_bars(best_ticker, config.BAR_TIMEFRAME, 5)
-            exit_price = float(df["close"].iloc[-1])
+            exit_price = broker.get_latest_price(best_ticker)
         except Exception:
             exit_price = best_price
             log("[BOT] Could not fetch exit price — using entry price as fallback")
@@ -302,8 +301,7 @@ def run():
         notify(f"Restarted — closing {len(_positions)} leftover position(s)")
         for ticker in list(_positions.keys()):
             try:
-                df    = broker.get_bars(ticker, config.BAR_TIMEFRAME, 5)
-                price = float(df["close"].iloc[-1])
+                price = broker.get_latest_price(ticker)
                 _close_position(ticker, price, "RESTART_CLOSE")
             except Exception as e:
                 log(f"[BOT] Could not close {ticker} on restart: {e}")
@@ -334,8 +332,7 @@ def run():
             if _is_near_close() and not summary_sent:
                 for ticker in list(_positions.keys()):
                     try:
-                        df    = broker.get_bars(ticker, config.BAR_TIMEFRAME, 5)
-                        price = float(df["close"].iloc[-1])
+                        price = broker.get_latest_price(ticker)
                         _close_position(ticker, price, "EOD_CLOSE")
                     except Exception as e:
                         log(f"[BOT] EOD close failed {ticker}: {e}")
