@@ -139,30 +139,63 @@ def get_balance(currency: str = "USD") -> float:
 
 
 def place_buy(product_id: str, dollars: float) -> str:
-    """Place a market buy order for $X of product. Returns order_id."""
+    """Place a limit buy order for $X of product at current price. Returns order_id.
+    Uses limit orders instead of market orders for lower maker fees (0.40% vs 0.60%).
+    Sets limit price slightly above current price to ensure immediate fill."""
     client_order_id = str(uuid.uuid4())
-    order = _client.market_order_buy(
+
+    # Get current price to calculate base_size and set limit
+    price = get_latest_price(product_id)
+    # Set limit 0.1% above current price — fills immediately but as limit order
+    limit_price = round(price * 1.001, 4)
+    # Calculate how much XRP we can buy (minus a tiny buffer for rounding)
+    base_size = round(dollars / limit_price, 6)
+
+    order = _client.limit_order_gtc_buy(
         client_order_id=client_order_id,
         product_id=product_id,
-        quote_size=str(round(dollars, 2)),
+        base_size=str(base_size),
+        limit_price=str(limit_price),
     )
     data = order.to_dict() if hasattr(order, 'to_dict') else order
-    order_id = data.get("order_id", "") if isinstance(data, dict) else ""
-    log(f"[BROKER] BUY ${dollars:.2f} of {product_id} — {order_id}")
+
+    # Check for success/error response format
+    if isinstance(data, dict) and "success_response" in data:
+        order_id = data["success_response"].get("order_id", "")
+    elif isinstance(data, dict) and "order_id" in data:
+        order_id = data["order_id"]
+    else:
+        order_id = data.get("order_id", "") if isinstance(data, dict) else ""
+
+    log(f"[BROKER] LIMIT BUY {base_size} {product_id} @ ${limit_price} — {order_id}")
     return order_id
 
 
 def place_sell(product_id: str, base_size: str) -> str:
-    """Place a market sell order for X units of product. Returns order_id."""
+    """Place a limit sell order. Returns order_id.
+    Sets limit price slightly below current price to ensure immediate fill."""
     client_order_id = str(uuid.uuid4())
-    order = _client.market_order_sell(
+
+    # Get current price and set limit slightly below for immediate fill
+    price = get_latest_price(product_id)
+    limit_price = round(price * 0.999, 4)
+
+    order = _client.limit_order_gtc_sell(
         client_order_id=client_order_id,
         product_id=product_id,
         base_size=base_size,
+        limit_price=str(limit_price),
     )
     data = order.to_dict() if hasattr(order, 'to_dict') else order
-    order_id = data.get("order_id", "") if isinstance(data, dict) else ""
-    log(f"[BROKER] SELL {base_size} of {product_id} — {order_id}")
+
+    if isinstance(data, dict) and "success_response" in data:
+        order_id = data["success_response"].get("order_id", "")
+    elif isinstance(data, dict) and "order_id" in data:
+        order_id = data["order_id"]
+    else:
+        order_id = data.get("order_id", "") if isinstance(data, dict) else ""
+
+    log(f"[BROKER] LIMIT SELL {base_size} {product_id} @ ${limit_price} — {order_id}")
     return order_id
 
 
