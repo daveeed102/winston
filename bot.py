@@ -31,11 +31,8 @@ _last_rescore = 0  # Timestamp of last rescore
 
 
 def _get_position_size(score: int) -> float:
-    """Determine position size based on momentum score."""
-    for threshold, dollars in config.POSITION_TIERS:
-        if score >= threshold:
-            return dollars
-    return 0
+    """Flat $20 per trade."""
+    return config.POSITION_SIZE
 
 
 def _format_hold_time(entry_time) -> str:

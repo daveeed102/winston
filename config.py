@@ -11,14 +11,8 @@ GROK_MODEL   = "grok-3-mini-fast"
 # ── Database ─────────────────────────────────────────────────────────────────
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-# ── Position sizing by momentum score ────────────────────────────────────────
-# Score 90+ = $25, 80+ = $20, 70+ = $15, 60+ = $10
-POSITION_TIERS = [
-    (90, 25.00),
-    (80, 20.00),
-    (70, 15.00),
-    (60, 10.00),
-]
+# ── Position sizing ──────────────────────────────────────────────────────────
+POSITION_SIZE = 20.00         # Flat $20 per trade, every time
 
 # ── Positions ────────────────────────────────────────────────────────────────
 MAX_POSITIONS = 2             # Hold max 2 tokens at a time
