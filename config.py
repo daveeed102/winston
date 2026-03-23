@@ -30,6 +30,7 @@ SCORE_DROP_EXIT   = 35        # Sell if score drops below this
 # ── Smart exits ──────────────────────────────────────────────────────────────
 TRAILING_STOP_PCT  = 0.12     # 12% trailing stop from peak
 EARLY_STOP_PCT     = 0.05     # 5% hard stop loss from entry
+MAX_HOLD_SECS      = 43200    # 12 hours max hold — sell and find something fresh
 CHECK_INTERVAL     = 120      # Check positions every 2 minutes
 
 # ── Scanner ──────────────────────────────────────────────────────────────────

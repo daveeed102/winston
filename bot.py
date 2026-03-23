@@ -131,6 +131,21 @@ def _check_exits():
                              pnl, pnl_pct * 100, hold_time)
                 continue
 
+        # ── EXIT 4: Max hold time (12 hours) ─────────────────────────────
+        entry_time = pos.get("entry_time")
+        if entry_time:
+            if hasattr(entry_time, 'tzinfo') and entry_time.tzinfo is None:
+                held_secs = (datetime.utcnow() - entry_time).total_seconds()
+            else:
+                held_secs = (datetime.now(timezone.utc) - entry_time).total_seconds()
+
+            if held_secs >= config.MAX_HOLD_SECS:
+                pnl = pnl_pct * pos["dollars"]
+                hold_time = _format_hold_time(entry_time)
+                log(f"[BOT] ⏰ MAX HOLD {symbol} — held {hold_time}, time to find something fresh")
+                _sell_position(product_id, current_price, "MAX_HOLD_12H", pnl, pnl_pct * 100, hold_time)
+                continue
+
         # ── Still holding — log status ───────────────────────────────────
         sign = "+" if pnl_pct >= 0 else ""
         peak_str = f" | peak ${high_water:.6f}" if pnl_pct > 0 else ""
