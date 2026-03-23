@@ -64,16 +64,21 @@ def _votes_to_emoji(votes: dict) -> str:
         "macd_cross":     "MACD",
         "macd_histogram": "MACDhist",
         "rsi_direction":  "RSIdir",
-        "rsi_level":      "RSIlvl",
+        "rsi_extreme":    "RSIext",
         "vwap_position":  "VWAP",
         "bollinger":      "BB",
-        "volume_trend":   "VOL",
+        "obv_slope":      "OBV",
         "candle":         "Candle",
     }
     parts = []
     for key, label in labels.items():
         if key in votes:
-            emoji = "🟢" if votes[key] == "LONG" else "🔴"
+            if votes[key] == "LONG":
+                emoji = "🟢"
+            elif votes[key] == "SHORT":
+                emoji = "🔴"
+            else:
+                emoji = "⚪"
             parts.append(f"{label}{emoji}")
     return " ".join(parts)
 
