@@ -122,9 +122,9 @@ def get_balance(currency: str = "USD") -> float:
                 avail = ad.get("available_balance", {})
                 bal = float(avail.get("value", 0)) if isinstance(avail, dict) else 0
 
-            # Log non-zero balances for debugging
-            if bal > 0:
-                log(f"[BROKER] Found balance: {curr} = {bal}")
+            # Log only the currency we're looking for
+            if curr == currency and bal > 0:
+                log(f"[BROKER] {curr} balance: {bal}")
 
             if curr == currency:
                 found_balance = bal
