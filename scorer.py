@@ -101,14 +101,18 @@ def _score_x_mentions(mention_data: dict) -> int:
 
 
 def _score_trending(sources: list) -> int:
-    """Score based on how many trending lists the coin appears on."""
+    """Score based on how many sources found the coin and which ones."""
     score = 0
     if "trending" in sources:
-        score += 50  # On CoinGecko trending
+        score += 35  # On CoinGecko trending
     if "mover" in sources:
-        score += 30  # Big price/volume move detected
+        score += 25  # Big price/volume move detected
+    if "x_early_buzz" in sources:
+        score += 30  # Grok found early Twitter buzz (leading signal)
     if len(sources) >= 2:
-        score += 20  # Multiple signals = stronger
+        score += 20  # Multiple signals = much stronger
+    if len(sources) >= 3:
+        score += 10  # Triple confirmed = very strong
 
     return min(100, score)
 
@@ -213,8 +217,13 @@ def score_token(candidate: dict, skip_x: bool = False) -> dict:
     if x_score >= 50:
         buzz = x_data.get("buzz", "")
         reasons.append(f"X buzz: {buzz}" if buzz else "active on CT")
+    if "x_early_buzz" in candidate.get("sources", []):
+        grok_reason = candidate.get("grok_reason", "")
+        if grok_reason:
+            reasons.append(f"Grok early signal: {grok_reason}")
     if trending_score >= 50:
-        reasons.append("trending on CoinGecko")
+        sources = candidate.get("sources", [])
+        reasons.append(f"found in {len(sources)} sources: {', '.join(sources)}")
     if buyer_score >= 60:
         reasons.append("momentum accelerating")
 

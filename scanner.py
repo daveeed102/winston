@@ -193,9 +193,110 @@ def get_x_mention_velocity(symbol: str) -> dict:
         return {"mentions": 0, "sentiment": 0, "has_influencer": False}
 
 
+def get_grok_early_picks(available_coins: list) -> list:
+    """
+    Ask Grok to search X/Twitter for memecoins that are STARTING to buzz
+    but haven't hit trending lists yet. This is the leading signal.
+    Returns list of {symbol, reason} dicts.
+    """
+    if not config.GROK_API_KEY:
+        return []
+
+    try:
+        available_symbols = sorted(set(
+            c.replace("-USD", "") for c in available_coins
+            if c.replace("-USD", "") not in config.BLOCKED_COINS
+        ))
+        symbol_list = ", ".join(available_symbols)
+
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        time_str = now.strftime("%B %d, %Y %H:%M UTC")
+
+        headers = {
+            "Authorization": f"Bearer {config.GROK_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "model": config.GROK_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You find memecoins that are STARTING to get buzz on crypto Twitter "
+                        "but haven't blown up yet. You look for early signals — first mentions, "
+                        "small influencers picking them up, unusual chatter beginning.\n\n"
+                        "RULES:\n"
+                        "- ONLY pick from the provided Coinbase coin list.\n"
+                        "- Focus on the LAST FEW HOURS only. Not yesterday.\n"
+                        "- DO NOT make up tweets or events. If unsure, skip it.\n"
+                        "- NO blue chips (BTC, ETH, SOL, XRP, etc).\n"
+                        "- Pick 3-5 memecoins showing EARLY signs of buzz.\n"
+                        "- For each, explain what early signal you're seeing.\n\n"
+                        "Respond with ONLY JSON, no markdown:\n"
+                        '{"picks": [{"symbol": "PEPE", "reason": "what early signal you found"}]}'
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Right now it's {time_str}.\n\n"
+                        f"Search crypto Twitter for memecoins that are STARTING to get "
+                        f"attention in the last few hours. Not coins already pumping hard — "
+                        f"coins where the buzz is just beginning.\n\n"
+                        f"ONLY pick from this Coinbase list:\n{symbol_list}\n\n"
+                        f"Find 3-5 early momentum plays. Go."
+                    ),
+                },
+            ],
+            "temperature": 0.5,
+        }
+
+        log("[SCANNER] Asking Grok for early X/Twitter buzz picks...")
+        resp = requests.post(
+            "https://api.x.ai/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=20,
+        )
+        data = resp.json()
+        text = data["choices"][0]["message"]["content"].strip()
+        text = text.replace("```json", "").replace("```", "").strip()
+
+        import json
+        result = json.loads(text)
+        picks = result.get("picks", [])
+
+        valid = []
+        available_set = set(c.replace("-USD", "").upper() for c in available_coins)
+        for p in picks:
+            sym = p.get("symbol", "").upper().strip()
+            if sym in available_set and sym not in config.BLOCKED_COINS:
+                valid.append({
+                    "symbol": sym,
+                    "reason": p.get("reason", "early X buzz"),
+                })
+            else:
+                log(f"[SCANNER] Grok pick {sym} not on Coinbase — skipped")
+
+        log(f"[SCANNER] Grok found {len(valid)} early buzz picks")
+        return valid
+
+    except Exception as e:
+        log(f"[SCANNER] Grok discovery failed: {e}")
+        return []
+
+
 def discover_candidates(available_coins: list) -> list:
     """
     Merge all data sources, deduplicate, return top candidates.
+    
+    Source 1: CoinGecko trending (lagging but reliable)
+    Source 2: CoinGecko movers — volume + price action (lagging but reliable)
+    Source 3: Grok X/Twitter early buzz (leading but less reliable)
+    
+    Coins found by multiple sources naturally score higher.
     """
     candidates = {}
 
@@ -221,10 +322,23 @@ def discover_candidates(available_coins: list) -> list:
             "market_cap": coin.get("market_cap", 0),
         })
 
+    # Source 3: Grok X/Twitter early buzz (leading indicator)
+    for pick in get_grok_early_picks(available_coins):
+        sym = pick["symbol"]
+        candidates[sym] = candidates.get(sym, {"symbol": sym, "sources": []})
+        candidates[sym]["sources"].append("x_early_buzz")
+        if "grok_reason" not in candidates[sym]:
+            candidates[sym]["grok_reason"] = pick.get("reason", "")
+
     # Filter to Coinbase-only
     available_set = set(c.replace("-USD", "").upper() for c in available_coins)
     filtered = {k: v for k, v in candidates.items() if k in available_set}
 
+    # Log multi-source coins (strongest signals)
+    for sym, c in filtered.items():
+        if len(c.get("sources", [])) >= 2:
+            log(f"[SCANNER] 🔥 {sym} found in {len(c['sources'])} sources: {c['sources']}")
+
     result = list(filtered.values())
-    log(f"[SCANNER] {len(result)} candidates after filtering to Coinbase")
+    log(f"[SCANNER] {len(result)} total candidates ({sum(1 for c in result if len(c.get('sources',[])) >= 2)} multi-source)")
     return result
