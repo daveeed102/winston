@@ -118,7 +118,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 def get_vote_score(df: pd.DataFrame, ticker: str = "") -> dict:
     df = compute_indicators(df)
 
-    if len(df) < 30:
+    if len(df) < 20:
         return {"long_votes": 0, "short_votes": 0, "signal": "HOLD",
                 "votes": {}, "info": {}, "atr": 0.0}
 
