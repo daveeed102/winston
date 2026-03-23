@@ -4,22 +4,46 @@ import os
 COINBASE_API_KEY    = os.environ["COINBASE_API_KEY"]
 COINBASE_API_SECRET = os.environ["COINBASE_API_SECRET"]
 
-# ── Grok (picks coins from Twitter hype) ─────────────────────────────────────
-GROK_API_KEY = os.environ["GROK_API_KEY"]
+# ── Grok (X/Twitter search for mention velocity) ────────────────────────────
+GROK_API_KEY = os.environ.get("GROK_API_KEY", "")
 GROK_MODEL   = "grok-3-mini-fast"
 
 # ── Database ─────────────────────────────────────────────────────────────────
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-# ── Trade sizing ─────────────────────────────────────────────────────────────
-TOTAL_BANKROLL     = 40.00    # Total to spread across picks
-NUM_PICKS          = 2        # 2 meme coin picks per cycle
-DOLLARS_PER_PICK   = TOTAL_BANKROLL / NUM_PICKS   # $20 each
+# ── Position sizing by momentum score ────────────────────────────────────────
+# Score 90+ = $25, 80+ = $20, 70+ = $15, 60+ = $10
+POSITION_TIERS = [
+    (90, 25.00),
+    (80, 20.00),
+    (70, 15.00),
+    (60, 10.00),
+]
 
-# ── Cycle timing ─────────────────────────────────────────────────────────────
-HOLD_HOURS         = 6        # Hold each batch for 6 hours
-HOLD_SECS          = HOLD_HOURS * 3600
-CHECK_INTERVAL     = 300      # Check portfolio value every 5 min during hold
+# ── Positions ────────────────────────────────────────────────────────────────
+MAX_POSITIONS = 2             # Hold max 2 tokens at a time
+
+# ── Momentum scoring ────────────────────────────────────────────────────────
+MIN_SCORE_TO_BUY  = 60        # Don't buy below this score
+SCORE_DROP_EXIT   = 35        # Sell if score drops below this
+
+# ── Smart exits ──────────────────────────────────────────────────────────────
+TRAILING_STOP_PCT  = 0.12     # 12% trailing stop from peak
+EARLY_STOP_PCT     = 0.05     # 5% hard stop loss from entry
+CHECK_INTERVAL     = 120      # Check positions every 2 minutes
+
+# ── Scanner ──────────────────────────────────────────────────────────────────
+SCAN_INTERVAL      = 180      # Scan for new opportunities every 3 minutes
+RESCORE_INTERVAL   = 300      # Re-score existing positions every 5 minutes
+
+# ── Blue chip blocklist (we want memecoins only) ─────────────────────────────
+BLOCKED_COINS = {
+    "BTC", "ETH", "SOL", "XRP", "ADA", "AVAX", "LINK", "DOT",
+    "MATIC", "UNI", "AAVE", "LTC", "BCH", "ATOM", "FIL", "APT",
+    "ARB", "OP", "NEAR", "ICP", "HBAR", "VET", "ALGO", "XLM",
+    "TRX", "TON", "SUI", "SEI", "INJ", "TIA", "RENDER", "FET",
+    "TAO", "USDC", "USDT", "DAI", "WBTC", "CBETH", "STETH",
+}
 
 # ── Discord ──────────────────────────────────────────────────────────────────
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")

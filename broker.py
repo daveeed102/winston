@@ -1,7 +1,5 @@
 """
-broker.py — Coinbase Advanced Trade wrapper for Winston v11 Degen Mode
-
-Handles buying/selling multiple coins, getting prices, listing available products.
+broker.py — Coinbase Advanced Trade wrapper for Winston v12
 """
 
 import uuid
@@ -17,7 +15,7 @@ _client = RESTClient(
 
 
 def get_available_coins() -> list:
-    """Get all tradeable USD pairs on Coinbase. Returns list of product_ids like ['BTC-USD', 'ETH-USD', ...]"""
+    """Get all tradeable USD pairs on Coinbase."""
     try:
         resp = _client.get_products(product_type="SPOT")
         data = resp.to_dict() if hasattr(resp, 'to_dict') else resp
@@ -25,22 +23,15 @@ def get_available_coins() -> list:
 
         coins = []
         for p in products:
-            if isinstance(p, dict):
-                pid = p.get("product_id", "")
-                status = p.get("status", "")
-                is_disabled = p.get("is_disabled", False)
-                trading_disabled = p.get("trading_disabled", False)
-            else:
-                pd_dict = p.to_dict() if hasattr(p, 'to_dict') else {}
+            pd_dict = p.to_dict() if hasattr(p, 'to_dict') else p
+            if isinstance(pd_dict, dict):
                 pid = pd_dict.get("product_id", "")
-                status = pd_dict.get("status", "")
                 is_disabled = pd_dict.get("is_disabled", False)
                 trading_disabled = pd_dict.get("trading_disabled", False)
+                if pid.endswith("-USD") and not is_disabled and not trading_disabled:
+                    coins.append(pid)
 
-            if pid.endswith("-USD") and not is_disabled and not trading_disabled:
-                coins.append(pid)
-
-        log(f"[BROKER] Found {len(coins)} tradeable USD pairs")
+        log(f"[BROKER] {len(coins)} tradeable USD pairs")
         return coins
     except Exception as e:
         log(f"[BROKER] Error fetching products: {e}")
@@ -48,14 +39,14 @@ def get_available_coins() -> list:
 
 
 def get_price(product_id: str) -> float:
-    """Get current price for a product."""
+    """Get current price."""
     product = _client.get_product(product_id=product_id)
     data = product.to_dict() if hasattr(product, 'to_dict') else product
     return float(data.get("price", 0)) if isinstance(data, dict) else 0.0
 
 
 def get_balance(currency: str) -> float:
-    """Get available balance for a currency."""
+    """Get available balance."""
     try:
         accounts_resp = _client.get_accounts(limit=250)
         data = accounts_resp.to_dict() if hasattr(accounts_resp, 'to_dict') else accounts_resp
@@ -70,12 +61,12 @@ def get_balance(currency: str) -> float:
                 if curr == currency:
                     return bal
     except Exception as e:
-        log(f"[BROKER] Error getting {currency} balance: {e}")
+        log(f"[BROKER] Balance error: {e}")
     return 0.0
 
 
 def buy_coin(product_id: str, dollars: float) -> dict:
-    """Buy $X of a coin using market order. Returns {order_id, price, base_size} or empty dict on failure."""
+    """Buy $X of a coin. Returns {order_id, price} or empty dict."""
     try:
         client_order_id = str(uuid.uuid4())
         order = _client.market_order_buy(
@@ -86,8 +77,7 @@ def buy_coin(product_id: str, dollars: float) -> dict:
         data = order.to_dict() if hasattr(order, 'to_dict') else order
 
         if isinstance(data, dict) and data.get("success") is False:
-            error = data.get("error_response", {})
-            log(f"[BROKER] BUY {product_id} failed: {error}")
+            log(f"[BROKER] BUY {product_id} failed: {data.get('error_response', {})}")
             return {}
 
         if isinstance(data, dict) and "success_response" in data:
@@ -96,34 +86,31 @@ def buy_coin(product_id: str, dollars: float) -> dict:
             order_id = data.get("order_id", "") if isinstance(data, dict) else ""
 
         price = get_price(product_id)
-        base_size = dollars / price if price > 0 else 0
-
-        log(f"[BROKER] BOUGHT ${dollars:.2f} of {product_id} @ ${price:.6f} — {order_id}")
-        return {"order_id": order_id, "price": price, "base_size": base_size}
+        log(f"[BROKER] BOUGHT ${dollars:.2f} of {product_id} @ ${price:.6f}")
+        return {"order_id": order_id, "price": price}
 
     except Exception as e:
-        log(f"[BROKER] BUY {product_id} error: {e}")
+        log(f"[BROKER] BUY error {product_id}: {e}")
         return {}
 
 
 def sell_coin(product_id: str) -> dict:
-    """Sell entire holding of a coin. Returns {price, pnl_pct} or empty dict."""
+    """Sell entire holding. Returns {price} or empty dict."""
     try:
         base_currency = product_id.split("-")[0]
         balance = get_balance(base_currency)
-
         if balance <= 0:
-            log(f"[BROKER] No {base_currency} to sell")
             return {}
 
-        # Format base_size — different coins need different precision
         price = get_price(product_id)
-        if price >= 1000:
+        if price >= 100:
             base_size = f"{balance:.8f}"
         elif price >= 1:
             base_size = f"{balance:.6f}"
-        else:
+        elif price >= 0.001:
             base_size = f"{balance:.2f}"
+        else:
+            base_size = f"{balance:.0f}"
 
         client_order_id = str(uuid.uuid4())
         order = _client.market_order_sell(
@@ -134,13 +121,12 @@ def sell_coin(product_id: str) -> dict:
         data = order.to_dict() if hasattr(order, 'to_dict') else order
 
         if isinstance(data, dict) and data.get("success") is False:
-            error = data.get("error_response", {})
-            log(f"[BROKER] SELL {product_id} failed: {error}")
+            log(f"[BROKER] SELL {product_id} failed: {data.get('error_response', {})}")
             return {}
 
         log(f"[BROKER] SOLD {base_size} of {product_id} @ ${price:.6f}")
         return {"price": price}
 
     except Exception as e:
-        log(f"[BROKER] SELL {product_id} error: {e}")
+        log(f"[BROKER] SELL error {product_id}: {e}")
         return {}

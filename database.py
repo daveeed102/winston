@@ -1,11 +1,10 @@
 """
-database.py — PostgreSQL persistence for Winston v11 Degen Mode
+database.py — PostgreSQL persistence for Winston v12
 """
 
 import psycopg2
-from datetime import datetime, timezone
-import config
 from logger import log
+import config
 
 
 def _conn():
@@ -16,16 +15,18 @@ def init_db():
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS degen_holdings (
+                CREATE TABLE IF NOT EXISTS v12_positions (
                     product_id TEXT PRIMARY KEY,
                     entry_price DOUBLE PRECISION NOT NULL,
                     dollars DOUBLE PRECISION NOT NULL,
-                    base_size DOUBLE PRECISION NOT NULL,
+                    high_water DOUBLE PRECISION NOT NULL,
+                    score_at_entry INT NOT NULL,
+                    entry_reason TEXT DEFAULT '',
                     entry_time TIMESTAMP DEFAULT NOW()
                 )
             """)
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS degen_trades (
+                CREATE TABLE IF NOT EXISTS v12_trades (
                     id SERIAL PRIMARY KEY,
                     product_id TEXT NOT NULL,
                     entry_price DOUBLE PRECISION NOT NULL,
@@ -33,7 +34,10 @@ def init_db():
                     dollars DOUBLE PRECISION NOT NULL,
                     pnl DOUBLE PRECISION NOT NULL,
                     pnl_pct DOUBLE PRECISION NOT NULL,
-                    hold_hours DOUBLE PRECISION NOT NULL,
+                    entry_score INT,
+                    exit_reason TEXT NOT NULL,
+                    entry_reason TEXT DEFAULT '',
+                    hold_seconds INT DEFAULT 0,
                     entry_time TIMESTAMP,
                     exit_time TIMESTAMP DEFAULT NOW()
                 )
@@ -42,76 +46,65 @@ def init_db():
     log("[DB] Tables ready.")
 
 
-def save_holding(product_id: str, entry_price: float, dollars: float, base_size: float):
+def save_position(product_id, entry_price, dollars, high_water, score, reason):
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO degen_holdings (product_id, entry_price, dollars, base_size)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO v12_positions (product_id, entry_price, dollars, high_water, score_at_entry, entry_reason)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (product_id) DO UPDATE SET
                     entry_price=EXCLUDED.entry_price, dollars=EXCLUDED.dollars,
-                    base_size=EXCLUDED.base_size, entry_time=NOW()
-            """, (product_id, entry_price, dollars, base_size))
+                    high_water=EXCLUDED.high_water, score_at_entry=EXCLUDED.score_at_entry,
+                    entry_reason=EXCLUDED.entry_reason, entry_time=NOW()
+            """, (product_id, entry_price, dollars, high_water, score, reason))
         conn.commit()
 
 
-def load_holdings() -> dict:
-    holdings = {}
+def update_high_water(product_id, high_water):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE v12_positions SET high_water = %s WHERE product_id = %s",
+                       (high_water, product_id))
+        conn.commit()
+
+
+def load_positions() -> dict:
+    positions = {}
     try:
         with _conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT product_id, entry_price, dollars, base_size, entry_time FROM degen_holdings")
+                cur.execute("SELECT product_id, entry_price, dollars, high_water, score_at_entry, entry_reason, entry_time FROM v12_positions")
                 for row in cur.fetchall():
-                    holdings[row[0]] = {
+                    positions[row[0]] = {
                         "entry_price": row[1],
                         "dollars": row[2],
-                        "base_size": row[3],
-                        "entry_time": row[4],
+                        "high_water": row[3],
+                        "score_at_entry": row[4],
+                        "entry_reason": row[5],
+                        "entry_time": row[6],
                     }
     except Exception as e:
-        log(f"[DB] Error loading holdings: {e}")
-    log(f"[DB] Loaded {len(holdings)} holdings.")
-    return holdings
+        log(f"[DB] Load error: {e}")
+    log(f"[DB] Loaded {len(positions)} positions.")
+    return positions
 
 
-def delete_holding(product_id: str):
+def delete_position(product_id):
     with _conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM degen_holdings WHERE product_id = %s", (product_id,))
+            cur.execute("DELETE FROM v12_positions WHERE product_id = %s", (product_id,))
         conn.commit()
 
 
-def clear_all_holdings():
-    with _conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM degen_holdings")
-        conn.commit()
-
-
-def record_trade(product_id: str, entry_price: float, exit_price: float,
-                 dollars: float, pnl: float, pnl_pct: float,
-                 hold_hours: float, entry_time=None):
+def record_trade(product_id, entry_price, exit_price, dollars, pnl, pnl_pct,
+                 entry_score, exit_reason, entry_reason, hold_seconds, entry_time):
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO degen_trades (product_id, entry_price, exit_price, dollars, pnl, pnl_pct, hold_hours, entry_time)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """, (product_id, entry_price, exit_price, dollars, pnl, pnl_pct, hold_hours, entry_time))
+                INSERT INTO v12_trades
+                (product_id, entry_price, exit_price, dollars, pnl, pnl_pct,
+                 entry_score, exit_reason, entry_reason, hold_seconds, entry_time)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (product_id, entry_price, exit_price, dollars, pnl, pnl_pct,
+                  entry_score, exit_reason, entry_reason, hold_seconds, entry_time))
         conn.commit()
-
-
-def get_daily_summary() -> dict:
-    with _conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT COUNT(*), COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0),
-                       COALESCE(SUM(pnl), 0)
-                FROM degen_trades
-                WHERE exit_time >= CURRENT_DATE
-            """)
-            row = cur.fetchone()
-            return {
-                "total_trades": row[0],
-                "winning_trades": row[1],
-                "total_pnl": row[2],
-            }
