@@ -18,7 +18,7 @@ import broker
 import strategy
 import database
 import grok
-from logger import log, notify, notify_close, notify_scan, notify_summary, notify_error
+from logger import log, notify_buy, notify_sell, notify_summary, notify_startup, notify_error
 
 
 _position     = {}     # Current open position (max 1)
@@ -62,7 +62,7 @@ def _open_position(price: float, long_votes: int, short_votes: int, votes: dict)
             usd_balance = broker.get_balance("USDC")
         if usd_balance < config.MAX_TRADE_DOLLARS:
             log(f"[BOT] Insufficient balance: ${usd_balance:.2f} < ${config.MAX_TRADE_DOLLARS:.2f}")
-            notify(f"⚠️ Can't trade — only ${usd_balance:.2f} available (need ${config.MAX_TRADE_DOLLARS:.2f})")
+            notify_error(f"Can't trade — only ${usd_balance:.2f} available")
             return False
 
         order_id = broker.place_buy(config.PRODUCT_ID, config.MAX_TRADE_DOLLARS)
@@ -88,15 +88,7 @@ def _open_position(price: float, long_votes: int, short_votes: int, votes: dict)
             base_size,
         )
 
-        emoji_str = _votes_to_emoji(votes)
-        msg = (
-            f"🟢 **LONG {config.PRODUCT_ID}** — ${config.MAX_TRADE_DOLLARS:.2f} @ ~${price:.4f}\n"
-            f"Votes: {long_votes}L/{short_votes}S | {emoji_str}\n"
-            f"Hard stop: {config.HARD_STOP_PCT*100:.1f}% | "
-            f"Trail: {config.TRAIL_DISTANCE_PCT*100:.1f}% after {config.TRAIL_ACTIVATE_PCT*100:.1f}% profit | "
-            f"Max hold: {config.MAX_HOLD_SECS//60} min"
-        )
-        notify(msg)
+        notify_buy(price, config.MAX_TRADE_DOLLARS)
 
         log(f"[BOT] ✅ Opened LONG {config.PRODUCT_ID} @ {price:.4f} "
             f"| {long_votes}L/{short_votes}S | hard stop={config.HARD_STOP_PCT*100:.1f}%")
@@ -134,7 +126,7 @@ def _close_position(current_price: float, reason: str):
     )
     database.delete_position(config.PRODUCT_ID)
 
-    notify_close(config.PRODUCT_ID, "LONG", reason, pnl)
+    notify_sell(current_price, pnl)
     sign = "+" if pnl >= 0 else ""
     log(f"[BOT] {'✅' if pnl >= 0 else '❌'} Closed LONG {config.PRODUCT_ID} "
         f"@ {current_price:.4f} | {reason} | P&L: {sign}${pnl:.4f}")
@@ -253,8 +245,6 @@ def _run_cycle():
     if signal != "LONG":
         log(f"[BOT] ⏸️ No signal — {result['long_votes']}L/{result['short_votes']}S "
             f"(need {config.MIN_VOTE_SCORE})")
-        notify(f"⏸️ Skipped — {result['long_votes']}L/{result['short_votes']}S "
-               f"(need {config.MIN_VOTE_SCORE})")
         return
 
     # ── Grok AI gate ─────────────────────────────────────────────────────
@@ -275,7 +265,6 @@ def _run_cycle():
 
     if not grok_says_buy:
         log(f"[BOT] 🤖 Grok says NO — skipping despite {vote_summary} votes")
-        notify(f"🤖 Grok vetoed — {vote_summary} votes but Grok predicts DOWN")
         return
 
     log(f"[BOT] 🤖 Grok says YES — proceeding with entry")
@@ -298,7 +287,7 @@ def run():
     positions = database.load_positions()
     if config.PRODUCT_ID in positions:
         _position = positions[config.PRODUCT_ID]
-        notify(f"Restarted — found open {config.PRODUCT_ID} position, closing it")
+        notify_startup(f"Restarted — found open {config.PRODUCT_ID} position, closing it")
         try:
             price = broker.get_latest_price(config.PRODUCT_ID)
             _close_position(price, "RESTART_CLOSE")
@@ -319,14 +308,8 @@ def run():
     cash_display = usd_balance if usd_balance > 0 else usdc_balance
     cash_label   = "USD" if usd_balance > 0 else "USDC"
 
-    notify(
-        "Winston v10 🚀 XRP Momentum Mode\n"
-        f"XRP-USD | ${config.MAX_TRADE_DOLLARS:.0f}/trade | Every {config.SCAN_INTERVAL_SECS//60} min\n"
-        f"Needs {config.MIN_VOTE_SCORE}/10 votes + momentum confirmation\n"
-        f"Hard stop: {config.HARD_STOP_PCT*100:.1f}% | "
-        f"Trail: {config.TRAIL_DISTANCE_PCT*100:.1f}% after {config.TRAIL_ACTIVATE_PCT*100:.1f}% profit\n"
-        f"Max hold: {config.MAX_HOLD_SECS//60} min | ADX threshold: {config.ADX_THRESHOLD}\n"
-        f"💰 Balance: ${cash_display:.2f} {cash_label} | {xrp_balance:.4f} XRP"
+    notify_startup(
+        f"🚀 Winston v10 started | ${config.MAX_TRADE_DOLLARS:.0f}/trade | 💰 ${cash_display:.2f} {cash_label}"
     )
     log("[BOT] Winston v10 XRP started — 24/7 mode")
 
@@ -348,7 +331,6 @@ def run():
                 last_summary_hour = now.hour
 
             # Run a scan cycle
-            notify_scan([config.PRODUCT_ID])
             _run_cycle()
 
             # Wait for next scan
