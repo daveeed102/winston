@@ -30,9 +30,10 @@ def get_bars(ticker: str, timeframe_str: str = "5Min", limit: int = BAR_LIMIT) -
     }
     tf = tf_map.get(timeframe_str, TimeFrame(5, TimeFrameUnit.Minute))
 
-    # Dynamic start window so we always get fresh bars
+    # Pull 3x the needed window to guarantee enough bars for all indicators
+    # MACD needs 26 bars min, Bollinger needs 20 — this ensures we always get enough
     now   = datetime.now(pytz.utc)
-    start = now - timedelta(minutes=limit * 10)  # generous lookback window
+    start = now - timedelta(minutes=limit * bar_minutes * 3)
 
     req = StockBarsRequest(
         symbol_or_symbols=ticker,
