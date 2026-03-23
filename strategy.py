@@ -335,4 +335,3 @@ def get_vote_score(df: pd.DataFrame, ticker: str = "") -> dict:
         "info":        info,
         "atr":         atr,
     }
-

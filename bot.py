@@ -17,6 +17,7 @@ import config
 import broker
 import strategy
 import database
+import grok
 from logger import log, notify, notify_close, notify_scan, notify_summary, notify_error
 
 
@@ -253,8 +254,24 @@ def _run_cycle():
         log(f"[BOT] ⏸️ No signal — {result['long_votes']}L/{result['short_votes']}S "
             f"(need {config.MIN_VOTE_SCORE})")
         notify(f"⏸️ Skipped — {result['long_votes']}L/{result['short_votes']}S "
-               f"(need {config.MIN_VOTE_SCORE} + momentum confirmation)")
+               f"(need {config.MIN_VOTE_SCORE})")
         return
+
+    # ── Grok AI gate ─────────────────────────────────────────────────────
+    # Technical indicators say GO — now ask Grok if it agrees
+    vote_summary = f"{result['long_votes']}L/{result['short_votes']}S"
+    grok_says_buy = grok.predict_price_direction(
+        current_price=price,
+        vote_summary=vote_summary,
+        indicator_info=result["info"],
+    )
+
+    if not grok_says_buy:
+        log(f"[BOT] 🤖 Grok says NO — skipping despite {vote_summary} votes")
+        notify(f"🤖 Grok vetoed — {vote_summary} votes but Grok predicts DOWN")
+        return
+
+    log(f"[BOT] 🤖 Grok says YES — proceeding with entry")
 
     # Get real-time price for entry
     try:

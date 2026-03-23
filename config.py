@@ -38,7 +38,7 @@ ATR_PERIOD     = 14
 # ── Voting system ────────────────────────────────────────────────────────────
 # 10 total votes. Need 5+ to enter (higher than SPY because XRP is noisier).
 # But ADX threshold is lower (15) so we still get trades.
-MIN_VOTE_SCORE = 5
+MIN_VOTE_SCORE = 4
 
 # ── Stops ────────────────────────────────────────────────────────────────────
 # XRP is more volatile than SPY — wider stops to avoid getting shaken out
