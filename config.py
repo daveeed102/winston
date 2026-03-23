@@ -12,7 +12,7 @@ GROK_MODEL   = "grok-3-mini"
 DATABASE_URL = os.environ["DATABASE_URL"]
 
 # ── Trade sizing ─────────────────────────────────────────────────────────────
-MAX_TRADE_DOLLARS  = 20.00    # $20 per trade
+MAX_TRADE_DOLLARS  = 50.00    # $50 per trade
 MAX_OPEN_POSITIONS = 1        # One position at a time
 
 # ── Product ──────────────────────────────────────────────────────────────────
