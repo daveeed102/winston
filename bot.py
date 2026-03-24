@@ -20,7 +20,7 @@ import aiohttp
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
-TRADE_AMOUNT_SOL = float(os.getenv("TRADE_AMOUNT_SOL", "0.015"))
+TRADE_AMOUNT_SOL = float(os.getenv("TRADE_AMOUNT_SOL", "0.021"))  # ~$3
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "30"))  # degen default
 MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "2"))
 SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "500"))
@@ -117,7 +117,7 @@ class Jupiter:
                     p = d.get("data", {}).get(mint, {}).get("price")
                     return float(p) if p else None
         except Exception as e:
-            log.debug(f"Price err: {e}")
+            log.warning(f"Price err: {e}")
         finally:
             await s.close()
         return None
@@ -331,9 +331,16 @@ class PoolDetector:
             log.info(f"🆕 New {source} pool detected (tx: {sig[:20]}...)")
 
             # Fetch full transaction to extract the REAL token mint
-            mint = await self._extract_mint(sig, session)
+            # Retry up to 3 times since brand-new txs may not be indexed yet
+            mint = None
+            for attempt in range(3):
+                mint = await self._extract_mint(sig, session)
+                if mint:
+                    break
+                await asyncio.sleep(1)
+
             if not mint:
-                log.debug(f"Could not extract mint from {sig[:20]}")
+                log.warning(f"Could not extract mint from {sig[:20]}")
                 return
 
             if mint in self.seen:
@@ -347,7 +354,7 @@ class PoolDetector:
             await self.on_new_token(token, session)
 
         except Exception as e:
-            log.debug(f"Handle err: {e}")
+            log.warning(f"Handle err: {e}")
 
     async def _extract_mint(self, sig: str, session: aiohttp.ClientSession) -> Optional[str]:
         """
@@ -389,7 +396,7 @@ class PoolDetector:
                             return mint
 
         except Exception as e:
-            log.debug(f"Extract mint err: {e}")
+            log.warning(f"Extract mint err: {e}")
         return None
 
 # ─── TRAILING STOP MANAGER ──────────────────────────────────────────────────
