@@ -486,9 +486,6 @@ class ChainListener:
         PADDING_PREFIXES = ("AAAAAAA", "FAAAAAA", "GQAAAAA")
 
         for line in logs:
-            # Only look at lines that reference token transfers or mints
-            if "Transfer" not in line and "MintTo" not in line and "InitializeMint" not in line:
-                continue
             words = line.split()
             for word in words:
                 clean = word.strip(",.;:()[]{}\"'")
@@ -499,7 +496,14 @@ class ChainListener:
                     and not any(clean.startswith(p) for p in PADDING_PREFIXES)):
                     mints.append(clean)
 
-        return mints
+        # Deduplicate while preserving order
+        seen = set()
+        unique = []
+        for m in mints:
+            if m not in seen:
+                seen.add(m)
+                unique.append(m)
+        return unique
 
 
 # ─── JUPITER DEX ─────────────────────────────────────────────────────────────
