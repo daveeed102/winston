@@ -35,6 +35,74 @@ def _get_position_size(score: int) -> float:
     return config.POSITION_SIZE
 
 
+def _get_grok_prediction(symbol: str, current_price: float, reason: str) -> str:
+    """Ask Grok for a 12-hour price prediction. Returns a string for Discord."""
+    if not config.GROK_API_KEY:
+        return "Grok unavailable"
+
+    try:
+        import requests
+        import json
+
+        headers = {
+            "Authorization": f"Bearer {config.GROK_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": config.GROK_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You predict crypto prices. Give a specific dollar price prediction "
+                        "and a one-sentence explanation. Respond with ONLY JSON:\n"
+                        '{"predicted_price": <number>, "direction": "UP" or "DOWN", '
+                        '"confidence": <0-100>, "explanation": "<one sentence>"}'
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"${symbol} is currently at ${current_price:.6f}.\n"
+                        f"Momentum signals: {reason}\n"
+                        f"Where will ${symbol} be in 12 hours? Give a specific price."
+                    ),
+                },
+            ],
+            "temperature": 0.4,
+        }
+
+        resp = requests.post(
+            "https://api.x.ai/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=15,
+        )
+        data = resp.json()
+        text = data["choices"][0]["message"]["content"].strip()
+        text = text.replace("```json", "").replace("```", "").strip()
+
+        result = json.loads(text)
+        pred_price = float(result.get("predicted_price", current_price))
+        direction = result.get("direction", "?")
+        confidence = result.get("confidence", 0)
+        explanation = result.get("explanation", "")
+
+        pct_change = ((pred_price - current_price) / current_price) * 100 if current_price > 0 else 0
+        sign = "+" if pct_change >= 0 else ""
+
+        prediction_str = (
+            f"Grok predicts ${pred_price:.6f} in 12h ({sign}{pct_change:.1f}%) "
+            f"[{confidence}% confident] — {explanation}"
+        )
+        log(f"[GROK] {symbol}: {prediction_str}")
+        return prediction_str
+
+    except Exception as e:
+        log(f"[GROK] Prediction failed for {symbol}: {e}")
+        return "Grok prediction unavailable"
+
+
 def _format_hold_time(entry_time) -> str:
     """Format hold time as human readable string."""
     if not entry_time:
@@ -213,6 +281,10 @@ def _scan_for_entries():
         if product_id in _positions:
             continue
 
+        # Skip if no price data at all
+        if c.get("price", 0) <= 0:
+            continue
+
         result = scorer.score_token(c)
         c["_score"] = result["score"]
         c["_reason"] = result["reason"]
@@ -220,20 +292,21 @@ def _scan_for_entries():
         c["_cached_x_score"] = result.get("_cached_x_score", 30)
         scored.append(c)
 
-    # Sort by score descending
+    # Sort by score descending — ALWAYS buy the top picks, no threshold
     scored.sort(key=lambda x: x["_score"], reverse=True)
 
-    # Buy the best candidates that pass the threshold
+    if not scored:
+        log("[BOT] No scoreable candidates this cycle")
+        return
+
+    # Buy the top candidates to fill our slots
     for c in scored:
         if len(_positions) >= config.MAX_POSITIONS:
             break
 
-        score = c["_score"]
-        if score < config.MIN_SCORE_TO_BUY:
-            break  # Sorted descending, so everything after is lower
-
         symbol = c["symbol"]
         product_id = f"{symbol}-USD"
+        score = c["_score"]
         dollars = _get_position_size(score)
         reason = c["_reason"]
 
@@ -242,6 +315,9 @@ def _scan_for_entries():
         if usd < dollars:
             log(f"[BOT] Not enough USD (${usd:.2f}) for ${dollars:.0f} trade")
             break
+
+        # Get Grok's 12-hour price prediction for Discord
+        grok_prediction = _get_grok_prediction(symbol, c.get("price", 0), reason)
 
         log(f"[BOT] 🎯 Buying {symbol} — score {score}/100 — ${dollars:.0f}")
 
@@ -261,7 +337,7 @@ def _scan_for_entries():
             }
             database.save_position(product_id, result["price"], dollars,
                                   result["price"], score, reason)
-            notify_buy(symbol, dollars, score, reason)
+            notify_buy(symbol, dollars, score, reason, grok_prediction)
         else:
             log(f"[BOT] Buy failed for {symbol}")
 

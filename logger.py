@@ -22,10 +22,11 @@ def _discord(content: str):
         pass
 
 
-def notify_buy(symbol: str, dollars: float, score: int, reason: str):
+def notify_buy(symbol: str, dollars: float, score: int, reason: str, prediction: str = ""):
     msg = (
         f"🟢 **BOUGHT ${dollars:.0f} of {symbol}** (score: {score}/100)\n"
-        f"📊 {reason}"
+        f"📊 Why: {reason}\n"
+        f"🔮 {prediction}"
     )
     log(f"[DISCORD] {msg}")
     _discord(msg)
