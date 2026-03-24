@@ -219,8 +219,25 @@ def score_token(candidate: dict, skip_x: bool = False) -> dict:
 
     buyer_score = _score_buyer_momentum(candidate)
 
-    # Chart shape score from DEXScreener data
-    chart_score = candidate.get("chart_score", 40)  # Default neutral if no chart data
+    # Chart shape score — computed from candle data
+    chart_trending = candidate.get("chart_trending_up", None)
+    pct_6h = candidate.get("pct_6h", 0)
+
+    if chart_trending is not None:
+        chart_score = 50  # baseline
+        if chart_trending:
+            chart_score += 20  # last 3 candles trending up
+        if pct_6h > 5:
+            chart_score += 20  # solid 6h uptrend
+        elif pct_6h > 0:
+            chart_score += 10
+        elif pct_6h < -5:
+            chart_score -= 20  # 6h downtrend = bad
+        chart_score = max(0, min(100, chart_score))
+        chart_label = "up" if chart_trending else "down"
+    else:
+        chart_score = 40  # no data
+        chart_label = "no_data"
 
     # 6 factors now, with chart shape as a key component
     has_market_data = candidate.get("volume_24h", 0) > 0 or candidate.get("pct_1h", 0) != 0
@@ -280,7 +297,7 @@ def score_token(candidate: dict, skip_x: bool = False) -> dict:
     reason = " | ".join(reasons) if reasons else "moderate signals across indicators"
 
     log(f"[SCORER] {symbol}: {final_score}/100 — vol={vol_score} price={price_score} "
-        f"x={x_score} trend={trending_score} accel={buyer_score} chart={chart_score}({chart_phase})")
+        f"x={x_score} trend={trending_score} accel={buyer_score} chart={chart_score}({chart_label})")
 
     return {
         "score": final_score,

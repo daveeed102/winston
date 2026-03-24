@@ -300,21 +300,59 @@ def discover_candidates(available_coins: list) -> list:
         if len(c.get("sources", [])) >= 2:
             log(f"[SCANNER] 🔥 {sym} found in {len(c['sources'])} sources: {c['sources']}")
 
-    # Enrich each candidate with DEXScreener pair data (volume, price, buys/sells)
+    # Enrich each candidate with COINBASE data (since that's where we trade)
+    import broker as _broker
     import time as _time
     enriched = []
     for sym, c in candidates.items():
-        dex_data = get_token_data_dexscreener(sym)
-        _time.sleep(0.3)  # Gentle rate limiting
+        product_id = f"{sym}-USD"
 
-        if dex_data:
-            c.update(dex_data)
-            log(f"[SCANNER] {sym}: price=${dex_data.get('price', 0):.6f} "
-                f"1h={dex_data.get('pct_1h', 0):+.1f}% "
-                f"vol_1h=${dex_data.get('volume_1h', 0):,.0f} "
-                f"buys={dex_data.get('buys_1h', 0)} sells={dex_data.get('sells_1h', 0)}")
+        # Get price + volume from Coinbase
+        cb_data = _broker.get_product_data(product_id)
+        _time.sleep(0.2)
+
+        if cb_data and cb_data.get("price", 0) > 0:
+            c["price"] = cb_data["price"]
+            c["volume_24h"] = cb_data.get("volume_24h", 0)
+            c["pct_24h"] = cb_data.get("price_change_24h", 0)
+
+            # Get 1-hour candles to calculate 1h price change and chart shape
+            candles = _broker.get_candles(product_id, "ONE_HOUR", 12)
+            _time.sleep(0.2)
+
+            if len(candles) >= 2:
+                current_close = candles[-1]["close"]
+                one_hour_ago = candles[-2]["close"]
+                if one_hour_ago > 0:
+                    c["pct_1h"] = ((current_close - one_hour_ago) / one_hour_ago) * 100
+                else:
+                    c["pct_1h"] = 0
+
+                # Calculate volume_1h from the last candle
+                c["volume_1h"] = candles[-1].get("volume", 0) * current_close
+
+                # Simple chart shape analysis: are last 3 candles trending up?
+                if len(candles) >= 4:
+                    last_4 = [c_["close"] for c_ in candles[-4:]]
+                    ups = sum(1 for i in range(1, len(last_4)) if last_4[i] > last_4[i-1])
+                    c["chart_trending_up"] = ups >= 2
+
+                    # 6h change for longer-term trend
+                    if len(candles) >= 7:
+                        six_h_ago = candles[-7]["close"]
+                        if six_h_ago > 0:
+                            c["pct_6h"] = ((current_close - six_h_ago) / six_h_ago) * 100
+
+            # Estimate market cap from volume (rough — Coinbase doesn't give mcap directly)
+            # Use volume/price as proxy for activity level
+            c["market_cap"] = c.get("volume_24h", 0) * 5  # rough proxy
+
+            log(f"[SCANNER] {sym}: ${c['price']:.6f} "
+                f"1h={c.get('pct_1h', 0):+.1f}% 24h={c.get('pct_24h', 0):+.1f}% "
+                f"vol_24h=${c.get('volume_24h', 0):,.0f} "
+                f"chart_up={c.get('chart_trending_up', '?')}")
         else:
-            log(f"[SCANNER] {sym}: no DEXScreener data found")
+            log(f"[SCANNER] {sym}: couldn't get Coinbase data")
 
         enriched.append(c)
 

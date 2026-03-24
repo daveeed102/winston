@@ -45,6 +45,66 @@ def get_price(product_id: str) -> float:
     return float(data.get("price", 0)) if isinstance(data, dict) else 0.0
 
 
+def get_product_data(product_id: str) -> dict:
+    """Get full product data including price, volume, and price change from Coinbase."""
+    try:
+        product = _client.get_product(product_id=product_id)
+        data = product.to_dict() if hasattr(product, 'to_dict') else product
+        if not isinstance(data, dict):
+            return {}
+
+        return {
+            "price": float(data.get("price", 0) or 0),
+            "volume_24h": float(data.get("volume_24h", 0) or 0),
+            "price_change_24h": float(data.get("price_percentage_change_24h", 0) or 0),
+        }
+    except Exception as e:
+        log(f"[BROKER] Product data error for {product_id}: {e}")
+        return {}
+
+
+def get_candles(product_id: str, granularity: str = "ONE_HOUR", limit: int = 24) -> list:
+    """Get candle data for chart analysis. Returns list of {open, high, low, close, volume}."""
+    try:
+        from datetime import datetime, timezone, timedelta
+
+        gran_secs = {
+            "FIVE_MINUTE": 300, "FIFTEEN_MINUTE": 900, "ONE_HOUR": 3600, "SIX_HOUR": 21600,
+        }
+        secs = gran_secs.get(granularity, 3600)
+        now = datetime.now(timezone.utc)
+        start = now - timedelta(seconds=secs * limit)
+
+        resp = _client.get_candles(
+            product_id=product_id,
+            start=str(int(start.timestamp())),
+            end=str(int(now.timestamp())),
+            granularity=granularity,
+        )
+        data = resp.to_dict() if hasattr(resp, 'to_dict') else resp
+        candles = data.get("candles", []) if isinstance(data, dict) else []
+
+        rows = []
+        for c in candles:
+            cd = c.to_dict() if hasattr(c, 'to_dict') else c
+            if isinstance(cd, dict):
+                rows.append({
+                    "open": float(cd.get("open", 0)),
+                    "high": float(cd.get("high", 0)),
+                    "low": float(cd.get("low", 0)),
+                    "close": float(cd.get("close", 0)),
+                    "volume": float(cd.get("volume", 0)),
+                })
+
+        # Coinbase returns newest first, reverse to oldest first
+        rows.reverse()
+        return rows
+
+    except Exception as e:
+        log(f"[BROKER] Candles error for {product_id}: {e}")
+        return []
+
+
 def get_balance(currency: str) -> float:
     """Get available balance."""
     try:

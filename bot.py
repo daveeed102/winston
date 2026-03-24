@@ -41,7 +41,7 @@ def _format_hold_time(entry_time) -> str:
         return "unknown"
     now = datetime.now(timezone.utc)
     if hasattr(entry_time, 'tzinfo') and entry_time.tzinfo is None:
-        delta = (datetime.utcnow() - entry_time).total_seconds()
+        delta = (datetime.now(timezone.utc).replace(tzinfo=None) - entry_time).total_seconds()
     else:
         delta = (now - entry_time).total_seconds()
 
@@ -132,7 +132,7 @@ def _check_exits():
         entry_time = pos.get("entry_time")
         if entry_time:
             if hasattr(entry_time, 'tzinfo') and entry_time.tzinfo is None:
-                held_secs = (datetime.utcnow() - entry_time).total_seconds()
+                held_secs = (datetime.now(timezone.utc).replace(tzinfo=None) - entry_time).total_seconds()
             else:
                 held_secs = (datetime.now(timezone.utc) - entry_time).total_seconds()
 
@@ -171,7 +171,7 @@ def _sell_position(product_id: str, current_price: float, reason: str,
     hold_secs = 0
     if entry_time:
         if hasattr(entry_time, 'tzinfo') and entry_time.tzinfo is None:
-            hold_secs = int((datetime.utcnow() - entry_time).total_seconds())
+            hold_secs = int((datetime.now(timezone.utc).replace(tzinfo=None) - entry_time).total_seconds())
         else:
             hold_secs = int((datetime.now(timezone.utc) - entry_time).total_seconds())
 
