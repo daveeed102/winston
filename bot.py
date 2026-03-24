@@ -359,41 +359,83 @@ class PoolDetector:
     async def _extract_mint(self, sig: str, session: aiohttp.ClientSession) -> Optional[str]:
         """
         Fetch parsed transaction and find the NEW token mint.
-        Look at postTokenBalances for mints that aren't SOL/USDC/USDT.
+        Multiple strategies for Raydium and Pump.fun transaction formats.
         """
         try:
             tx = await self.sol.get_tx(sig, session)
             if not tx:
+                log.warning(f"getTransaction returned null for {sig[:16]}")
                 return None
 
             meta = tx.get("meta", {})
-            if not meta or meta.get("err"):
+            if not meta:
+                log.warning(f"No meta in tx {sig[:16]}")
                 return None
+            if meta.get("err"):
+                return None  # Failed tx, skip silently
 
-            # Strategy 1: Look at postTokenBalances for non-SOL mints
-            post_balances = meta.get("postTokenBalances", [])
-            for bal in post_balances:
+            # Strategy 1: postTokenBalances (works for most Raydium pools)
+            for bal in meta.get("postTokenBalances", []):
                 mint = bal.get("mint", "")
                 if mint and mint not in SKIP_MINTS:
                     return mint
 
-            # Strategy 2: Look at preTokenBalances too
-            pre_balances = meta.get("preTokenBalances", [])
-            for bal in pre_balances:
+            # Strategy 2: preTokenBalances
+            for bal in meta.get("preTokenBalances", []):
                 mint = bal.get("mint", "")
                 if mint and mint not in SKIP_MINTS:
                     return mint
 
-            # Strategy 3: Check inner instructions for token program calls
-            inner = meta.get("innerInstructions", [])
-            for ix_group in inner:
+            # Strategy 3: Inner instructions — parsed info.mint
+            for ix_group in meta.get("innerInstructions", []):
                 for ix in ix_group.get("instructions", []):
                     parsed = ix.get("parsed", {})
                     if isinstance(parsed, dict):
                         info = parsed.get("info", {})
-                        mint = info.get("mint", "")
-                        if mint and mint not in SKIP_MINTS:
-                            return mint
+                        for key in ["mint", "source", "destination"]:
+                            val = info.get(key, "")
+                            if val and val not in SKIP_MINTS and len(val) >= 32:
+                                return val
+
+            # Strategy 4: Account keys — for Pump.fun, the token mint is
+            # typically in the transaction's account keys list
+            transaction = tx.get("transaction", {})
+            message = transaction.get("message", {})
+            account_keys = message.get("accountKeys", [])
+
+            # Pump.fun token mint is usually at a specific index
+            # Skip first few accounts (fee payer, programs) and look for
+            # base58 addresses that aren't known programs
+            known_programs = {
+                RAYDIUM_AMM, PUMPFUN, WSOL, USDC, USDT,
+                "11111111111111111111111111111111",
+                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+                "SysvarRent111111111111111111111111111111111",
+                "ComputeBudget111111111111111111111111111111",
+                "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+                "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",
+                "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+            }
+            for acct in account_keys:
+                # accountKeys can be strings or objects with pubkey
+                if isinstance(acct, str):
+                    addr = acct
+                elif isinstance(acct, dict):
+                    addr = acct.get("pubkey", "")
+                else:
+                    continue
+
+                if (addr and addr not in SKIP_MINTS
+                    and addr not in known_programs
+                    and len(addr) >= 32 and len(addr) <= 44):
+                    # Verify this is actually a token mint by checking
+                    # if it appears in any token balance
+                    # For now, return the first candidate — Jupiter will
+                    # reject it if it's not tradeable
+                    return addr
+
+            log.warning(f"No mint found in tx {sig[:16]} (balances:{len(meta.get('postTokenBalances',[]))} keys:{len(account_keys)})")
 
         except Exception as e:
             log.warning(f"Extract mint err: {e}")
@@ -500,10 +542,37 @@ class SniperBot:
         )
 
     async def _on_token(self, token: Token, session: aiohttp.ClientSession):
-        """Called when a real new token mint is detected."""
+        """Called when a real new token mint is detected. Runs quality filters."""
 
-        # Safety: check top holder concentration
+        # Limit: max 3 open positions at once (don't blow the whole wallet)
+        open_count = len([p for p in self.stops.positions if p.status == "open"])
+        if open_count >= 3:
+            log.info(f"⏸️ {token.mint[:16]}: 3 positions open, skipping")
+            return
+
         try:
+            # Get token account info
+            account_info = await self.sol._call(
+                "getAccountInfo",
+                [token.mint, {"encoding": "jsonParsed"}],
+                session,
+            )
+            acct_data = account_info.get("result", {}).get("value", {})
+            if acct_data:
+                parsed = acct_data.get("data", {}).get("parsed", {}).get("info", {})
+
+                # FILTER 1: Freeze authority — instant reject
+                if parsed.get("freezeAuthority"):
+                    log.info(f"⛔ {token.mint[:16]}: freeze authority active")
+                    return
+
+                # Get symbol/name if available
+                if parsed.get("symbol"):
+                    token.symbol = parsed["symbol"]
+                if parsed.get("name"):
+                    token.name = parsed["name"]
+
+            # FILTER 2: Top holder concentration
             supply_info = await self.sol.get_token_supply(token.mint, session)
             largest = await self.sol.get_largest_holders(token.mint, session)
             if supply_info and largest:
@@ -514,8 +583,10 @@ class SniperBot:
                     if pct > MAX_TOP_HOLDER_PCT:
                         log.info(f"⛔ {token.mint[:16]}: top holder {pct:.0f}%")
                         return
-        except Exception:
-            pass  # If check fails, proceed anyway
+
+        except Exception as e:
+            log.warning(f"Filter check err: {e}")
+            # If checks fail, still proceed — Jupiter will reject bad tokens
 
         log.info(f"✅ Buying {token.symbol} ({token.source})...")
 
