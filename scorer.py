@@ -16,25 +16,40 @@ import scanner
 from logger import log
 
 
-def _score_volume(volume_24h: float, market_cap: float) -> int:
-    """Score based on volume/mcap ratio. High ratio = unusual activity."""
+def _score_volume(volume_24h: float, market_cap: float, volume_1h: float = 0) -> int:
+    """Score based on volume/mcap ratio and 1h volume spike."""
     if market_cap <= 0 or volume_24h <= 0:
-        return 20  # No data, neutral
+        # If we have 1h volume but no mcap, score based on raw volume
+        if volume_1h > 100_000:
+            return 60
+        elif volume_1h > 50_000:
+            return 45
+        elif volume_1h > 10_000:
+            return 30
+        return 20
 
     ratio = volume_24h / market_cap
-    # Normal is ~0.05-0.10. High is 0.3+. Insane is 1.0+
+
     if ratio >= 1.0:
-        return 100
+        score = 100
     elif ratio >= 0.5:
-        return 85
+        score = 85
     elif ratio >= 0.3:
-        return 70
+        score = 70
     elif ratio >= 0.15:
-        return 55
+        score = 55
     elif ratio >= 0.08:
-        return 35
+        score = 35
     else:
-        return 15
+        score = 15
+
+    # Bonus for 1h volume spike (1h should be ~4% of 24h normally)
+    if volume_24h > 0 and volume_1h > 0:
+        hourly_normal = volume_24h / 24
+        if volume_1h > hourly_normal * 3:
+            score = min(100, score + 15)  # 3x normal hourly = spiking
+
+    return score
 
 
 def _score_price_momentum(pct_1h: float, pct_24h: float) -> int:
@@ -117,37 +132,53 @@ def _score_trending(sources: list) -> int:
     return min(100, score)
 
 
-def _score_buyer_momentum(pct_1h: float, pct_24h: float) -> int:
+def _score_buyer_momentum(candidate: dict) -> int:
     """
-    Score based on whether momentum is accelerating.
-    If 1h change is much higher than 24h/24 (hourly avg), it's accelerating.
+    Score based on actual buyer vs seller activity from DEXScreener.
+    Also factors in acceleration (1h outperforming 24h average).
     """
-    if pct_24h == 0:
-        hourly_avg = 0
-    else:
-        hourly_avg = pct_24h / 24
+    buys_1h = candidate.get("buys_1h", 0)
+    sells_1h = candidate.get("sells_1h", 0)
+    pct_1h = candidate.get("pct_1h", 0)
+    pct_24h = candidate.get("pct_24h", 0)
 
-    if pct_1h <= 0:
-        return 15
+    score = 20  # baseline
 
-    # How much is 1h outperforming the average hourly move?
-    if hourly_avg > 0:
-        acceleration = pct_1h / hourly_avg
+    # Buy/sell ratio (if we have the data)
+    total_txns = buys_1h + sells_1h
+    if total_txns > 0:
+        buy_ratio = buys_1h / total_txns
+        if buy_ratio >= 0.75:
+            score = 90
+        elif buy_ratio >= 0.65:
+            score = 70
+        elif buy_ratio >= 0.55:
+            score = 50
+        elif buy_ratio >= 0.45:
+            score = 30
+        else:
+            score = 10
     else:
-        acceleration = pct_1h * 10  # Any positive 1h on a flat/negative 24h = strong signal
+        # No txn data, fall back to price acceleration
+        if pct_24h != 0:
+            hourly_avg = pct_24h / 24
+        else:
+            hourly_avg = 0
 
-    if acceleration >= 10:
-        return 100
-    elif acceleration >= 5:
-        return 80
-    elif acceleration >= 3:
-        return 65
-    elif acceleration >= 2:
-        return 50
-    elif acceleration >= 1:
-        return 35
-    else:
-        return 20
+        if pct_1h > 0:
+            if hourly_avg > 0:
+                acceleration = pct_1h / hourly_avg
+            else:
+                acceleration = pct_1h * 10
+            if acceleration >= 5: score = 80
+            elif acceleration >= 3: score = 60
+            elif acceleration >= 1: score = 40
+
+    # Bonus for high transaction count (active market)
+    if total_txns >= 500:
+        score = min(100, score + 10)
+
+    return score
 
 
 def score_token(candidate: dict, skip_x: bool = False) -> dict:
@@ -168,6 +199,7 @@ def score_token(candidate: dict, skip_x: bool = False) -> dict:
     vol_score = _score_volume(
         candidate.get("volume_24h", 0),
         candidate.get("market_cap", 0),
+        candidate.get("volume_1h", 0),
     )
 
     price_score = _score_price_momentum(
@@ -185,32 +217,31 @@ def score_token(candidate: dict, skip_x: bool = False) -> dict:
 
     trending_score = _score_trending(candidate.get("sources", []))
 
-    buyer_score = _score_buyer_momentum(
-        candidate.get("pct_1h", 0),
-        candidate.get("pct_24h", 0),
-    )
+    buyer_score = _score_buyer_momentum(candidate)
 
-    # Dynamic weights — if we have real market data, use balanced weights
-    # If market data is missing (all defaults), lean harder on X buzz + trending
+    # Chart shape score from DEXScreener data
+    chart_score = candidate.get("chart_score", 40)  # Default neutral if no chart data
+
+    # 6 factors now, with chart shape as a key component
     has_market_data = candidate.get("volume_24h", 0) > 0 or candidate.get("pct_1h", 0) != 0
 
     if has_market_data:
-        # Normal balanced weights
         total = (
-            vol_score * 0.25 +
-            price_score * 0.25 +
-            x_score * 0.20 +
+            vol_score * 0.15 +
+            price_score * 0.20 +
+            x_score * 0.15 +
             trending_score * 0.15 +
-            buyer_score * 0.15
+            buyer_score * 0.10 +
+            chart_score * 0.25    # Chart shape is crucial — don't buy the top
         )
     else:
-        # No market data — lean on X buzz and trending presence
         total = (
             vol_score * 0.05 +
-            price_score * 0.10 +
-            x_score * 0.40 +
-            trending_score * 0.35 +
-            buyer_score * 0.10
+            price_score * 0.05 +
+            x_score * 0.35 +
+            trending_score * 0.30 +
+            buyer_score * 0.05 +
+            chart_score * 0.20
         )
 
     final_score = int(round(total))
@@ -221,10 +252,14 @@ def score_token(candidate: dict, skip_x: bool = False) -> dict:
         "x_buzz": x_score,
         "trending": trending_score,
         "acceleration": buyer_score,
+        "chart": chart_score,
     }
 
     # Build reason string
+    chart_phase = candidate.get("chart_phase", "unknown")
     reasons = []
+    if chart_score >= 60:
+        reasons.append(f"chart: {chart_phase}")
     if price_score >= 60:
         reasons.append(f"+{candidate.get('pct_1h', 0):.1f}% in 1h")
     if vol_score >= 60:
@@ -245,7 +280,7 @@ def score_token(candidate: dict, skip_x: bool = False) -> dict:
     reason = " | ".join(reasons) if reasons else "moderate signals across indicators"
 
     log(f"[SCORER] {symbol}: {final_score}/100 — vol={vol_score} price={price_score} "
-        f"x={x_score} trend={trending_score} accel={buyer_score}")
+        f"x={x_score} trend={trending_score} accel={buyer_score} chart={chart_score}({chart_phase})")
 
     return {
         "score": final_score,

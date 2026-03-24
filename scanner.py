@@ -1,13 +1,12 @@
 """
 scanner.py — Data watchers for Winston v12
 
-Pulls trending/volume/momentum data from:
-  1. CoinGecko trending API
-  2. CoinGecko search trending
-  3. Grok X/Twitter mention velocity (via xAI API)
+Sources:
+  1. DEXScreener — boosted tokens, search pairs for volume/price/buys data
+  2. Grok X/Twitter — early buzz detection (leading indicator)
 
-All free APIs, no keys needed except Grok for X search.
-Returns candidate tokens with raw data for the scorer.
+All free, no API keys needed except Grok.
+300 req/min on DEXScreener, no rate limit issues.
 """
 
 import requests
@@ -16,136 +15,123 @@ from logger import log
 import config
 
 
-def get_trending_coingecko() -> list:
-    """Get trending coins from CoinGecko. Returns list of symbols."""
+def get_boosted_tokens() -> list:
+    """Get the most boosted tokens on DEXScreener. These are tokens people are paying
+    to promote — it's a hype signal (someone thinks it's worth promoting)."""
     try:
         resp = requests.get(
-            "https://api.coingecko.com/api/v3/search/trending",
+            "https://api.dexscreener.com/token-boosts/top/v1",
             timeout=10,
         )
+        if resp.status_code != 200:
+            log(f"[SCANNER] DEXScreener boosts returned {resp.status_code}")
+            return []
+
         data = resp.json()
-        coins = data.get("coins", [])
+        if not isinstance(data, list):
+            return []
+
         results = []
-        for item in coins:
-            coin = item.get("item", {})
+        seen = set()
+        for token in data:
+            symbol = token.get("description", "").split(" ")[0].upper() if token.get("description") else ""
+            # Try to extract symbol from the token profile
+            chain = token.get("chainId", "")
+            address = token.get("tokenAddress", "")
+            amount = token.get("totalAmount", 0) or token.get("amount", 0)
+
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+
             results.append({
-                "symbol": coin.get("symbol", "").upper(),
-                "name": coin.get("name", ""),
-                "market_cap_rank": coin.get("market_cap_rank", 9999),
-                "source": "coingecko_trending",
+                "symbol": symbol,
+                "chain": chain,
+                "address": address,
+                "boost_amount": amount,
+                "source": "dexscreener_boosted",
             })
-        log(f"[SCANNER] CoinGecko trending: {len(results)} coins")
-        return results
+
+        log(f"[SCANNER] DEXScreener boosted: {len(results)} tokens")
+        return results[:20]
+
     except Exception as e:
-        log(f"[SCANNER] CoinGecko trending error: {e}")
+        log(f"[SCANNER] DEXScreener boosts error: {e}")
         return []
 
 
-def get_coin_market_data(coin_id: str) -> dict:
-    """Get detailed market data for a coin from CoinGecko."""
+def get_token_data_dexscreener(symbol: str) -> dict:
+    """
+    Search DEXScreener for a token's pair data.
+    Returns volume, price change, buys/sells, liquidity — the real numbers.
+    """
     try:
         resp = requests.get(
-            f"https://api.coingecko.com/api/v3/coins/{coin_id}",
-            params={
-                "localization": "false",
-                "tickers": "false",
-                "community_data": "false",
-                "developer_data": "false",
-            },
+            f"https://api.dexscreener.com/latest/dex/search?q={symbol}%20USD",
             timeout=10,
         )
+        if resp.status_code != 200:
+            return {}
+
         data = resp.json()
-        market = data.get("market_data", {})
+        pairs = data.get("pairs", [])
+        if not pairs:
+            return {}
+
+        # Find the highest-volume USD pair
+        best = None
+        best_vol = 0
+        for pair in pairs:
+            base_sym = pair.get("baseToken", {}).get("symbol", "").upper()
+            quote_sym = pair.get("quoteToken", {}).get("symbol", "").upper()
+
+            # Match our symbol and USD-quoted pairs
+            if base_sym != symbol.upper():
+                continue
+            if quote_sym not in ("USD", "USDT", "USDC", "WETH", "ETH"):
+                continue
+
+            vol = pair.get("volume", {}).get("h24", 0) or 0
+            if vol > best_vol:
+                best_vol = vol
+                best = pair
+
+        if not best:
+            return {}
+
+        price_change = best.get("priceChange", {})
+        volume = best.get("volume", {})
+        txns = best.get("txns", {})
+        liquidity = best.get("liquidity", {})
+
+        # Extract buy/sell counts from various timeframes
+        h1_txns = txns.get("h1", {})
+        h24_txns = txns.get("h24", {})
+
         return {
-            "price_change_1h": market.get("price_change_percentage_1h_in_currency", {}).get("usd", 0),
-            "price_change_24h": market.get("price_change_percentage_24h", 0),
-            "volume_24h": market.get("total_volume", {}).get("usd", 0),
-            "market_cap": market.get("market_cap", {}).get("usd", 0),
+            "price": float(best.get("priceUsd", 0) or 0),
+            "pct_5m": float(price_change.get("m5", 0) or 0),
+            "pct_1h": float(price_change.get("h1", 0) or 0),
+            "pct_6h": float(price_change.get("h6", 0) or 0),
+            "pct_24h": float(price_change.get("h24", 0) or 0),
+            "volume_5m": float(volume.get("m5", 0) or 0),
+            "volume_1h": float(volume.get("h1", 0) or 0),
+            "volume_24h": float(volume.get("h24", 0) or 0),
+            "buys_1h": int(h1_txns.get("buys", 0) or 0),
+            "sells_1h": int(h1_txns.get("sells", 0) or 0),
+            "buys_24h": int(h24_txns.get("buys", 0) or 0),
+            "sells_24h": int(h24_txns.get("sells", 0) or 0),
+            "liquidity": float(liquidity.get("usd", 0) or 0),
+            "market_cap": float(best.get("marketCap", 0) or best.get("fdv", 0) or 0),
         }
-    except Exception:
+
+    except Exception as e:
+        log(f"[SCANNER] DEXScreener search error for {symbol}: {e}")
         return {}
 
 
-def get_coinbase_movers(available_coins: list) -> list:
-    """
-    Check which Coinbase coins have big price moves in last 24h.
-    Uses CoinGecko's markets endpoint with retry for rate limits.
-    """
-    import time as _time
-
-    for attempt in range(3):
-        try:
-            resp = requests.get(
-                "https://api.coingecko.com/api/v3/coins/markets",
-                params={
-                    "vs_currency": "usd",
-                    "order": "volume_desc",
-                    "per_page": 250,
-                    "page": 1,
-                    "price_change_percentage": "1h,24h",
-                },
-                timeout=15,
-            )
-
-            # Handle rate limiting
-            if resp.status_code == 429:
-                wait = 30 * (attempt + 1)
-                log(f"[SCANNER] CoinGecko rate limited — waiting {wait}s (attempt {attempt+1}/3)")
-                _time.sleep(wait)
-                continue
-
-            if resp.status_code != 200:
-                log(f"[SCANNER] CoinGecko returned status {resp.status_code}")
-                _time.sleep(10)
-                continue
-
-            data = resp.json()
-            if not isinstance(data, list):
-                log(f"[SCANNER] CoinGecko unexpected response type: {type(data)}")
-                _time.sleep(10)
-                continue
-
-            available_set = set(c.replace("-USD", "").upper() for c in available_coins)
-            results = []
-
-            for coin in data:
-                symbol = coin.get("symbol", "").upper()
-                if symbol in available_set and symbol not in config.BLOCKED_COINS:
-                    pct_1h = coin.get("price_change_percentage_1h_in_currency", 0) or 0
-                    pct_24h = coin.get("price_change_percentage_24h", 0) or 0
-                    volume = coin.get("total_volume", 0) or 0
-                    mcap = coin.get("market_cap", 0) or 0
-
-                    # Include any memecoin with some activity — lower threshold
-                    if abs(pct_1h) > 1 or abs(pct_24h) > 5 or volume > 500_000:
-                        results.append({
-                            "symbol": symbol,
-                            "name": coin.get("name", ""),
-                            "price": coin.get("current_price", 0),
-                            "pct_1h": pct_1h,
-                            "pct_24h": pct_24h,
-                            "volume_24h": volume,
-                            "market_cap": mcap,
-                            "source": "coingecko_movers",
-                        })
-
-            results.sort(key=lambda x: x.get("pct_1h", 0), reverse=True)
-            log(f"[SCANNER] CoinGecko movers: {len(results)} coins with activity")
-            return results[:30]
-
-        except Exception as e:
-            log(f"[SCANNER] CoinGecko movers error (attempt {attempt+1}): {e}")
-            _time.sleep(10)
-
-    log("[SCANNER] CoinGecko movers failed after 3 attempts")
-    return []
-
-
 def get_x_mention_velocity(symbol: str) -> dict:
-    """
-    Use Grok's API to search X/Twitter for recent mentions of a coin.
-    Returns mention count and sentiment from the last 2 hours.
-    """
+    """Use Grok to check X/Twitter buzz for a symbol in the last 2 hours."""
     if not config.GROK_API_KEY:
         return {"mentions": 0, "sentiment": 0, "has_influencer": False}
 
@@ -157,7 +143,6 @@ def get_x_mention_velocity(symbol: str) -> dict:
             "Authorization": f"Bearer {config.GROK_API_KEY}",
             "Content-Type": "application/json",
         }
-
         payload = {
             "model": config.GROK_MODEL,
             "messages": [
@@ -168,8 +153,8 @@ def get_x_mention_velocity(symbol: str) -> dict:
                         "no markdown, no backticks:\n"
                         '{"mention_count": <estimated posts in last 2 hours>, '
                         '"sentiment": <-1.0 to 1.0>, '
-                        '"has_influencer": <true/false if major CT influencer posted>, '
-                        '"buzz_summary": "<one sentence about the vibe>"}'
+                        '"has_influencer": <true/false>, '
+                        '"buzz_summary": "<one sentence>"}'
                     ),
                 },
                 {
@@ -177,9 +162,7 @@ def get_x_mention_velocity(symbol: str) -> dict:
                     "content": (
                         f"Right now it's {time_str}. "
                         f"How much buzz is ${symbol} getting on crypto Twitter in the LAST 2 HOURS? "
-                        f"Estimate the number of posts, the sentiment, and whether any major "
-                        f"influencers (100k+ followers) have posted about it. "
-                        f"Only count posts from the last 2 hours, not older."
+                        f"Estimate posts, sentiment, influencer activity. Last 2 hours ONLY."
                     ),
                 },
             ],
@@ -211,11 +194,7 @@ def get_x_mention_velocity(symbol: str) -> dict:
 
 
 def get_grok_early_picks(available_coins: list) -> list:
-    """
-    Ask Grok to search X/Twitter for memecoins that are STARTING to buzz
-    but haven't hit trending lists yet. This is the leading signal.
-    Returns list of {symbol, reason} dicts.
-    """
+    """Ask Grok for memecoins starting to buzz on X/Twitter."""
     if not config.GROK_API_KEY:
         return []
 
@@ -226,7 +205,6 @@ def get_grok_early_picks(available_coins: list) -> list:
         ))
         symbol_list = ", ".join(available_symbols)
 
-        from datetime import datetime, timezone
         now = datetime.now(timezone.utc)
         time_str = now.strftime("%B %d, %Y %H:%M UTC")
 
@@ -234,36 +212,27 @@ def get_grok_early_picks(available_coins: list) -> list:
             "Authorization": f"Bearer {config.GROK_API_KEY}",
             "Content-Type": "application/json",
         }
-
         payload = {
             "model": config.GROK_MODEL,
             "messages": [
                 {
                     "role": "system",
                     "content": (
-                        "You find memecoins that are STARTING to get buzz on crypto Twitter "
-                        "but haven't blown up yet. You look for early signals — first mentions, "
-                        "small influencers picking them up, unusual chatter beginning.\n\n"
-                        "RULES:\n"
-                        "- ONLY pick from the provided Coinbase coin list.\n"
-                        "- Focus on the LAST FEW HOURS only. Not yesterday.\n"
-                        "- DO NOT make up tweets or events. If unsure, skip it.\n"
-                        "- NO blue chips (BTC, ETH, SOL, XRP, etc).\n"
-                        "- Pick 3-5 memecoins showing EARLY signs of buzz.\n"
-                        "- For each, explain what early signal you're seeing.\n\n"
-                        "Respond with ONLY JSON, no markdown:\n"
-                        '{"picks": [{"symbol": "PEPE", "reason": "what early signal you found"}]}'
+                        "You find memecoins STARTING to buzz on crypto Twitter. "
+                        "Early signals only — first mentions, unusual chatter beginning.\n"
+                        "ONLY pick from the provided Coinbase list. LAST FEW HOURS ONLY.\n"
+                        "NO blue chips. DO NOT make up tweets.\n"
+                        "Respond with ONLY JSON:\n"
+                        '{"picks": [{"symbol": "PEPE", "reason": "early signal found"}]}'
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
-                        f"Right now it's {time_str}.\n\n"
-                        f"Search crypto Twitter for memecoins that are STARTING to get "
-                        f"attention in the last few hours. Not coins already pumping hard — "
-                        f"coins where the buzz is just beginning.\n\n"
-                        f"ONLY pick from this Coinbase list:\n{symbol_list}\n\n"
-                        f"Find 3-5 early momentum plays. Go."
+                        f"It's {time_str}. Find 3-5 memecoins starting to get attention "
+                        f"on X in the last few hours.\n"
+                        f"ONLY from this Coinbase list:\n{symbol_list}\n"
+                        f"Focus on early momentum, not already-pumped coins."
                     ),
                 },
             ],
@@ -290,12 +259,7 @@ def get_grok_early_picks(available_coins: list) -> list:
         for p in picks:
             sym = p.get("symbol", "").upper().strip()
             if sym in available_set and sym not in config.BLOCKED_COINS:
-                valid.append({
-                    "symbol": sym,
-                    "reason": p.get("reason", "early X buzz"),
-                })
-            else:
-                log(f"[SCANNER] Grok pick {sym} not on Coinbase — skipped")
+                valid.append({"symbol": sym, "reason": p.get("reason", "early X buzz")})
 
         log(f"[SCANNER] Grok found {len(valid)} early buzz picks")
         return valid
@@ -307,59 +271,53 @@ def get_grok_early_picks(available_coins: list) -> list:
 
 def discover_candidates(available_coins: list) -> list:
     """
-    Merge all data sources, deduplicate, return top candidates.
-    
-    Source 1: CoinGecko trending (lagging but reliable)
-    Source 2: CoinGecko movers — volume + price action (lagging but reliable)
-    Source 3: Grok X/Twitter early buzz (leading but less reliable)
-    
-    Coins found by multiple sources naturally score higher.
+    Merge all sources, enrich with DEXScreener data, return scored candidates.
+
+    Source 1: DEXScreener boosted tokens (hype signal)
+    Source 2: Grok X/Twitter early buzz (leading indicator)
+
+    Then for each candidate, pull real volume/price/buys data from DEXScreener.
     """
     candidates = {}
+    available_set = set(c.replace("-USD", "").upper() for c in available_coins)
 
-    # Source 1: CoinGecko trending
-    for coin in get_trending_coingecko():
-        sym = coin["symbol"]
-        if sym not in config.BLOCKED_COINS:
+    # Source 1: DEXScreener boosted tokens
+    for token in get_boosted_tokens():
+        sym = token["symbol"]
+        if sym in available_set and sym not in config.BLOCKED_COINS:
             candidates[sym] = candidates.get(sym, {"symbol": sym, "sources": []})
-            candidates[sym]["sources"].append("trending")
-            candidates[sym]["name"] = coin.get("name", sym)
+            candidates[sym]["sources"].append("dex_boosted")
 
-    # Brief pause to avoid CoinGecko rate limit
-    import time as _time
-    _time.sleep(5)
-
-    # Source 2: CoinGecko movers (volume + price action)
-    for coin in get_coinbase_movers(available_coins):
-        sym = coin["symbol"]
-        candidates[sym] = candidates.get(sym, {"symbol": sym, "sources": []})
-        candidates[sym]["sources"].append("mover")
-        candidates[sym].update({
-            "name": coin.get("name", sym),
-            "price": coin.get("price", 0),
-            "pct_1h": coin.get("pct_1h", 0),
-            "pct_24h": coin.get("pct_24h", 0),
-            "volume_24h": coin.get("volume_24h", 0),
-            "market_cap": coin.get("market_cap", 0),
-        })
-
-    # Source 3: Grok X/Twitter early buzz (leading indicator)
+    # Source 2: Grok X/Twitter early buzz
     for pick in get_grok_early_picks(available_coins):
         sym = pick["symbol"]
         candidates[sym] = candidates.get(sym, {"symbol": sym, "sources": []})
         candidates[sym]["sources"].append("x_early_buzz")
-        if "grok_reason" not in candidates[sym]:
-            candidates[sym]["grok_reason"] = pick.get("reason", "")
+        candidates[sym]["grok_reason"] = pick.get("reason", "")
 
-    # Filter to Coinbase-only
-    available_set = set(c.replace("-USD", "").upper() for c in available_coins)
-    filtered = {k: v for k, v in candidates.items() if k in available_set}
-
-    # Log multi-source coins (strongest signals)
-    for sym, c in filtered.items():
+    # Log multi-source coins
+    for sym, c in candidates.items():
         if len(c.get("sources", [])) >= 2:
             log(f"[SCANNER] 🔥 {sym} found in {len(c['sources'])} sources: {c['sources']}")
 
-    result = list(filtered.values())
-    log(f"[SCANNER] {len(result)} total candidates ({sum(1 for c in result if len(c.get('sources',[])) >= 2)} multi-source)")
-    return result
+    # Enrich each candidate with DEXScreener pair data (volume, price, buys/sells)
+    import time as _time
+    enriched = []
+    for sym, c in candidates.items():
+        dex_data = get_token_data_dexscreener(sym)
+        _time.sleep(0.3)  # Gentle rate limiting
+
+        if dex_data:
+            c.update(dex_data)
+            log(f"[SCANNER] {sym}: price=${dex_data.get('price', 0):.6f} "
+                f"1h={dex_data.get('pct_1h', 0):+.1f}% "
+                f"vol_1h=${dex_data.get('volume_1h', 0):,.0f} "
+                f"buys={dex_data.get('buys_1h', 0)} sells={dex_data.get('sells_1h', 0)}")
+        else:
+            log(f"[SCANNER] {sym}: no DEXScreener data found")
+
+        enriched.append(c)
+
+    log(f"[SCANNER] {len(enriched)} total candidates "
+        f"({sum(1 for c in enriched if len(c.get('sources', [])) >= 2)} multi-source)")
+    return enriched
