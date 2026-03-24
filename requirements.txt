@@ -1,3 +1,0 @@
-coinbase-advanced-py
-requests
-psycopg2-binary
