@@ -12,7 +12,7 @@ GROK_MODEL   = "grok-3-mini-fast"
 DATABASE_URL = os.environ["DATABASE_URL"]
 
 # ── Position sizing ──────────────────────────────────────────────────────────
-POSITION_SIZE = 20.00         # Flat $20 per trade, every time
+POSITION_SIZE = 45.00         # Flat $20 per trade, every time
 
 # ── Positions ────────────────────────────────────────────────────────────────
 MAX_POSITIONS = 2             # Hold max 2 tokens at a time
