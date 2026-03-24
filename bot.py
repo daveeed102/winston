@@ -11,7 +11,7 @@ Loop every 3 minutes:
   2. If room for new positions, scan for opportunities
      - Pull trending data from CoinGecko + X
      - Score each candidate (0-100)
-     - Buy if score >= 60 and we have room
+     - Always buys the top 2 scored candidates — never sits in cash
   3. Keep winners, cut losers, replace weak positions with stronger ones
 """
 
@@ -352,7 +352,7 @@ def run():
     holding_str = ", ".join(p.replace("-USD", "") for p in _positions) or "none"
     notify_startup(
         f"🎰 Winston v12 — Smart Degen Mode\n"
-        f"Max 2 positions | Score ≥60 to buy | Smart exits\n"
+        f"Max 2 positions | Always picks top 2 | Smart exits\n"
         f"Trailing stop: {config.TRAILING_STOP_PCT*100:.0f}% | "
         f"Early stop: {config.EARLY_STOP_PCT*100:.0f}%\n"
         f"💰 ${usd:.2f} USD | Holding: {holding_str}"

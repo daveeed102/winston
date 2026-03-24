@@ -149,20 +149,24 @@ def get_x_mention_velocity(symbol: str) -> dict:
                 {
                     "role": "system",
                     "content": (
-                        "You analyze crypto Twitter mentions. Respond with ONLY JSON, "
-                        "no markdown, no backticks:\n"
-                        '{"mention_count": <estimated posts in last 2 hours>, '
+                        "You count recent crypto Twitter mentions. Search X for the coin's "
+                        "ticker symbol (with $) and count ONLY posts from the last 2 hours.\n"
+                        "Respond with ONLY JSON, no markdown:\n"
+                        '{"mention_count": <posts found in last 2 hours>, '
                         '"sentiment": <-1.0 to 1.0>, '
-                        '"has_influencer": <true/false>, '
-                        '"buzz_summary": "<one sentence>"}'
+                        '"has_influencer": <true if any account with 50k+ followers posted>, '
+                        '"buzz_summary": "<what people are specifically saying in recent posts>"}'
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
                         f"Right now it's {time_str}. "
-                        f"How much buzz is ${symbol} getting on crypto Twitter in the LAST 2 HOURS? "
-                        f"Estimate posts, sentiment, influencer activity. Last 2 hours ONLY."
+                        f"Search X for '${symbol}' and filter to RECENT posts only. "
+                        f"How many posts mentioning ${symbol} can you find from the last 2 hours? "
+                        f"What are people saying in those recent posts? "
+                        f"Did any big accounts (50k+ followers) post about it? "
+                        f"ONLY count posts from the last 2 hours — ignore anything older."
                     ),
                 },
             ],
@@ -194,7 +198,8 @@ def get_x_mention_velocity(symbol: str) -> dict:
 
 
 def get_grok_early_picks(available_coins: list) -> list:
-    """Ask Grok for memecoins starting to buzz on X/Twitter."""
+    """Ask Grok to search X/Twitter for the most-mentioned memecoins RIGHT NOW.
+    Not 'what's trending' but literally what coins have the most posts in the last 2-3 hours."""
     if not config.GROK_API_KEY:
         return []
 
@@ -218,33 +223,54 @@ def get_grok_early_picks(available_coins: list) -> list:
                 {
                     "role": "system",
                     "content": (
-                        "You find memecoins STARTING to buzz on crypto Twitter. "
-                        "Early signals only — first mentions, unusual chatter beginning.\n"
-                        "ONLY pick from the provided Coinbase list. LAST FEW HOURS ONLY.\n"
-                        "NO blue chips. DO NOT make up tweets.\n"
+                        "You are a crypto Twitter analyst. Your job is to find which MEMECOINS "
+                        "have the HIGHEST VOLUME of mentions on X/Twitter RIGHT NOW.\n\n"
+                        "HOW TO DO THIS:\n"
+                        "1. Search X for 'meme coin' and look at RECENT posts (last 2-3 hours)\n"
+                        "2. Search X for 'memecoin pump' and look at RECENT posts\n"
+                        "3. Search X for '$PEPE $BONK $DOGE $SHIB $WIF' etc and see which "
+                        "have the most activity in the LAST 2-3 HOURS\n"
+                        "4. Look for coins being mentioned repeatedly in DIFFERENT posts by "
+                        "DIFFERENT accounts — that's real organic buzz, not one person shilling\n"
+                        "5. Count which coin symbols appear most frequently\n\n"
+                        "RULES:\n"
+                        "- ONLY count posts from the LAST 2-3 HOURS. Not yesterday.\n"
+                        "- ONLY pick from the provided Coinbase coin list.\n"
+                        "- NO blue chips (BTC, ETH, SOL, XRP, etc).\n"
+                        "- Rank by MENTION COUNT — the coin with the most recent posts wins.\n"
+                        "- DO NOT make up tweet counts. If you can't verify, estimate conservatively.\n"
+                        "- For each pick, say approximately how many posts you found.\n\n"
                         "Respond with ONLY JSON:\n"
-                        '{"picks": [{"symbol": "PEPE", "reason": "early signal found"}]}'
+                        '{"picks": [{"symbol": "PEPE", "mention_count": 150, '
+                        '"reason": "what the posts are saying"}]}'
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
-                        f"It's {time_str}. Find 3-5 memecoins starting to get attention "
-                        f"on X in the last few hours.\n"
-                        f"ONLY from this Coinbase list:\n{symbol_list}\n"
-                        f"Focus on early momentum, not already-pumped coins."
+                        f"Right now it's {time_str}.\n\n"
+                        f"Search X/Twitter for the memecoins with the MOST posts in the "
+                        f"last 2-3 hours. I want to know which memecoins people are actively "
+                        f"talking about RIGHT NOW — the ones showing up when you search "
+                        f"'meme coin' or 'memecoin' and filter to Recent.\n\n"
+                        f"ONLY pick from this Coinbase list:\n{symbol_list}\n\n"
+                        f"Give me the top 5 most-mentioned memecoins from the last 2-3 hours, "
+                        f"ranked by how many posts/tweets you can find. Include approximate "
+                        f"mention counts and what people are saying about each one.\n\n"
+                        f"Be specific — I want to know what the actual tweets are about, "
+                        f"not generic descriptions."
                     ),
                 },
             ],
-            "temperature": 0.5,
+            "temperature": 0.4,
         }
 
-        log("[SCANNER] Asking Grok for early X/Twitter buzz picks...")
+        log("[SCANNER] Asking Grok: which memecoins have the most X posts in last 2-3 hours...")
         resp = requests.post(
             "https://api.x.ai/v1/chat/completions",
             headers=headers,
             json=payload,
-            timeout=20,
+            timeout=25,
         )
         data = resp.json()
         text = data["choices"][0]["message"]["content"].strip()
@@ -259,9 +285,19 @@ def get_grok_early_picks(available_coins: list) -> list:
         for p in picks:
             sym = p.get("symbol", "").upper().strip()
             if sym in available_set and sym not in config.BLOCKED_COINS:
-                valid.append({"symbol": sym, "reason": p.get("reason", "early X buzz")})
+                mentions = p.get("mention_count", 0)
+                reason = p.get("reason", "active on CT")
+                valid.append({
+                    "symbol": sym,
+                    "reason": f"~{mentions} posts in last 2-3h: {reason}",
+                    "mention_count": mentions,
+                })
+                log(f"[SCANNER] Grok: {sym} — ~{mentions} mentions — {reason}")
 
-        log(f"[SCANNER] Grok found {len(valid)} early buzz picks")
+        # Sort by mention count descending
+        valid.sort(key=lambda x: x.get("mention_count", 0), reverse=True)
+
+        log(f"[SCANNER] Grok found {len(valid)} actively-discussed memecoins")
         return valid
 
     except Exception as e:
@@ -288,19 +324,20 @@ def discover_candidates(available_coins: list) -> list:
             candidates[sym] = candidates.get(sym, {"symbol": sym, "sources": []})
             candidates[sym]["sources"].append("dex_boosted")
 
-    # Source 2: Grok X/Twitter early buzz
+    # Source 2: Grok X/Twitter — most-mentioned memecoins in last 2-3 hours
     for pick in get_grok_early_picks(available_coins):
         sym = pick["symbol"]
         candidates[sym] = candidates.get(sym, {"symbol": sym, "sources": []})
         candidates[sym]["sources"].append("x_early_buzz")
         candidates[sym]["grok_reason"] = pick.get("reason", "")
+        candidates[sym]["grok_mention_count"] = pick.get("mention_count", 0)
 
     # Log multi-source coins
     for sym, c in candidates.items():
         if len(c.get("sources", [])) >= 2:
             log(f"[SCANNER] 🔥 {sym} found in {len(c['sources'])} sources: {c['sources']}")
 
-    # Enrich each candidate with COINBASE data (since that's where we trade)
+    # Enrich each candidate with COINBASE multi-timeframe data
     import broker as _broker
     import time as _time
     enriched = []
@@ -316,40 +353,68 @@ def discover_candidates(available_coins: list) -> list:
             c["volume_24h"] = cb_data.get("volume_24h", 0)
             c["pct_24h"] = cb_data.get("price_change_24h", 0)
 
-            # Get 1-hour candles to calculate 1h price change and chart shape
-            candles = _broker.get_candles(product_id, "ONE_HOUR", 12)
+            # ── 5-MINUTE candles (last 12 = 1 hour of granular data) ─────
+            candles_5m = _broker.get_candles(product_id, "FIVE_MINUTE", 12)
             _time.sleep(0.2)
 
-            if len(candles) >= 2:
-                current_close = candles[-1]["close"]
-                one_hour_ago = candles[-2]["close"]
+            if len(candles_5m) >= 3:
+                # 15-min momentum (last 3 five-min candles)
+                recent_close = candles_5m[-1]["close"]
+                fifteen_min_ago = candles_5m[-3]["close"]
+                if fifteen_min_ago > 0:
+                    c["pct_15m"] = ((recent_close - fifteen_min_ago) / fifteen_min_ago) * 100
+
+                # Volume in last 5 min vs average 5-min volume
+                vol_last = candles_5m[-1].get("volume", 0)
+                vol_avg = sum(c_.get("volume", 0) for c_ in candles_5m) / len(candles_5m)
+                if vol_avg > 0:
+                    c["volume_spike_5m"] = vol_last / vol_avg  # >2 = spiking
+
+            # ── 1-HOUR candles (last 12 = 12 hours) ─────────────────────
+            candles_1h = _broker.get_candles(product_id, "ONE_HOUR", 12)
+            _time.sleep(0.2)
+
+            if len(candles_1h) >= 2:
+                current_close = candles_1h[-1]["close"]
+                one_hour_ago = candles_1h[-2]["close"]
                 if one_hour_ago > 0:
                     c["pct_1h"] = ((current_close - one_hour_ago) / one_hour_ago) * 100
-                else:
-                    c["pct_1h"] = 0
 
-                # Calculate volume_1h from the last candle
-                c["volume_1h"] = candles[-1].get("volume", 0) * current_close
+                c["volume_1h"] = candles_1h[-1].get("volume", 0) * current_close
 
-                # Simple chart shape analysis: are last 3 candles trending up?
-                if len(candles) >= 4:
-                    last_4 = [c_["close"] for c_ in candles[-4:]]
+                # 2h change
+                if len(candles_1h) >= 3:
+                    two_h_ago = candles_1h[-3]["close"]
+                    if two_h_ago > 0:
+                        c["pct_2h"] = ((current_close - two_h_ago) / two_h_ago) * 100
+
+                # Chart shape: are last 4 hourly candles trending up?
+                if len(candles_1h) >= 4:
+                    last_4 = [c_["close"] for c_ in candles_1h[-4:]]
                     ups = sum(1 for i in range(1, len(last_4)) if last_4[i] > last_4[i-1])
                     c["chart_trending_up"] = ups >= 2
 
-                    # 6h change for longer-term trend
-                    if len(candles) >= 7:
-                        six_h_ago = candles[-7]["close"]
-                        if six_h_ago > 0:
-                            c["pct_6h"] = ((current_close - six_h_ago) / six_h_ago) * 100
+                # 6h change
+                if len(candles_1h) >= 7:
+                    six_h_ago = candles_1h[-7]["close"]
+                    if six_h_ago > 0:
+                        c["pct_6h"] = ((current_close - six_h_ago) / six_h_ago) * 100
 
-            # Estimate market cap from volume (rough — Coinbase doesn't give mcap directly)
-            # Use volume/price as proxy for activity level
-            c["market_cap"] = c.get("volume_24h", 0) * 5  # rough proxy
+                # 12h change (full candle range)
+                if len(candles_1h) >= 12:
+                    twelve_h_ago = candles_1h[0]["close"]
+                    if twelve_h_ago > 0:
+                        c["pct_12h"] = ((current_close - twelve_h_ago) / twelve_h_ago) * 100
+
+            # Estimate market cap from volume
+            c["market_cap"] = c.get("volume_24h", 0) * 5
 
             log(f"[SCANNER] {sym}: ${c['price']:.6f} "
-                f"1h={c.get('pct_1h', 0):+.1f}% 24h={c.get('pct_24h', 0):+.1f}% "
-                f"vol_24h=${c.get('volume_24h', 0):,.0f} "
+                f"15m={c.get('pct_15m', 0):+.1f}% "
+                f"1h={c.get('pct_1h', 0):+.1f}% "
+                f"6h={c.get('pct_6h', 0):+.1f}% "
+                f"24h={c.get('pct_24h', 0):+.1f}% "
+                f"vol_spike={c.get('volume_spike_5m', 0):.1f}x "
                 f"chart_up={c.get('chart_trending_up', '?')}")
         else:
             log(f"[SCANNER] {sym}: couldn't get Coinbase data")

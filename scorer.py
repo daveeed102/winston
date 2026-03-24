@@ -52,26 +52,53 @@ def _score_volume(volume_24h: float, market_cap: float, volume_1h: float = 0) ->
     return score
 
 
-def _score_price_momentum(pct_1h: float, pct_24h: float) -> int:
-    """Score based on recent price action."""
-    # 1h is more important than 24h for short-term trades
+def _score_price_momentum(candidate: dict) -> int:
+    """Score based on multi-timeframe price action from Coinbase candles.
+    Uses 15m, 1h, 2h, 6h, 24h to build a complete picture."""
+
+    pct_15m = candidate.get("pct_15m", 0)
+    pct_1h = candidate.get("pct_1h", 0)
+    pct_2h = candidate.get("pct_2h", 0)
+    pct_6h = candidate.get("pct_6h", 0)
+    pct_24h = candidate.get("pct_24h", 0)
+    vol_spike = candidate.get("volume_spike_5m", 0)
+
     score = 30  # neutral baseline
 
-    # 1h momentum (dominant factor)
-    if pct_1h >= 20:
-        score = 100
-    elif pct_1h >= 10:
-        score = 85
-    elif pct_1h >= 5:
-        score = 70
-    elif pct_1h >= 2:
-        score = 55
-    elif pct_1h >= 0:
-        score = 40
-    elif pct_1h >= -3:
-        score = 25
+    # Short-term momentum (15m + 1h) — most important
+    short_term = (pct_15m * 2 + pct_1h) / 3  # Weight 15m more
+    if short_term >= 10:
+        score = 95
+    elif short_term >= 5:
+        score = 80
+    elif short_term >= 2:
+        score = 65
+    elif short_term >= 0.5:
+        score = 50
+    elif short_term >= 0:
+        score = 35
+    elif short_term >= -2:
+        score = 20
     else:
         score = 10
+
+    # Medium-term confirmation (2h, 6h)
+    if pct_2h > 0 and pct_1h > 0:
+        score = min(100, score + 5)  # 2h confirms 1h direction
+    if pct_6h > 5 and pct_1h > 0:
+        score = min(100, score + 10)  # Strong 6h uptrend + recent continuation
+
+    # 24h context — bonus if recovering from dip (bounce play)
+    if pct_24h < -5 and pct_1h > 2:
+        score = min(100, score + 10)  # Bounce from 24h dip
+
+    # Volume spike bonus
+    if vol_spike >= 3:
+        score = min(100, score + 10)  # 3x normal 5-min volume
+    elif vol_spike >= 2:
+        score = min(100, score + 5)
+
+    return score
 
     # Bonus if 24h trend confirms 1h direction
     if pct_24h > 0 and pct_1h > 0:
@@ -202,15 +229,19 @@ def score_token(candidate: dict, skip_x: bool = False) -> dict:
         candidate.get("volume_1h", 0),
     )
 
-    price_score = _score_price_momentum(
-        candidate.get("pct_1h", 0),
-        candidate.get("pct_24h", 0),
-    )
+    price_score = _score_price_momentum(candidate)
 
     # X mentions — skip if we're just rescoring (expensive API call)
+    # X mentions — use Grok discovery data if we already have it, otherwise fetch
     if skip_x:
         x_score = candidate.get("_cached_x_score", 30)
         x_data = {}
+    elif candidate.get("grok_mention_count", 0) > 0:
+        # Already have mention data from Grok discovery — no need for second call
+        grok_mentions = candidate["grok_mention_count"]
+        x_data = {"mentions": grok_mentions, "sentiment": 0.5, "has_influencer": grok_mentions > 50}
+        x_score = _score_x_mentions(x_data)
+        log(f"[SCORER] {symbol}: using Grok discovery data (~{grok_mentions} mentions)")
     else:
         x_data = scanner.get_x_mention_velocity(symbol)
         x_score = _score_x_mentions(x_data)
