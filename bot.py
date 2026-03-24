@@ -1,63 +1,48 @@
 """
-Solana Listing Sniper Bot v3 — CHAIN MONITOR
-Watches Solana blockchain in real-time for new token launches:
-  - Raydium AMM new pool creation
-  - Pump.fun token graduation (bonding → Raydium)
-Buys via Jupiter DEX, manages trailing stop exits.
-Built for David @ BumprAZ — degen mode.
+DEGEN SNIPER BOT v4 — Ground-up rebuild
+Monitors Solana for new Raydium pools + Pump.fun graduations.
+Extracts REAL token mints from parsed transactions (not log scraping).
+Buys via Jupiter Swap V2 (api.jup.ag). Sells on trailing stop or timeout.
+Discord alerts: buy + sell only. Everything else is console-only.
 """
 
 import asyncio
 import json
-import re
 import time
 import logging
 import os
-import struct
 import base64 as b64
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Optional
 
 import aiohttp
-from aiohttp import WSMsgType
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
-TRADE_AMOUNT_SOL = float(os.getenv("TRADE_AMOUNT_SOL", "0.015"))  # ~$2
-TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "20"))
-DEGEN_MODE = os.getenv("DEGEN_MODE", "false").lower() == "true"
+TRADE_AMOUNT_SOL = float(os.getenv("TRADE_AMOUNT_SOL", "0.015"))
+TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "30"))  # degen default
 MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "2"))
-SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "500"))  # 5% for brand new tokens
+SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "500"))
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
-SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
-SOLANA_WS_URL = os.getenv("SOLANA_WS_URL", "")  # auto-derived from RPC if blank
+SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "")
 WALLET_PRIVATE_KEY = os.getenv("WALLET_PRIVATE_KEY", "")
 JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "")
+BUY_DELAY_SECONDS = float(os.getenv("BUY_DELAY_SECONDS", "2"))
+MAX_TOP_HOLDER_PCT = float(os.getenv("MAX_TOP_HOLDER_PCT", "50"))
 
-# Safety filters
-MIN_LIQUIDITY_SOL = float(os.getenv("MIN_LIQUIDITY_SOL", "5"))     # min SOL in pool
-MAX_TOP_HOLDER_PCT = float(os.getenv("MAX_TOP_HOLDER_PCT", "50"))  # skip if top wallet >50%
-REQUIRE_MINT_REVOKED = os.getenv("REQUIRE_MINT_REVOKED", "false").lower() == "true"
-BUY_DELAY_SECONDS = float(os.getenv("BUY_DELAY_SECONDS", "3"))    # wait before buying
+# Solana programs
+RAYDIUM_AMM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+PUMPFUN = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+WSOL = "So11111111111111111111111111111111111111112"
+USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+USDT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+SKIP_MINTS = {WSOL, USDC, USDT}
 
-# Program IDs
-RAYDIUM_AMM_PROGRAM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
-RAYDIUM_CPMM_PROGRAM = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"
-PUMPFUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
-
-# Well-known mints to ignore
-WSOL_MINT = "So11111111111111111111111111111111111111112"
-USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
-KNOWN_MINTS = {WSOL_MINT, USDC_MINT, USDT_MINT}
-
-# Jupiter Swap API V2 (api.jup.ag — works on Railway)
-JUPITER_PRICE_URL = "https://api.jup.ag/price/v2"
-JUPITER_ORDER_URL = "https://api.jup.ag/swap/v2/order"
-JUPITER_EXECUTE_URL = "https://api.jup.ag/swap/v2/execute"
+# Jupiter V2
+JUP_ORDER = "https://api.jup.ag/swap/v2/order"
+JUP_EXECUTE = "https://api.jup.ag/swap/v2/execute"
+JUP_PRICE = "https://api.jup.ag/price/v2"
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 
@@ -68,856 +53,549 @@ logging.basicConfig(
 )
 log = logging.getLogger("sniper")
 
-
-# ─── DATA MODELS ─────────────────────────────────────────────────────────────
+# ─── MODELS ──────────────────────────────────────────────────────────────────
 
 @dataclass
-class NewToken:
+class Token:
     mint: str
     symbol: str = "???"
     name: str = "Unknown"
-    source: str = ""         # "raydium" or "pumpfun"
-    pool_address: str = ""
-    paired_with: str = ""    # usually WSOL
-    initial_liq_sol: float = 0.0
-    mint_authority_revoked: bool = False
-    top_holder_pct: float = 0.0
+    source: str = ""
     discovered_at: float = 0.0
-    safe: bool = True
-    reject_reason: str = ""
-
     def __post_init__(self):
         if not self.discovered_at:
             self.discovered_at = time.time()
 
-
 @dataclass
 class Position:
-    token: NewToken
+    token: Token
     entry_price: float = 0.0
-    amount_tokens: float = 0.0
+    tokens_held: float = 0.0
     cost_sol: float = 0.0
-    highest_price: float = 0.0
-    trailing_stop_price: float = 0.0
-    status: str = "pending"
+    high_price: float = 0.0
+    stop_price: float = 0.0
+    status: str = "open"
     pnl_usd: float = 0.0
     exit_price: float = 0.0
     exit_reason: str = ""
-    opened_at: str = ""
-    closed_at: str = ""
-    opened_at_ts: float = 0.0
-    buy_gas_sol: float = 0.0
-    sell_gas_sol: float = 0.0
-
+    buy_gas: float = 0.0
+    sell_gas: float = 0.0
+    opened_ts: float = 0.0
     def __post_init__(self):
-        if not self.opened_at:
-            self.opened_at = datetime.now(timezone.utc).isoformat()
-        if not self.opened_at_ts:
-            self.opened_at_ts = time.time()
-
+        if not self.opened_ts:
+            self.opened_ts = time.time()
     @property
-    def hold_seconds(self) -> float:
-        return time.time() - self.opened_at_ts
-
+    def hold_secs(self) -> float:
+        return time.time() - self.opened_ts
     @property
-    def hold_expired(self) -> bool:
-        return self.hold_seconds >= (MAX_HOLD_HOURS * 3600)
+    def expired(self) -> bool:
+        return self.hold_secs >= MAX_HOLD_HOURS * 3600
 
+# ─── JUPITER (api.jup.ag — works on Railway) ────────────────────────────────
 
-# ─── DISCORD ALERTS ─────────────────────────────────────────────────────────
+class Jupiter:
+    """Jupiter Swap V2 API with Railway-safe DNS resolver."""
 
-class DiscordAlert:
-    def __init__(self, webhook_url: str):
-        self.url = webhook_url
-
-    async def send(self, embed: dict):
-        if not self.url:
-            return
-        try:
-            async with aiohttp.ClientSession() as s:
-                await s.post(self.url, json={"embeds": [embed]},
-                             headers={"Content-Type": "application/json"})
-        except Exception as e:
-            log.error(f"Discord: {e}")
-
-    async def bought(self, pos: Position):
-        await self.send({
-            "title": f"💰 BOUGHT — {pos.token.symbol}",
-            "color": 0x00FF88,
-            "fields": [
-                {"name": "Token", "value": pos.token.name, "inline": True},
-                {"name": "Price", "value": f"${pos.entry_price:.8f}", "inline": True},
-                {"name": "Spent", "value": f"{pos.cost_sol:.4f} SOL", "inline": True},
-                {"name": "Gas", "value": f"{pos.buy_gas_sol:.6f} SOL", "inline": True},
-                {"name": "Solscan", "value": f"[View](https://solscan.io/token/{pos.token.mint})", "inline": False},
-            ],
-        })
-
-    async def sold(self, pos: Position):
-        color = 0x00FF88 if pos.pnl_usd >= 0 else 0xFF4444
-        emoji = "🟢" if pos.pnl_usd >= 0 else "🔴"
-        total_gas = pos.buy_gas_sol + pos.sell_gas_sol
-        await self.send({
-            "title": f"{emoji} SOLD — {pos.token.symbol}",
-            "color": color,
-            "fields": [
-                {"name": "Token", "value": pos.token.name, "inline": True},
-                {"name": "P&L", "value": f"${pos.pnl_usd:+.4f}", "inline": True},
-                {"name": "Buy", "value": f"${pos.entry_price:.8f}", "inline": True},
-                {"name": "Sell", "value": f"${pos.exit_price:.8f}", "inline": True},
-                {"name": "Gas (total)", "value": f"{total_gas:.6f} SOL", "inline": True},
-            ],
-        })
-
-
-# ─── SOLANA RPC HELPERS ──────────────────────────────────────────────────────
-
-class SolanaRPC:
-    """HTTP + WebSocket RPC interactions."""
-
-    def __init__(self, rpc_url: str, ws_url: str):
-        self.rpc_url = rpc_url
-        self.ws_url = ws_url
-
-    async def call(self, method: str, params: list, session: aiohttp.ClientSession):
-        payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-        async with session.post(self.rpc_url, json=payload,
-                                timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            return await resp.json()
-
-    async def get_account_info(self, pubkey: str, session: aiohttp.ClientSession) -> Optional[dict]:
-        result = await self.call("getAccountInfo", [pubkey, {"encoding": "jsonParsed"}], session)
-        return result.get("result", {}).get("value")
-
-    async def get_token_supply(self, mint: str, session: aiohttp.ClientSession) -> Optional[dict]:
-        result = await self.call("getTokenSupply", [mint], session)
-        return result.get("result", {}).get("value")
-
-    async def get_token_largest_accounts(self, mint: str, session: aiohttp.ClientSession) -> list:
-        result = await self.call("getTokenLargestAccounts", [mint], session)
-        return result.get("result", {}).get("value", [])
-
-    async def get_balance(self, pubkey: str, session: aiohttp.ClientSession) -> float:
-        result = await self.call("getBalance", [pubkey], session)
-        return result.get("result", {}).get("value", 0) / 1e9
-
-
-# ─── SAFETY CHECKER ─────────────────────────────────────────────────────────
-
-class SafetyChecker:
-    """
-    Runs safety checks on newly detected tokens before buying.
-    Checks: liquidity, mint authority, top holder concentration.
-    """
-
-    def __init__(self, rpc: SolanaRPC):
-        self.rpc = rpc
-
-    async def check(self, token: NewToken, session: aiohttp.ClientSession) -> NewToken:
-        """Run all safety checks. Sets token.safe and token.reject_reason."""
-        try:
-            # Check 1: Minimum liquidity
-            if token.initial_liq_sol < MIN_LIQUIDITY_SOL:
-                token.safe = False
-                token.reject_reason = f"Low liquidity ({token.initial_liq_sol:.1f} < {MIN_LIQUIDITY_SOL} SOL)"
-                return token
-
-            # Check 2: Mint authority (can they print more tokens?)
-            account_info = await self.rpc.get_account_info(token.mint, session)
-            if account_info:
-                parsed = account_info.get("data", {}).get("parsed", {}).get("info", {})
-                mint_auth = parsed.get("mintAuthority")
-                freeze_auth = parsed.get("freezeAuthority")
-
-                token.mint_authority_revoked = mint_auth is None
-                if REQUIRE_MINT_REVOKED and not token.mint_authority_revoked:
-                    token.safe = False
-                    token.reject_reason = "Mint authority NOT revoked (can print tokens)"
-                    return token
-
-                # Freeze authority is a bigger red flag
-                if freeze_auth is not None:
-                    token.safe = False
-                    token.reject_reason = "Freeze authority active (can freeze your tokens)"
-                    return token
-
-                # Get token metadata
-                token.symbol = parsed.get("symbol", token.symbol)
-                token.name = parsed.get("name", token.name) if parsed.get("name") else token.name
-
-            # Check 3: Top holder concentration
-            largest = await self.rpc.get_token_largest_accounts(token.mint, session)
-            supply_info = await self.rpc.get_token_supply(token.mint, session)
-            if largest and supply_info:
-                total_supply = float(supply_info.get("amount", "0"))
-                if total_supply > 0 and len(largest) > 0:
-                    top_amount = float(largest[0].get("amount", "0"))
-                    token.top_holder_pct = (top_amount / total_supply) * 100
-
-                    if token.top_holder_pct > MAX_TOP_HOLDER_PCT:
-                        token.safe = False
-                        token.reject_reason = f"Top holder owns {token.top_holder_pct:.1f}% (>{MAX_TOP_HOLDER_PCT}%)"
-                        return token
-
-            token.safe = True
-            return token
-
-        except Exception as e:
-            log.warning(f"Safety check error for {token.mint[:16]}: {e}")
-            # On error, still allow but flag it
-            token.safe = True
-            token.reject_reason = f"Check error: {e}"
-            return token
-
-
-# ─── CHAIN LISTENER ──────────────────────────────────────────────────────────
-
-class ChainListener:
-    """
-    Subscribes to Solana logs via WebSocket and detects new pool creation
-    from Raydium AMM, Raydium CPMM, and Pump.fun graduation.
-    """
-
-    def __init__(self, rpc: SolanaRPC, on_new_token):
-        self.rpc = rpc
-        self.on_new_token = on_new_token  # callback
-        self.seen_mints: set[str] = set()
-        self.tokens_seen_count = 0
-
-    async def listen(self):
-        """Main WebSocket listener loop with auto-reconnect."""
-        while True:
-            try:
-                log.info(f"Connecting to Solana WebSocket: {self.rpc.ws_url[:40]}...")
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(
-                        self.rpc.ws_url,
-                        heartbeat=30,
-                        timeout=aiohttp.ClientTimeout(total=None),
-                    ) as ws:
-                        log.info("✅ WebSocket connected — subscribing to programs...")
-
-                        # Subscribe to Raydium AMM (new pool creation)
-                        await ws.send_json({
-                            "jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
-                            "params": [
-                                {"mentions": [RAYDIUM_AMM_PROGRAM]},
-                                {"commitment": "confirmed"},
-                            ],
-                        })
-
-                        # Subscribe to Raydium CPMM
-                        await ws.send_json({
-                            "jsonrpc": "2.0", "id": 2, "method": "logsSubscribe",
-                            "params": [
-                                {"mentions": [RAYDIUM_CPMM_PROGRAM]},
-                                {"commitment": "confirmed"},
-                            ],
-                        })
-
-                        # Subscribe to Pump.fun (graduation events)
-                        await ws.send_json({
-                            "jsonrpc": "2.0", "id": 3, "method": "logsSubscribe",
-                            "params": [
-                                {"mentions": [PUMPFUN_PROGRAM]},
-                                {"commitment": "confirmed"},
-                            ],
-                        })
-
-                        log.info("📡 Listening for new token launches...")
-
-                        async for msg in ws:
-                            if msg.type == WSMsgType.TEXT:
-                                await self._handle_message(msg.data)
-                            elif msg.type in (WSMsgType.ERROR, WSMsgType.CLOSED):
-                                log.warning(f"WS closed/error: {msg.type}")
-                                break
-
-            except Exception as e:
-                log.error(f"WebSocket error: {e}")
-
-            log.info("Reconnecting in 5s...")
-            await asyncio.sleep(5)
-
-    async def _handle_message(self, raw: str):
-        """Parse a WebSocket log message and detect pool creation."""
-        try:
-            data = json.loads(raw)
-            if "params" not in data:
-                return
-
-            result = data["params"]["result"]
-            value = result.get("value", {})
-            logs = value.get("logs", [])
-            signature = value.get("signature", "")
-
-            if not logs:
-                return
-
-            log_text = " ".join(logs)
-
-            # ── RAYDIUM AMM: New pool (look for "initialize2" or "Initialize" instruction)
-            if any(kw in log_text for kw in ["initialize2", "Initialize", "init_pc_amount"]):
-                if RAYDIUM_AMM_PROGRAM in log_text or RAYDIUM_CPMM_PROGRAM in log_text:
-                    await self._process_raydium_pool(signature, logs, log_text)
-
-            # ── PUMP.FUN: Graduation (token leaves bonding curve → Raydium)
-            if PUMPFUN_PROGRAM in log_text:
-                if any(kw in log_text for kw in [
-                    "Program log: Instruction: Withdraw",
-                    "migrate",
-                    "MigrateToRaydium",
-                ]):
-                    await self._process_pumpfun_graduation(signature, logs, log_text)
-
-        except json.JSONDecodeError:
-            pass
-        except Exception as e:
-            log.debug(f"Message parse error: {e}")
-
-    async def _process_raydium_pool(self, signature: str, logs: list, log_text: str):
-        """Extract new token mint from a Raydium pool creation transaction."""
-        # Extract account keys from logs — look for mint addresses
-        mints = self._extract_mints_from_logs(logs)
-
-        for mint in mints:
-            if mint in KNOWN_MINTS or mint in self.seen_mints:
-                continue
-
-            self.seen_mints.add(mint)
-            self.tokens_seen_count += 1
-
-            token = NewToken(
-                mint=mint,
-                source="raydium",
-                paired_with=WSOL_MINT,
-            )
-            log.info(f"🆕 RAYDIUM POOL: {mint[:20]}... (tx: {signature[:20]})")
-
-            # Fire callback
-            await self.on_new_token(token, signature)
-
-    async def _process_pumpfun_graduation(self, signature: str, logs: list, log_text: str):
-        """Extract token mint from a Pump.fun graduation event."""
-        mints = self._extract_mints_from_logs(logs)
-
-        for mint in mints:
-            if mint in KNOWN_MINTS or mint in self.seen_mints:
-                continue
-
-            self.seen_mints.add(mint)
-            self.tokens_seen_count += 1
-
-            token = NewToken(
-                mint=mint,
-                source="pumpfun",
-                paired_with=WSOL_MINT,
-            )
-            log.info(f"🎓 PUMP.FUN GRAD: {mint[:20]}... (tx: {signature[:20]})")
-
-            await self.on_new_token(token, signature)
-
-    def _extract_mints_from_logs(self, logs: list) -> list[str]:
-        """
-        Extract potential token mint addresses from transaction logs.
-        We use a strict approach: only grab addresses from specific log patterns
-        that indicate token mints, not random addresses from program invocations.
-        """
-        mints = []
-        # Massive blocklist of known DeFi programs, DEX routers, and infrastructure
-        known_programs = {
-            RAYDIUM_AMM_PROGRAM, RAYDIUM_CPMM_PROGRAM, PUMPFUN_PROGRAM,
-            TOKEN_PROGRAM, TOKEN_2022_PROGRAM,
-            "11111111111111111111111111111111",
-            "SysvarRent111111111111111111111111111111111",
-            "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
-            "ComputeBudget111111111111111111111111111111",
-            # Jupiter
-            "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
-            "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB",
-            "JUP2jxvXaqu7NQY1GmNF4m1vodw12LVXYxbFL2uN9CFi",
-            "JUP3c2Uh3WA4Ng34tw6kPd2G4C5BB21Xo36Je1s32Ph",
-            "routeUGWgWzqBWFcrCfv8tritsQukrFoGT6rP8jn1C8f",
-            # Raydium misc
-            "CAMMCzo5YL8w4VFF8KVHr7Wz8o4JrHoAMhFMGEZbEMag",
-            "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
-            "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
-            "cpamdpZCGKUy5JxQXB4dcpGPiikHawvTGsMC22CedAX",
-            "proVF4pMXVaYqmy4NjniDpaM2vPRK8NWt7mNS7dtKHP",
-            # Orca / Whirlpool
-            "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
-            "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP",
-            # Meteora
-            "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
-            "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB",
-            # Phoenix
-            "PhoeNiXZ8ByJGLkxNfZRnkUfjvmuYqLR89jjFHGqdXY",
-            # Lifinity
-            "EewxydAPCCVuNEyrVN68PuSYdQ7wKn27V9Gjeoi8dy3S",
-            # Openbook / Serum
-            "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX",
-            "opnb2LAfJYbRMAHHvqjCwQxanZn7ReEHp1k81EQMQvR",
-            # Marinade
-            "MarBmsSgKXdrN1egZf5sqe1TMai9K1rChYNDJgjq7aD",
-            # Misc infra
-            "SwaPpA9LAaLfeLi3a68M4DjnLqgtticKg6CnyNwgAC8",
-            "ALPHAQmeA7bjrVuccPsYMwP6mHNuJ7avDLJnrCtcj1C",
-            "FLASHX8DrLbgeR8FcfNV6U16Hmh3C7CmxPXwBqEAEAjA",
-            "ZERor4xhbUycZ6gb9ntrWd7DE9kcJUZhKg3YXmouN1u",
-            "goonuddtQRrWqqn5nFycg6oYP8AKMFHK5mzBNVMuaSK",
-            "NinafKYvKDCH26v6uEpfZGmsCFPHKncMd7EZR2a8FMU",
-            "DF1ow4tspfHX9JwWJsAbRnFAEDwJF4th1JoBoNNDEBh",
-            "EEUNhHsRoUVgJUFpkupmCeC3AWkdFEJbnJGSJE7n5zy",
-            "AZhGu7kfjbQfcZZWfYv4giTLnFSBfHbS9mVWMa2JKJM",
-            "AmHUjHKfSFP34D4VgPsvisHi3AvSFHzAdxLSbSNVMCxI",
-            "FsWxHsafrajWKW5YZTT7MFnTL2EXSTiy8aTLXP8dA8LK",
-            "BiSoNHVpsVZW2F7rx2eQrALbHGxmJdLXhYasFYkCbXDh",
-            "DSkmPMDRYGshR48PLFwQFcxPnzMMEHQuNBqiR8CReEhS",
-            "L2TExMFKdjpN9kozasaurSKMJoJMVYUfRfkNxDiEhRfE",
-            "CASHx9KJUStyftLFWGvEHw1JByJGSrDm2BKwtZjp3M87",
-            "pfeeUxB6jkeY1Hxd7CsFkuTrSFXmTy2dDV9xKdR65AB",
-            "8LaciyeEVxaHdoL1EHavYsdGKBjxD7MePJeE7oCS5y1a",
-            "DbTYuFpdELAgyZBhX7TaiFHf26RRYJ3asnZYMJa9GQRY",
-            "sa12qbQyuQqEaDcEqEPKFRUDex4pq5SSBYwU6QqvMCC",
-            "va1t8sdGkReA6XFgAeZGgdubofVXEhiMFG3g6Z1qpum",
-            "m9obQHAPyZeZ88w7XUY81dLhbQXoqaCvN2dRhNcPRrh",
-            "25tkDMtUQRDa6UJ3x4MrBiLbExH2n9PyUomxgf7tJbcB",
-        }
-        # Also skip anything that looks like a padding/placeholder address
-        PADDING_PREFIXES = ("AAAAAAA", "FAAAAAA", "GQAAAAA")
-
-        for line in logs:
-            words = line.split()
-            for word in words:
-                clean = word.strip(",.;:()[]{}\"'")
-                if (32 <= len(clean) <= 44
-                    and all(c in "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz" for c in clean)
-                    and clean not in known_programs
-                    and clean not in KNOWN_MINTS
-                    and not any(clean.startswith(p) for p in PADDING_PREFIXES)):
-                    mints.append(clean)
-
-        # Deduplicate while preserving order
-        seen = set()
-        unique = []
-        for m in mints:
-            if m not in seen:
-                seen.add(m)
-                unique.append(m)
-        return unique
-
-
-# ─── JUPITER SWAP API V2 ─────────────────────────────────────────────────────
-
-class JupiterDEX:
-    """
-    Jupiter Ultra API — uses api.jup.ag instead of quote-api.jup.ag.
-    Ultra handles quote + swap + transaction landing in one flow.
-    """
-
-    async def _get_session(self) -> aiohttp.ClientSession:
+    async def _session(self) -> aiohttp.ClientSession:
         headers = {"Content-Type": "application/json"}
         if JUPITER_API_KEY:
             headers["x-api-key"] = JUPITER_API_KEY
         try:
-            from aiohttp import TCPConnector
             from aiohttp.resolver import AsyncResolver
             resolver = AsyncResolver(nameservers=["8.8.8.8", "1.1.1.1"])
-            connector = TCPConnector(resolver=resolver, ssl=False)
+            conn = aiohttp.TCPConnector(resolver=resolver, ssl=False)
         except Exception:
-            connector = aiohttp.TCPConnector(ssl=False)
-        return aiohttp.ClientSession(connector=connector, headers=headers)
+            conn = aiohttp.TCPConnector(ssl=False)
+        return aiohttp.ClientSession(connector=conn, headers=headers)
 
-    async def get_price(self, mint: str, session=None) -> Optional[float]:
-        s = await self._get_session()
+    async def price(self, mint: str) -> Optional[float]:
+        s = await self._session()
         try:
-            url = f"{JUPITER_PRICE_URL}?ids={mint}"
-            async with s.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    price = data.get("data", {}).get(mint, {}).get("price")
-                    return float(price) if price else None
+            async with s.get(f"{JUP_PRICE}?ids={mint}", timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    p = d.get("data", {}).get(mint, {}).get("price")
+                    return float(p) if p else None
         except Exception as e:
-            log.error(f"Price failed: {e}")
+            log.debug(f"Price err: {e}")
         finally:
             await s.close()
         return None
 
-    async def get_order(self, input_mint: str, output_mint: str,
-                        amount: int, taker: str, session=None) -> Optional[dict]:
-        """GET /swap/v2/order — returns quote + unsigned transaction."""
-        s = await self._get_session()
+    async def order(self, input_mint: str, output_mint: str, amount: int, taker: str) -> Optional[dict]:
+        """GET /swap/v2/order — returns quote + unsigned tx."""
+        s = await self._session()
         try:
-            params = {
-                "inputMint": input_mint,
-                "outputMint": output_mint,
-                "amount": str(amount),
-                "taker": taker,
-            }
-            async with s.get(
-                JUPITER_ORDER_URL, params=params,
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                body = await resp.text()
-                log.error(f"Order error {resp.status}: {body[:200]}")
+            params = {"inputMint": input_mint, "outputMint": output_mint,
+                      "amount": str(amount), "taker": taker}
+            async with s.get(JUP_ORDER, params=params, timeout=aiohttp.ClientTimeout(total=12)) as r:
+                if r.status == 200:
+                    return await r.json()
+                body = await r.text()
+                log.error(f"Jup order {r.status}: {body[:150]}")
         except Exception as e:
-            log.error(f"Order failed: {e}")
+            log.error(f"Jup order err: {e}")
         finally:
             await s.close()
         return None
 
-    async def execute_order(self, request_id: str, signed_tx: str, session=None) -> Optional[dict]:
-        """POST /swap/v2/execute — Jupiter lands the transaction."""
-        s = await self._get_session()
+    async def execute(self, request_id: str, signed_tx_b64: str) -> Optional[dict]:
+        """POST /swap/v2/execute — Jupiter lands the tx."""
+        s = await self._session()
         try:
-            payload = {
-                "signedTransaction": signed_tx,
-                "requestId": request_id,
-            }
-            async with s.post(
-                JUPITER_EXECUTE_URL, json=payload,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                body = await resp.text()
-                log.error(f"Execute error {resp.status}: {body[:200]}")
+            payload = {"signedTransaction": signed_tx_b64, "requestId": request_id}
+            async with s.post(JUP_EXECUTE, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                if r.status == 200:
+                    return await r.json()
+                body = await r.text()
+                log.error(f"Jup exec {r.status}: {body[:150]}")
         except Exception as e:
-            log.error(f"Execute failed: {e}")
+            log.error(f"Jup exec err: {e}")
         finally:
             await s.close()
         return None
 
+# ─── SOLANA RPC ──────────────────────────────────────────────────────────────
 
-# ─── SOLANA TX HANDLER ───────────────────────────────────────────────────────
-
-class SolanaHandler:
-    def __init__(self, private_key_b58: str, rpc_url: str):
-        self.rpc_url = rpc_url
+class Solana:
+    def __init__(self, rpc_url: str, privkey_b58: str):
+        self.rpc = rpc_url
+        self.ws = rpc_url.replace("https://", "wss://").replace("http://", "ws://")
         self.keypair = None
         self.pubkey = None
-
-        if private_key_b58:
+        if privkey_b58:
             try:
                 from solders.keypair import Keypair
                 import base58
-                secret = base58.b58decode(private_key_b58)
-                self.keypair = Keypair.from_bytes(secret)
+                self.keypair = Keypair.from_bytes(base58.b58decode(privkey_b58))
                 self.pubkey = str(self.keypair.pubkey())
                 log.info(f"Wallet: {self.pubkey[:8]}...{self.pubkey[-4:]}")
-            except ImportError:
-                log.error("Install: pip install solders base58")
             except Exception as e:
-                log.error(f"Wallet error: {e}")
+                log.error(f"Wallet load failed: {e}")
 
-    async def sign_and_send(self, swap_resp: dict, session: aiohttp.ClientSession) -> Optional[str]:
+    async def _call(self, method: str, params: list, session: aiohttp.ClientSession):
+        payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+        async with session.post(self.rpc, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            return await r.json()
+
+    async def balance(self, session: aiohttp.ClientSession) -> float:
+        if not self.pubkey:
+            return 0.0
+        res = await self._call("getBalance", [self.pubkey], session)
+        return res.get("result", {}).get("value", 0) / 1e9
+
+    async def get_tx(self, sig: str, session: aiohttp.ClientSession) -> Optional[dict]:
+        """Fetch full parsed transaction to extract token mints."""
+        res = await self._call("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}], session)
+        return res.get("result")
+
+    async def get_token_supply(self, mint: str, session: aiohttp.ClientSession) -> Optional[dict]:
+        res = await self._call("getTokenSupply", [mint], session)
+        return res.get("result", {}).get("value")
+
+    async def get_largest_holders(self, mint: str, session: aiohttp.ClientSession) -> list:
+        res = await self._call("getTokenLargestAccounts", [mint], session)
+        return res.get("result", {}).get("value", [])
+
+    def sign_tx(self, tx_b64: str) -> Optional[str]:
+        """Sign a base64 transaction, return base64 signed tx."""
         if not self.keypair:
             return None
         try:
             from solders.transaction import VersionedTransaction
-            import base64
-
-            raw = base64.b64decode(swap_resp.get("swapTransaction", ""))
+            raw = b64.b64decode(tx_b64)
             txn = VersionedTransaction.from_bytes(raw)
             signed = VersionedTransaction(txn.message, [self.keypair])
-
-            payload = {
-                "jsonrpc": "2.0", "id": 1,
-                "method": "sendTransaction",
-                "params": [
-                    base64.b64encode(bytes(signed)).decode(),
-                    {"encoding": "base64", "skipPreflight": True, "maxRetries": 3},
-                ],
-            }
-            async with session.post(self.rpc_url, json=payload,
-                                    timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                result = await resp.json()
-                if "result" in result:
-                    sig = result["result"]
-                    log.info(f"✅ TX: {sig[:20]}...")
-                    return sig
-                log.error(f"RPC: {result.get('error')}")
+            return b64.b64encode(bytes(signed)).decode()
         except Exception as e:
-            log.error(f"Sign/send: {e}")
-        return None
+            log.error(f"Sign err: {e}")
+            return None
 
-    async def get_balance(self, session: aiohttp.ClientSession) -> float:
-        if not self.pubkey:
-            return 0.0
+# ─── DISCORD (buy + sell only) ───────────────────────────────────────────────
+
+class Discord:
+    def __init__(self, url: str):
+        self.url = url
+
+    async def _send(self, embed: dict):
+        if not self.url:
+            return
         try:
-            payload = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [self.pubkey]}
-            async with session.post(self.rpc_url, json=payload) as resp:
-                data = await resp.json()
-                return data.get("result", {}).get("value", 0) / 1e9
+            async with aiohttp.ClientSession() as s:
+                await s.post(self.url, json={"embeds": [embed]})
         except Exception:
-            return 0.0
+            pass
 
+    async def bought(self, p: Position):
+        await self._send({
+            "title": f"💰 BOUGHT — {p.token.symbol}",
+            "color": 0x00FF88,
+            "fields": [
+                {"name": "Token", "value": f"{p.token.name} (`{p.token.mint[:16]}...`)", "inline": False},
+                {"name": "Price", "value": f"${p.entry_price:.10f}", "inline": True},
+                {"name": "Spent", "value": f"{p.cost_sol:.4f} SOL", "inline": True},
+                {"name": "Gas", "value": f"{p.buy_gas:.5f} SOL", "inline": True},
+                {"name": "Link", "value": f"[Solscan](https://solscan.io/token/{p.token.mint})", "inline": False},
+            ],
+        })
+
+    async def sold(self, p: Position):
+        emoji = "🟢" if p.pnl_usd >= 0 else "🔴"
+        total_gas = p.buy_gas + p.sell_gas
+        await self._send({
+            "title": f"{emoji} SOLD — {p.token.symbol}",
+            "color": 0x00FF88 if p.pnl_usd >= 0 else 0xFF4444,
+            "fields": [
+                {"name": "Token", "value": p.token.name, "inline": True},
+                {"name": "P&L", "value": f"${p.pnl_usd:+.4f}", "inline": True},
+                {"name": "Buy", "value": f"${p.entry_price:.10f}", "inline": True},
+                {"name": "Sell", "value": f"${p.exit_price:.10f}", "inline": True},
+                {"name": "Gas (total)", "value": f"{total_gas:.5f} SOL", "inline": True},
+                {"name": "Held", "value": f"{p.hold_secs/60:.1f}m", "inline": True},
+            ],
+        })
+
+# ─── POOL DETECTOR ───────────────────────────────────────────────────────────
+
+class PoolDetector:
+    """
+    Listens to Raydium AMM + Pump.fun via WebSocket.
+    When a new pool is created (initialize2 log), fetches the FULL transaction
+    and extracts the actual token mint from accountKeys + token balances.
+    """
+
+    def __init__(self, sol: Solana, on_new_token):
+        self.sol = sol
+        self.on_new_token = on_new_token
+        self.seen: set[str] = set()
+        self.count = 0
+
+    async def listen(self):
+        while True:
+            try:
+                log.info(f"Connecting WS: {self.sol.ws[:50]}...")
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect(self.sol.ws, heartbeat=30) as ws:
+                        log.info("✅ WebSocket connected")
+
+                        # Subscribe to Raydium AMM
+                        await ws.send_json({
+                            "jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
+                            "params": [{"mentions": [RAYDIUM_AMM]}, {"commitment": "confirmed"}],
+                        })
+                        # Subscribe to Pump.fun
+                        await ws.send_json({
+                            "jsonrpc": "2.0", "id": 2, "method": "logsSubscribe",
+                            "params": [{"mentions": [PUMPFUN]}, {"commitment": "confirmed"}],
+                        })
+
+                        log.info("📡 Listening for new pools...")
+
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                await self._handle(msg.data, session)
+                            elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
+                                break
+
+            except Exception as e:
+                log.error(f"WS error: {e}")
+            log.info("Reconnecting in 5s...")
+            await asyncio.sleep(5)
+
+    async def _handle(self, raw: str, session: aiohttp.ClientSession):
+        try:
+            data = json.loads(raw)
+            if "params" not in data:
+                return
+            value = data["params"]["result"].get("value", {})
+            logs = value.get("logs", [])
+            sig = value.get("signature", "")
+            if not logs or not sig:
+                return
+
+            log_text = " ".join(logs)
+
+            # Detect new Raydium pool: "initialize2" in logs
+            is_new_pool = "initialize2" in log_text or "InitializeInstruction2" in log_text
+            # Detect Pump.fun graduation
+            is_pumpfun = PUMPFUN in log_text and ("Withdraw" in log_text or "migrate" in log_text.lower())
+
+            if not is_new_pool and not is_pumpfun:
+                return
+
+            if sig in self.seen:
+                return
+            self.seen.add(sig)
+
+            source = "pumpfun" if is_pumpfun else "raydium"
+            log.info(f"🆕 New {source} pool detected (tx: {sig[:20]}...)")
+
+            # Fetch full transaction to extract the REAL token mint
+            mint = await self._extract_mint(sig, session)
+            if not mint:
+                log.debug(f"Could not extract mint from {sig[:20]}")
+                return
+
+            if mint in self.seen:
+                return
+            self.seen.add(mint)
+            self.count += 1
+
+            token = Token(mint=mint, source=source)
+            log.info(f"🎯 Token mint: {mint[:20]}... ({source})")
+
+            await self.on_new_token(token, session)
+
+        except Exception as e:
+            log.debug(f"Handle err: {e}")
+
+    async def _extract_mint(self, sig: str, session: aiohttp.ClientSession) -> Optional[str]:
+        """
+        Fetch parsed transaction and find the NEW token mint.
+        Look at postTokenBalances for mints that aren't SOL/USDC/USDT.
+        """
+        try:
+            tx = await self.sol.get_tx(sig, session)
+            if not tx:
+                return None
+
+            meta = tx.get("meta", {})
+            if not meta or meta.get("err"):
+                return None
+
+            # Strategy 1: Look at postTokenBalances for non-SOL mints
+            post_balances = meta.get("postTokenBalances", [])
+            for bal in post_balances:
+                mint = bal.get("mint", "")
+                if mint and mint not in SKIP_MINTS:
+                    return mint
+
+            # Strategy 2: Look at preTokenBalances too
+            pre_balances = meta.get("preTokenBalances", [])
+            for bal in pre_balances:
+                mint = bal.get("mint", "")
+                if mint and mint not in SKIP_MINTS:
+                    return mint
+
+            # Strategy 3: Check inner instructions for token program calls
+            inner = meta.get("innerInstructions", [])
+            for ix_group in inner:
+                for ix in ix_group.get("instructions", []):
+                    parsed = ix.get("parsed", {})
+                    if isinstance(parsed, dict):
+                        info = parsed.get("info", {})
+                        mint = info.get("mint", "")
+                        if mint and mint not in SKIP_MINTS:
+                            return mint
+
+        except Exception as e:
+            log.debug(f"Extract mint err: {e}")
+        return None
 
 # ─── TRAILING STOP MANAGER ──────────────────────────────────────────────────
 
-class TrailingStopManager:
-    def __init__(self, jupiter: JupiterDEX, solana: SolanaHandler, discord: DiscordAlert):
-        self.jupiter = jupiter
-        self.solana = solana
+class StopManager:
+    def __init__(self, jup: Jupiter, sol: Solana, discord: Discord):
+        self.jup = jup
+        self.sol = sol
         self.discord = discord
         self.positions: list[Position] = []
-        self.stop_pct = 30.0 if DEGEN_MODE else TRAILING_STOP_PCT
 
     def add(self, pos: Position):
         self.positions.append(pos)
 
-    async def monitor_loop(self):
-        log.info(f"Stop monitor: {self.stop_pct}% trail / {MAX_HOLD_HOURS}h hard exit")
-        async with aiohttp.ClientSession() as session:
-            while True:
-                for pos in [p for p in self.positions if p.status == "open"]:
-                    await self._check(pos, session)
-                await asyncio.sleep(5)
+    async def run(self):
+        log.info(f"Stop manager: {TRAILING_STOP_PCT}% trail / {MAX_HOLD_HOURS}h max")
+        while True:
+            for pos in [p for p in self.positions if p.status == "open"]:
+                await self._check(pos)
+            await asyncio.sleep(5)
 
-    async def _check(self, pos: Position, session: aiohttp.ClientSession):
-        price = await self.jupiter.get_price(pos.token.mint, session)
+    async def _check(self, pos: Position):
+        price = await self.jup.price(pos.token.mint)
         if not price:
             return
 
-        if pos.hold_expired:
-            log.warning(f"⏰ {pos.token.symbol} timeout — sell @ ${price:.8f}")
-            await self._exit(pos, price, "max_hold_timeout", session)
+        # Timeout exit
+        if pos.expired:
+            log.warning(f"⏰ {pos.token.symbol} timeout — selling")
+            await self._sell(pos, price, "timeout")
             return
 
-        if price > pos.highest_price:
-            pos.highest_price = price
-            pos.trailing_stop_price = price * (1 - self.stop_pct / 100)
-            log.info(f"📈 {pos.token.symbol} ${price:.8f} — stop ${pos.trailing_stop_price:.8f}")
+        # Update high water mark
+        if price > pos.high_price:
+            pos.high_price = price
+            pos.stop_price = price * (1 - TRAILING_STOP_PCT / 100)
 
-        if price <= pos.trailing_stop_price:
-            log.warning(f"🛑 {pos.token.symbol} stop hit @ ${price:.8f}")
-            await self._exit(pos, price, "trailing_stop", session)
+        # Stop hit
+        if price <= pos.stop_price:
+            log.warning(f"🛑 {pos.token.symbol} stop @ ${price:.10f}")
+            await self._sell(pos, price, "trailing_stop")
 
-    async def _exit(self, pos: Position, price: float, reason: str, session: aiohttp.ClientSession):
+    async def _sell(self, pos: Position, price: float, reason: str):
         pos.status = "closed"
         pos.exit_price = price
         pos.exit_reason = reason
-        pos.closed_at = datetime.now(timezone.utc).isoformat()
-        pos.pnl_usd = (price - pos.entry_price) * pos.amount_tokens
+        pos.pnl_usd = (price - pos.entry_price) * pos.tokens_held
 
-        log.info(f"Close {pos.token.symbol}: ${pos.entry_price:.8f}→${price:.8f} P&L:${pos.pnl_usd:+.4f}")
+        if pos.token.mint and self.sol.pubkey:
+            async with aiohttp.ClientSession() as session:
+                bal_before = await self.sol.balance(session)
 
-        if pos.token.mint and self.solana.pubkey and self.solana.keypair:
-            bal_before = await self.solana.get_balance(session)
-            amount = int(pos.amount_tokens * 1e6)
+            token_amount = int(pos.tokens_held * 1e6)
+            order = await self.jup.order(pos.token.mint, WSOL, token_amount, self.sol.pubkey)
+            if order and order.get("transaction"):
+                signed = self.sol.sign_tx(order["transaction"])
+                if signed:
+                    result = await self.jup.execute(order["requestId"], signed)
+                    if result:
+                        log.info(f"Sell OK: {result.get('signature', '?')[:20]}")
 
-            # Ultra order: token → SOL
-            order = await self.jupiter.get_order(
-                pos.token.mint, WSOL_MINT, amount, self.solana.pubkey
-            )
-            if order:
-                try:
-                    from solders.transaction import VersionedTransaction
-                    import base64
-
-                    tx_b64 = order.get("transaction", "")
-                    req_id = order.get("requestId", "")
-                    if tx_b64 and req_id:
-                        raw = base64.b64decode(tx_b64)
-                        txn = VersionedTransaction.from_bytes(raw)
-                        signed = VersionedTransaction(txn.message, [self.solana.keypair])
-                        signed_b64 = base64.b64encode(bytes(signed)).decode()
-
-                        result = await self.jupiter.execute_order(req_id, signed_b64)
-                        if result:
-                            log.info(f"Sell TX: {result.get('transactionId', 'ok')[:30]}")
-
-                        await asyncio.sleep(3)
-                        bal_after = await self.solana.get_balance(session)
-                        expected_back = int(order.get("outAmount", 0)) / 1e9
-                        actual_diff = bal_after - bal_before
-                        pos.sell_gas_sol = max(0, expected_back - actual_diff) if expected_back > 0 else 0.005
-                except Exception as e:
-                    log.error(f"Sell error: {e}")
+                    await asyncio.sleep(3)
+                    async with aiohttp.ClientSession() as session:
+                        bal_after = await self.sol.balance(session)
+                    expected = int(order.get("outAmount", 0)) / 1e9
+                    pos.sell_gas = max(0, expected - (bal_after - bal_before)) if expected > 0 else 0.005
 
         await self.discord.sold(pos)
-
+        log.info(f"Closed {pos.token.symbol}: P&L ${pos.pnl_usd:+.4f} [{reason}]")
 
 # ─── MAIN BOT ───────────────────────────────────────────────────────────────
 
 class SniperBot:
     def __init__(self):
-        # Derive WebSocket URL from RPC URL
-        ws_url = SOLANA_WS_URL
-        if not ws_url:
-            ws_url = SOLANA_RPC_URL.replace("https://", "wss://").replace("http://", "ws://")
-        
-        self.rpc = SolanaRPC(SOLANA_RPC_URL, ws_url)
-        self.jupiter = JupiterDEX()
-        self.solana = SolanaHandler(WALLET_PRIVATE_KEY, SOLANA_RPC_URL)
-        self.discord = DiscordAlert(DISCORD_WEBHOOK_URL)
-        self.safety = SafetyChecker(self.rpc)
-        self.stop_mgr = TrailingStopManager(self.jupiter, self.solana, self.discord)
-        self.listener = ChainListener(self.rpc, self._on_new_token)
-        self.start_time = time.time()
+        self.sol = Solana(SOLANA_RPC_URL, WALLET_PRIVATE_KEY)
+        self.jup = Jupiter()
+        self.discord = Discord(DISCORD_WEBHOOK_URL)
+        self.stops = StopManager(self.jup, self.sol, self.discord)
+        self.detector = PoolDetector(self.sol, self._on_token)
+        self.start = time.time()
 
     async def run(self):
-        stop_pct = 30.0 if DEGEN_MODE else TRAILING_STOP_PCT
-        log.info("=" * 60)
-        log.info("  SOLANA SNIPER BOT v3 — CHAIN MONITOR")
-        log.info(f"  Source: Solana blockchain (Raydium + Pump.fun)")
-        log.info(f"  Mode: {'🔥 DEGEN' if DEGEN_MODE else '📊 Normal'}")
-        log.info(f"  Trade: {TRADE_AMOUNT_SOL} SOL (~$2)")
-        log.info(f"  Stop: {stop_pct}% trail | {MAX_HOLD_HOURS}h max")
-        log.info(f"  Safety: min liq {MIN_LIQUIDITY_SOL} SOL | max holder {MAX_TOP_HOLDER_PCT}%")
-        log.info(f"  Slippage: {SLIPPAGE_BPS}bps | Buy delay: {BUY_DELAY_SECONDS}s")
-        log.info("=" * 60)
+        log.info("=" * 55)
+        log.info("  DEGEN SNIPER BOT v4")
+        log.info(f"  Trade: {TRADE_AMOUNT_SOL} SOL | Stop: {TRAILING_STOP_PCT}%")
+        log.info(f"  Max hold: {MAX_HOLD_HOURS}h | Slippage: {SLIPPAGE_BPS}bps")
+        log.info(f"  Jupiter key: {'✅' if JUPITER_API_KEY else '❌ MISSING'}")
+        log.info("=" * 55)
 
-        async with aiohttp.ClientSession() as session:
-            if self.solana.pubkey:
-                bal = await self.solana.get_balance(session)
-                log.info(f"Wallet: {bal:.4f} SOL")
+        async with aiohttp.ClientSession() as s:
+            if self.sol.pubkey:
+                bal = await self.sol.balance(s)
+                log.info(f"Balance: {bal:.4f} SOL")
             else:
-                log.warning("⚠️  No wallet — MONITOR ONLY")
+                log.warning("⚠️  No wallet — monitor only")
 
         await asyncio.gather(
-            self.listener.listen(),
-            self.stop_mgr.monitor_loop(),
-            self._heartbeat_loop(),
+            self.detector.listen(),
+            self.stops.run(),
+            self._heartbeat(),
         )
 
-    async def _on_new_token(self, token: NewToken, signature: str):
-        """Called by ChainListener when a new token is detected."""
-        async with aiohttp.ClientSession() as session:
-            token.initial_liq_sol = await self._estimate_pool_liquidity(token, session)
-            token = await self.safety.check(token, session)
+    async def _on_token(self, token: Token, session: aiohttp.ClientSession):
+        """Called when a real new token mint is detected."""
 
-            if not token.safe:
-                log.info(f"⛔ SKIP {token.mint[:16]}: {token.reject_reason}")
-                return
-
-            log.info(f"✅ PASSED safety: {token.symbol} ({token.source}) — buying...")
-
-            if BUY_DELAY_SECONDS > 0:
-                await asyncio.sleep(BUY_DELAY_SECONDS)
-
-            await self._buy(token, session)
-
-    async def _estimate_pool_liquidity(self, token: NewToken, session: aiohttp.ClientSession) -> float:
-        """Estimate liquidity using Solana RPC — no Jupiter needed."""
+        # Safety: check top holder concentration
         try:
-            # Check if the token account exists and has supply
-            supply = await self.rpc.get_token_supply(token.mint, session)
-            if not supply:
-                return 0.0
+            supply_info = await self.sol.get_token_supply(token.mint, session)
+            largest = await self.sol.get_largest_holders(token.mint, session)
+            if supply_info and largest:
+                total = float(supply_info.get("amount", "0"))
+                if total > 0 and len(largest) > 0:
+                    top = float(largest[0].get("amount", "0"))
+                    pct = (top / total) * 100
+                    if pct > MAX_TOP_HOLDER_PCT:
+                        log.info(f"⛔ {token.mint[:16]}: top holder {pct:.0f}%")
+                        return
+        except Exception:
+            pass  # If check fails, proceed anyway
 
-            total_supply = float(supply.get("amount", "0"))
-            if total_supply == 0:
-                return 0.0
+        log.info(f"✅ Buying {token.symbol} ({token.source})...")
 
-            # If the token has supply, assume it has at least basic liquidity
-            # We'll do a more precise check via the safety checker later
-            # For now, return a baseline that passes the filter
-            # The real safety gate is the top-holder check and mint authority check
-            return 10.0  # Assume tradeable if supply exists
+        if BUY_DELAY_SECONDS > 0:
+            await asyncio.sleep(BUY_DELAY_SECONDS)
 
-        except Exception as e:
-            log.debug(f"Liquidity check error: {e}")
-            return 0.0
+        await self._buy(token, session)
 
-    async def _buy(self, token: NewToken, session: aiohttp.ClientSession):
-        if not self.solana.pubkey:
-            log.warning("Monitor only — skip buy")
+    async def _buy(self, token: Token, session: aiohttp.ClientSession):
+        if not self.sol.pubkey:
             return
 
-        bal_before = await self.solana.get_balance(session)
+        bal_before = await self.sol.balance(session)
         if bal_before < TRADE_AMOUNT_SOL + 0.005:
             log.error(f"Low SOL: {bal_before:.4f}")
             return
 
-        # Step 1: Get order from Jupiter Ultra
-        sol_lamports = int(TRADE_AMOUNT_SOL * 1e9)
-        order = await self.jupiter.get_order(
-            WSOL_MINT, token.mint, sol_lamports, self.solana.pubkey
-        )
+        # Step 1: Get order from Jupiter
+        lamports = int(TRADE_AMOUNT_SOL * 1e9)
+        order = await self.jup.order(WSOL, token.mint, lamports, self.sol.pubkey)
         if not order:
-            log.error(f"No route for {token.symbol}")
+            log.info(f"No route for {token.mint[:16]} — skipping")
             return
 
-        request_id = order.get("requestId", "")
-        swap_tx_b64 = order.get("transaction", "")
+        tx_b64 = order.get("transaction")
+        req_id = order.get("requestId", "")
         out_amount = int(order.get("outAmount", "0"))
 
-        if not swap_tx_b64 or not request_id:
-            log.error(f"Invalid Ultra order response for {token.symbol}")
+        if not tx_b64 or not req_id:
+            log.error(f"Bad order response for {token.mint[:16]}")
             return
 
-        # Estimate price from order
-        tokens = out_amount / 1e6  # assume 6 decimals default
-        estimated_price = TRADE_AMOUNT_SOL / tokens if tokens > 0 else 0
-
-        price = await self.jupiter.get_price(token.mint)
-        if not price:
-            price = estimated_price
-            log.info(f"Estimated price for {token.symbol}: ${price:.10f}")
-
-        # Step 2: Sign the transaction
-        if not self.solana.keypair:
-            log.error("No keypair")
+        # Step 2: Sign
+        signed = self.sol.sign_tx(tx_b64)
+        if not signed:
             return
 
-        try:
-            from solders.transaction import VersionedTransaction
-            import base64
-
-            raw = base64.b64decode(swap_tx_b64)
-            txn = VersionedTransaction.from_bytes(raw)
-            signed = VersionedTransaction(txn.message, [self.solana.keypair])
-            signed_b64 = base64.b64encode(bytes(signed)).decode()
-        except Exception as e:
-            log.error(f"Sign failed: {e}")
-            return
-
-        # Step 3: Execute via Jupiter Ultra (Jupiter lands the tx)
-        result = await self.jupiter.execute_order(request_id, signed_b64)
+        # Step 3: Execute (Jupiter lands the tx)
+        result = await self.jup.execute(req_id, signed)
         if not result:
-            log.error(f"Execute failed for {token.symbol}")
+            log.error(f"Execute failed for {token.mint[:16]}")
             return
 
-        tx_sig = result.get("transactionId", result.get("signature", "unknown"))
-        log.info(f"✅ Ultra TX: {tx_sig[:30]}...")
+        status = result.get("status", "")
+        sig = result.get("signature", "unknown")
 
-        # Calculate gas
+        if status == "Failed":
+            log.error(f"Swap failed: {result.get('error', 'unknown')}")
+            return
+
+        log.info(f"✅ TX landed: {sig[:30]}...")
+
+        # Calculate tokens received + gas
         await asyncio.sleep(3)
-        bal_after = await self.solana.get_balance(session)
-        gas_paid = bal_before - bal_after - TRADE_AMOUNT_SOL
-        buy_gas = max(0, gas_paid)
+        bal_after = await self.sol.balance(session)
+        gas = max(0, bal_before - bal_after - TRADE_AMOUNT_SOL)
 
-        stop_pct = 30.0 if DEGEN_MODE else TRAILING_STOP_PCT
+        tokens = out_amount / 1e6  # default 6 decimals
+        price = TRADE_AMOUNT_SOL / tokens if tokens > 0 else 0
+
+        # Try to get real price from Jupiter
+        jup_price = await self.jup.price(token.mint)
+        if jup_price:
+            price = jup_price
+
         pos = Position(
-            token=token, entry_price=price, amount_tokens=tokens,
-            cost_sol=TRADE_AMOUNT_SOL, highest_price=price,
-            trailing_stop_price=price * (1 - stop_pct / 100),
-            status="open", buy_gas_sol=buy_gas,
+            token=token, entry_price=price, tokens_held=tokens,
+            cost_sol=TRADE_AMOUNT_SOL, high_price=price,
+            stop_price=price * (1 - TRAILING_STOP_PCT / 100),
+            buy_gas=gas,
         )
-        self.stop_mgr.add(pos)
+        self.stops.add(pos)
         await self.discord.bought(pos)
-        log.info(f"✅ BOUGHT {tokens:.2f} {token.symbol} @ ${price:.10f} for {TRADE_AMOUNT_SOL} SOL (gas: {buy_gas:.6f})")
+        log.info(f"💰 BOUGHT {tokens:.2f} {token.symbol} @ ${price:.10f} | gas: {gas:.5f} SOL")
 
-    async def _heartbeat_loop(self):
+    async def _heartbeat(self):
         while True:
             await asyncio.sleep(300)
-            # Just log to console, no Discord spam
-            uptime = (time.time() - self.start_time) / 60
-            open_pos = len([p for p in self.stop_mgr.positions if p.status == "open"])
-            log.info(f"💓 Heartbeat: {self.listener.tokens_seen_count} seen, {open_pos} open, {uptime:.0f}m uptime")
-
+            uptime = (time.time() - self.start) / 60
+            open_pos = len([p for p in self.stops.positions if p.status == "open"])
+            log.info(f"💓 {self.detector.count} tokens, {open_pos} open, {uptime:.0f}m up")
 
 # ─── RUN ─────────────────────────────────────────────────────────────────────
 
-def main():
+if __name__ == "__main__":
     bot = SniperBot()
     try:
         asyncio.run(bot.run())
     except KeyboardInterrupt:
-        log.info("Bot stopped")
-
-if __name__ == "__main__":
-    main()
+        log.info("Stopped")
