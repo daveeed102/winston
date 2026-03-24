@@ -20,7 +20,7 @@ import aiohttp
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
-TRADE_AMOUNT_SOL = float(os.getenv("TRADE_AMOUNT_SOL", "0.021"))  # ~$3
+TRADE_AMOUNT_SOL = float(os.getenv("TRADE_AMOUNT_SOL", "0.07"))  # ~$10
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "30"))  # degen default
 MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "2"))
 SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "500"))
