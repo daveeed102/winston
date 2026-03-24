@@ -53,10 +53,10 @@ USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
 KNOWN_MINTS = {WSOL_MINT, USDC_MINT, USDT_MINT}
 
-# Jupiter API
-JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
-JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
+# Jupiter API — using Ultra API (api.jup.ag works on Railway, quote-api.jup.ag doesn't)
 JUPITER_PRICE_URL = "https://api.jup.ag/price/v2"
+JUPITER_ULTRA_ORDER_URL = "https://api.jup.ag/ultra/v1/order"
+JUPITER_ULTRA_EXECUTE_URL = "https://api.jup.ag/ultra/v1/execute"
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 
@@ -506,23 +506,25 @@ class ChainListener:
         return unique
 
 
-# ─── JUPITER DEX ─────────────────────────────────────────────────────────────
+# ─── JUPITER ULTRA API ───────────────────────────────────────────────────────
 
 class JupiterDEX:
-    """Jupiter API with custom DNS resolver to work around Railway DNS issues."""
+    """
+    Jupiter Ultra API — uses api.jup.ag instead of quote-api.jup.ag.
+    Ultra handles quote + swap + transaction landing in one flow.
+    """
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        """Create a session with explicit DNS resolver using Google/Cloudflare DNS."""
-        from aiohttp import TCPConnector
         try:
+            from aiohttp import TCPConnector
             from aiohttp.resolver import AsyncResolver
             resolver = AsyncResolver(nameservers=["8.8.8.8", "1.1.1.1"])
             connector = TCPConnector(resolver=resolver, ssl=False)
         except Exception:
-            connector = TCPConnector(ssl=False)
+            connector = aiohttp.TCPConnector(ssl=False)
         return aiohttp.ClientSession(connector=connector)
 
-    async def get_price(self, mint: str, session: aiohttp.ClientSession = None) -> Optional[float]:
+    async def get_price(self, mint: str, session=None) -> Optional[float]:
         s = await self._get_session()
         try:
             url = f"{JUPITER_PRICE_URL}?ids={mint}"
@@ -537,41 +539,50 @@ class JupiterDEX:
             await s.close()
         return None
 
-    async def get_quote(self, input_mint: str, output_mint: str,
-                        amount: int, session: aiohttp.ClientSession = None) -> Optional[dict]:
+    async def get_order(self, input_mint: str, output_mint: str,
+                        amount: int, taker: str, session=None) -> Optional[dict]:
+        """Get an order from Jupiter Ultra API — returns a transaction to sign."""
         s = await self._get_session()
         try:
-            params = {
-                "inputMint": input_mint, "outputMint": output_mint,
-                "amount": str(amount), "slippageBps": str(SLIPPAGE_BPS),
+            payload = {
+                "inputMint": input_mint,
+                "outputMint": output_mint,
+                "amount": str(amount),
+                "taker": taker,
+                "slippageBps": SLIPPAGE_BPS,
             }
-            async with s.get(JUPITER_QUOTE_URL, params=params,
-                             timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with s.post(
+                JUPITER_ULTRA_ORDER_URL, json=payload,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
                 if resp.status == 200:
                     return await resp.json()
-                log.error(f"Quote error {resp.status}: {await resp.text()}")
+                body = await resp.text()
+                log.error(f"Ultra order error {resp.status}: {body}")
         except Exception as e:
-            log.error(f"Quote failed: {e}")
+            log.error(f"Ultra order failed: {e}")
         finally:
             await s.close()
         return None
 
-    async def execute_swap(self, quote: dict, pubkey: str,
-                           session: aiohttp.ClientSession = None) -> Optional[dict]:
+    async def execute_order(self, request_id: str, signed_tx: str, session=None) -> Optional[dict]:
+        """Execute a signed order via Jupiter Ultra — Jupiter lands the transaction."""
         s = await self._get_session()
         try:
             payload = {
-                "quoteResponse": quote, "userPublicKey": pubkey,
-                "wrapAndUnwrapSol": True, "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": "auto",
+                "signedTransaction": signed_tx,
+                "requestId": request_id,
             }
-            async with s.post(JUPITER_SWAP_URL, json=payload,
-                              timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with s.post(
+                JUPITER_ULTRA_EXECUTE_URL, json=payload,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
                 if resp.status == 200:
                     return await resp.json()
-                log.error(f"Swap error {resp.status}: {await resp.text()}")
+                body = await resp.text()
+                log.error(f"Ultra execute error {resp.status}: {body}")
         except Exception as e:
-            log.error(f"Swap failed: {e}")
+            log.error(f"Ultra execute failed: {e}")
         finally:
             await s.close()
         return None
@@ -690,20 +701,38 @@ class TrailingStopManager:
 
         log.info(f"Close {pos.token.symbol}: ${pos.entry_price:.8f}→${price:.8f} P&L:${pos.pnl_usd:+.4f}")
 
-        if pos.token.mint and self.solana.pubkey:
+        if pos.token.mint and self.solana.pubkey and self.solana.keypair:
             bal_before = await self.solana.get_balance(session)
             amount = int(pos.amount_tokens * 1e6)
-            quote = await self.jupiter.get_quote(pos.token.mint, WSOL_MINT, amount, session)
-            if quote:
-                swap = await self.jupiter.execute_swap(quote, self.solana.pubkey, session)
-                if swap:
-                    await self.solana.sign_and_send(swap, session)
-                    await asyncio.sleep(2)
-                    bal_after = await self.solana.get_balance(session)
-                    # Gas = expected SOL back - actual SOL back (rough estimate)
-                    expected_back = int(quote.get("outAmount", 0)) / 1e9
-                    actual_diff = bal_after - bal_before
-                    pos.sell_gas_sol = max(0, expected_back - actual_diff) if expected_back > 0 else 0.005
+
+            # Ultra order: token → SOL
+            order = await self.jupiter.get_order(
+                pos.token.mint, WSOL_MINT, amount, self.solana.pubkey
+            )
+            if order:
+                try:
+                    from solders.transaction import VersionedTransaction
+                    import base64
+
+                    tx_b64 = order.get("transaction", "")
+                    req_id = order.get("requestId", "")
+                    if tx_b64 and req_id:
+                        raw = base64.b64decode(tx_b64)
+                        txn = VersionedTransaction.from_bytes(raw)
+                        signed = VersionedTransaction(txn.message, [self.solana.keypair])
+                        signed_b64 = base64.b64encode(bytes(signed)).decode()
+
+                        result = await self.jupiter.execute_order(req_id, signed_b64)
+                        if result:
+                            log.info(f"Sell TX: {result.get('transactionId', 'ok')[:30]}")
+
+                        await asyncio.sleep(3)
+                        bal_after = await self.solana.get_balance(session)
+                        expected_back = int(order.get("outAmount", 0)) / 1e9
+                        actual_diff = bal_after - bal_before
+                        pos.sell_gas_sol = max(0, expected_back - actual_diff) if expected_back > 0 else 0.005
+                except Exception as e:
+                    log.error(f"Sell error: {e}")
 
         await self.discord.sold(pos)
 
@@ -800,35 +829,60 @@ class SniperBot:
             log.error(f"Low SOL: {bal_before:.4f}")
             return
 
-        # Get quote first — this is what matters, not the price
+        # Step 1: Get order from Jupiter Ultra
         sol_lamports = int(TRADE_AMOUNT_SOL * 1e9)
-        quote = await self.jupiter.get_quote(WSOL_MINT, token.mint, sol_lamports, session)
-        if not quote:
+        order = await self.jupiter.get_order(
+            WSOL_MINT, token.mint, sol_lamports, self.solana.pubkey
+        )
+        if not order:
             log.error(f"No route for {token.symbol}")
             return
 
-        # Estimate price from quote (tokens out / SOL in)
-        out_amount = int(quote.get("outAmount", 0))
-        decimals = int(quote.get("outputMint", {}).get("decimals", 6))
-        tokens = out_amount / (10 ** decimals) if decimals else out_amount
+        request_id = order.get("requestId", "")
+        swap_tx_b64 = order.get("transaction", "")
+        out_amount = int(order.get("outAmount", "0"))
+
+        if not swap_tx_b64 or not request_id:
+            log.error(f"Invalid Ultra order response for {token.symbol}")
+            return
+
+        # Estimate price from order
+        tokens = out_amount / 1e6  # assume 6 decimals default
         estimated_price = TRADE_AMOUNT_SOL / tokens if tokens > 0 else 0
 
-        # Try Jupiter price as bonus, fall back to estimate
-        price = await self.jupiter.get_price(token.mint, session)
+        price = await self.jupiter.get_price(token.mint)
         if not price:
             price = estimated_price
-            log.info(f"Using estimated price for {token.symbol}: ${price:.10f}")
+            log.info(f"Estimated price for {token.symbol}: ${price:.10f}")
 
-        swap = await self.jupiter.execute_swap(quote, self.solana.pubkey, session)
-        if not swap:
+        # Step 2: Sign the transaction
+        if not self.solana.keypair:
+            log.error("No keypair")
             return
 
-        sig = await self.solana.sign_and_send(swap, session)
-        if not sig:
+        try:
+            from solders.transaction import VersionedTransaction
+            import base64
+
+            raw = base64.b64decode(swap_tx_b64)
+            txn = VersionedTransaction.from_bytes(raw)
+            signed = VersionedTransaction(txn.message, [self.solana.keypair])
+            signed_b64 = base64.b64encode(bytes(signed)).decode()
+        except Exception as e:
+            log.error(f"Sign failed: {e}")
             return
 
-        # Calculate gas from balance difference
-        await asyncio.sleep(2)
+        # Step 3: Execute via Jupiter Ultra (Jupiter lands the tx)
+        result = await self.jupiter.execute_order(request_id, signed_b64)
+        if not result:
+            log.error(f"Execute failed for {token.symbol}")
+            return
+
+        tx_sig = result.get("transactionId", result.get("signature", "unknown"))
+        log.info(f"✅ Ultra TX: {tx_sig[:30]}...")
+
+        # Calculate gas
+        await asyncio.sleep(3)
         bal_after = await self.solana.get_balance(session)
         gas_paid = bal_before - bal_after - TRADE_AMOUNT_SOL
         buy_gas = max(0, gas_paid)
