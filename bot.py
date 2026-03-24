@@ -105,6 +105,8 @@ class Position:
     opened_at: str = ""
     closed_at: str = ""
     opened_at_ts: float = 0.0
+    buy_gas_sol: float = 0.0
+    sell_gas_sol: float = 0.0
 
     def __post_init__(self):
         if not self.opened_at:
@@ -137,72 +139,32 @@ class DiscordAlert:
         except Exception as e:
             log.error(f"Discord: {e}")
 
-    async def new_token_detected(self, token: NewToken):
-        safe_emoji = "✅" if token.safe else "⛔"
+    async def bought(self, pos: Position):
         await self.send({
-            "title": f"🔎 NEW TOKEN DETECTED {safe_emoji}",
-            "description": f"**{token.name}** ({token.symbol})",
-            "color": 0x00FF88 if token.safe else 0xFF4444,
-            "fields": [
-                {"name": "Mint", "value": f"`{token.mint[:20]}...`", "inline": False},
-                {"name": "Source", "value": token.source.upper(), "inline": True},
-                {"name": "Liquidity", "value": f"{token.initial_liq_sol:.1f} SOL", "inline": True},
-                {"name": "Mint Revoked", "value": "✅ Yes" if token.mint_authority_revoked else "⚠️ No", "inline": True},
-                {"name": "Top Holder", "value": f"{token.top_holder_pct:.1f}%", "inline": True},
-                {"name": "Status", "value": "BUYING" if token.safe else f"SKIP: {token.reject_reason}", "inline": False},
-            ],
-            "footer": {"text": "Sniper v3 • Chain Monitor"},
-        })
-
-    async def buy_executed(self, pos: Position):
-        stop_pct = 30.0 if DEGEN_MODE else TRAILING_STOP_PCT
-        await self.send({
-            "title": "💰 BOUGHT",
-            "description": f"**{pos.token.name}** ({pos.token.symbol})",
+            "title": f"💰 BOUGHT — {pos.token.symbol}",
             "color": 0x00FF88,
             "fields": [
-                {"name": "Entry", "value": f"${pos.entry_price:.8f}", "inline": True},
-                {"name": "Tokens", "value": f"{pos.amount_tokens:.2f}", "inline": True},
-                {"name": "Cost", "value": f"{pos.cost_sol:.4f} SOL", "inline": True},
-                {"name": "Stop", "value": f"{stop_pct}%", "inline": True},
-                {"name": "Hard Exit", "value": f"{MAX_HOLD_HOURS}h", "inline": True},
-                {"name": "Solscan", "value": f"[View](https://solscan.io/token/{pos.token.mint})", "inline": True},
+                {"name": "Token", "value": pos.token.name, "inline": True},
+                {"name": "Price", "value": f"${pos.entry_price:.8f}", "inline": True},
+                {"name": "Spent", "value": f"{pos.cost_sol:.4f} SOL", "inline": True},
+                {"name": "Gas", "value": f"{pos.buy_gas_sol:.6f} SOL", "inline": True},
+                {"name": "Solscan", "value": f"[View](https://solscan.io/token/{pos.token.mint})", "inline": False},
             ],
         })
 
-    async def position_closed(self, pos: Position):
+    async def sold(self, pos: Position):
         color = 0x00FF88 if pos.pnl_usd >= 0 else 0xFF4444
         emoji = "🟢" if pos.pnl_usd >= 0 else "🔴"
-        reason = "⏰ TIMEOUT" if pos.exit_reason == "max_hold_timeout" else "📉 STOP"
-        mins = pos.hold_seconds / 60
+        total_gas = pos.buy_gas_sol + pos.sell_gas_sol
         await self.send({
-            "title": f"{emoji} CLOSED — {reason}",
-            "description": f"**{pos.token.name}** ({pos.token.symbol})",
+            "title": f"{emoji} SOLD — {pos.token.symbol}",
             "color": color,
             "fields": [
-                {"name": "Entry", "value": f"${pos.entry_price:.8f}", "inline": True},
-                {"name": "Exit", "value": f"${pos.exit_price:.8f}", "inline": True},
+                {"name": "Token", "value": pos.token.name, "inline": True},
                 {"name": "P&L", "value": f"${pos.pnl_usd:+.4f}", "inline": True},
-                {"name": "High", "value": f"${pos.highest_price:.8f}", "inline": True},
-                {"name": "Held", "value": f"{mins:.1f}m", "inline": True},
-            ],
-        })
-
-    async def error(self, msg: str):
-        await self.send({"title": "⚠️ ERROR", "description": msg, "color": 0xFF4444})
-
-    async def heartbeat(self, tokens_seen: int, open_pos: int, uptime_mins: float):
-        stop_pct = 30.0 if DEGEN_MODE else TRAILING_STOP_PCT
-        await self.send({
-            "title": "💓 Sniper v3 Heartbeat",
-            "color": 0x888888,
-            "fields": [
-                {"name": "Tokens Seen", "value": str(tokens_seen), "inline": True},
-                {"name": "Open Positions", "value": str(open_pos), "inline": True},
-                {"name": "Uptime", "value": f"{uptime_mins:.0f}m", "inline": True},
-                {"name": "Mode", "value": "🔥 DEGEN" if DEGEN_MODE else "📊 Normal", "inline": True},
-                {"name": "Trade", "value": f"{TRADE_AMOUNT_SOL} SOL", "inline": True},
-                {"name": "Stop", "value": f"{stop_pct}% / {MAX_HOLD_HOURS}h", "inline": True},
+                {"name": "Buy", "value": f"${pos.entry_price:.8f}", "inline": True},
+                {"name": "Sell", "value": f"${pos.exit_price:.8f}", "inline": True},
+                {"name": "Gas (total)", "value": f"{total_gas:.6f} SOL", "inline": True},
             ],
         })
 
@@ -649,14 +611,21 @@ class TrailingStopManager:
         log.info(f"Close {pos.token.symbol}: ${pos.entry_price:.8f}→${price:.8f} P&L:${pos.pnl_usd:+.4f}")
 
         if pos.token.mint and self.solana.pubkey:
+            bal_before = await self.solana.get_balance(session)
             amount = int(pos.amount_tokens * 1e6)
             quote = await self.jupiter.get_quote(pos.token.mint, WSOL_MINT, amount, session)
             if quote:
                 swap = await self.jupiter.execute_swap(quote, self.solana.pubkey, session)
                 if swap:
                     await self.solana.sign_and_send(swap, session)
+                    await asyncio.sleep(2)
+                    bal_after = await self.solana.get_balance(session)
+                    # Gas = expected SOL back - actual SOL back (rough estimate)
+                    expected_back = int(quote.get("outAmount", 0)) / 1e9
+                    actual_diff = bal_after - bal_before
+                    pos.sell_gas_sol = max(0, expected_back - actual_diff) if expected_back > 0 else 0.005
 
-        await self.discord.position_closed(pos)
+        await self.discord.sold(pos)
 
 
 # ─── MAIN BOT ───────────────────────────────────────────────────────────────
@@ -705,25 +674,18 @@ class SniperBot:
     async def _on_new_token(self, token: NewToken, signature: str):
         """Called by ChainListener when a new token is detected."""
         async with aiohttp.ClientSession() as session:
-            # Get pool liquidity estimate
             token.initial_liq_sol = await self._estimate_pool_liquidity(token, session)
-
-            # Run safety checks
             token = await self.safety.check(token, session)
-
-            # Alert Discord
-            await self.discord.new_token_detected(token)
 
             if not token.safe:
                 log.info(f"⛔ SKIP {token.mint[:16]}: {token.reject_reason}")
                 return
 
-            # Brief delay to let liquidity settle
+            log.info(f"✅ PASSED safety: {token.symbol} ({token.source}) — buying...")
+
             if BUY_DELAY_SECONDS > 0:
-                log.info(f"⏳ Waiting {BUY_DELAY_SECONDS}s before buying...")
                 await asyncio.sleep(BUY_DELAY_SECONDS)
 
-            # Execute buy
             await self._buy(token, session)
 
     async def _estimate_pool_liquidity(self, token: NewToken, session: aiohttp.ClientSession) -> float:
@@ -749,10 +711,9 @@ class SniperBot:
             log.warning("Monitor only — skip buy")
             return
 
-        bal = await self.solana.get_balance(session)
-        if bal < TRADE_AMOUNT_SOL + 0.005:
-            log.error(f"Low SOL: {bal:.4f}")
-            await self.discord.error(f"Low balance: {bal:.4f} SOL")
+        bal_before = await self.solana.get_balance(session)
+        if bal_before < TRADE_AMOUNT_SOL + 0.005:
+            log.error(f"Low SOL: {bal_before:.4f}")
             return
 
         price = await self.jupiter.get_price(token.mint, session)
@@ -764,7 +725,6 @@ class SniperBot:
         quote = await self.jupiter.get_quote(WSOL_MINT, token.mint, sol_lamports, session)
         if not quote:
             log.error(f"No route for {token.symbol}")
-            await self.discord.error(f"No Jupiter route for **{token.symbol}**")
             return
 
         swap = await self.jupiter.execute_swap(quote, self.solana.pubkey, session)
@@ -775,6 +735,12 @@ class SniperBot:
         if not sig:
             return
 
+        # Calculate gas from balance difference
+        await asyncio.sleep(2)
+        bal_after = await self.solana.get_balance(session)
+        gas_paid = bal_before - bal_after - TRADE_AMOUNT_SOL
+        buy_gas = max(0, gas_paid)
+
         out_amount = int(quote.get("outAmount", 0))
         decimals = int(quote.get("outputMint", {}).get("decimals", 6))
         tokens = out_amount / (10 ** decimals) if decimals else out_amount
@@ -784,18 +750,19 @@ class SniperBot:
             token=token, entry_price=price, amount_tokens=tokens,
             cost_sol=TRADE_AMOUNT_SOL, highest_price=price,
             trailing_stop_price=price * (1 - stop_pct / 100),
-            status="open",
+            status="open", buy_gas_sol=buy_gas,
         )
         self.stop_mgr.add(pos)
-        await self.discord.buy_executed(pos)
-        log.info(f"✅ BOUGHT {tokens:.2f} {token.symbol} @ ${price:.8f} for {TRADE_AMOUNT_SOL} SOL")
+        await self.discord.bought(pos)
+        log.info(f"✅ BOUGHT {tokens:.2f} {token.symbol} @ ${price:.8f} for {TRADE_AMOUNT_SOL} SOL (gas: {buy_gas:.6f})")
 
     async def _heartbeat_loop(self):
         while True:
             await asyncio.sleep(300)
+            # Just log to console, no Discord spam
             uptime = (time.time() - self.start_time) / 60
             open_pos = len([p for p in self.stop_mgr.positions if p.status == "open"])
-            await self.discord.heartbeat(self.listener.tokens_seen_count, open_pos, uptime)
+            log.info(f"💓 Heartbeat: {self.listener.tokens_seen_count} seen, {open_pos} open, {uptime:.0f}m uptime")
 
 
 # ─── RUN ─────────────────────────────────────────────────────────────────────
