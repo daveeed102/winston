@@ -69,59 +69,76 @@ def get_coin_market_data(coin_id: str) -> dict:
 def get_coinbase_movers(available_coins: list) -> list:
     """
     Check which Coinbase coins have big price moves in last 24h.
-    Uses CoinGecko's simple/price endpoint for batch price data.
+    Uses CoinGecko's markets endpoint with retry for rate limits.
     """
-    try:
-        # Get price changes for popular memecoins on Coinbase
-        memecoin_symbols = [c.replace("-USD", "").lower() for c in available_coins
-                          if c.replace("-USD", "") not in config.BLOCKED_COINS]
+    import time as _time
 
-        # CoinGecko IDs don't always match symbols, so we'll use the markets endpoint
-        resp = requests.get(
-            "https://api.coingecko.com/api/v3/coins/markets",
-            params={
-                "vs_currency": "usd",
-                "order": "volume_desc",
-                "per_page": 250,
-                "page": 1,
-                "price_change_percentage": "1h,24h",
-            },
-            timeout=15,
-        )
-        data = resp.json()
+    for attempt in range(3):
+        try:
+            resp = requests.get(
+                "https://api.coingecko.com/api/v3/coins/markets",
+                params={
+                    "vs_currency": "usd",
+                    "order": "volume_desc",
+                    "per_page": 250,
+                    "page": 1,
+                    "price_change_percentage": "1h,24h",
+                },
+                timeout=15,
+            )
 
-        # Cross-reference with Coinbase available coins
-        available_set = set(c.replace("-USD", "").upper() for c in available_coins)
-        results = []
+            # Handle rate limiting
+            if resp.status_code == 429:
+                wait = 30 * (attempt + 1)
+                log(f"[SCANNER] CoinGecko rate limited — waiting {wait}s (attempt {attempt+1}/3)")
+                _time.sleep(wait)
+                continue
 
-        for coin in data:
-            symbol = coin.get("symbol", "").upper()
-            if symbol in available_set and symbol not in config.BLOCKED_COINS:
-                pct_1h = coin.get("price_change_percentage_1h_in_currency", 0) or 0
-                pct_24h = coin.get("price_change_percentage_24h", 0) or 0
-                volume = coin.get("total_volume", 0) or 0
+            if resp.status_code != 200:
+                log(f"[SCANNER] CoinGecko returned status {resp.status_code}")
+                _time.sleep(10)
+                continue
 
-                # Only include coins with notable movement or volume
-                if abs(pct_1h) > 3 or abs(pct_24h) > 10 or volume > 1_000_000:
-                    results.append({
-                        "symbol": symbol,
-                        "name": coin.get("name", ""),
-                        "price": coin.get("current_price", 0),
-                        "pct_1h": pct_1h,
-                        "pct_24h": pct_24h,
-                        "volume_24h": volume,
-                        "market_cap": coin.get("market_cap", 0) or 0,
-                        "source": "coingecko_movers",
-                    })
+            data = resp.json()
+            if not isinstance(data, list):
+                log(f"[SCANNER] CoinGecko unexpected response type: {type(data)}")
+                _time.sleep(10)
+                continue
 
-        # Sort by 1h change descending (biggest movers first)
-        results.sort(key=lambda x: x.get("pct_1h", 0), reverse=True)
-        log(f"[SCANNER] CoinGecko movers: {len(results)} coins with notable movement")
-        return results[:20]  # Top 20
+            available_set = set(c.replace("-USD", "").upper() for c in available_coins)
+            results = []
 
-    except Exception as e:
-        log(f"[SCANNER] CoinGecko movers error: {e}")
-        return []
+            for coin in data:
+                symbol = coin.get("symbol", "").upper()
+                if symbol in available_set and symbol not in config.BLOCKED_COINS:
+                    pct_1h = coin.get("price_change_percentage_1h_in_currency", 0) or 0
+                    pct_24h = coin.get("price_change_percentage_24h", 0) or 0
+                    volume = coin.get("total_volume", 0) or 0
+                    mcap = coin.get("market_cap", 0) or 0
+
+                    # Include any memecoin with some activity — lower threshold
+                    if abs(pct_1h) > 1 or abs(pct_24h) > 5 or volume > 500_000:
+                        results.append({
+                            "symbol": symbol,
+                            "name": coin.get("name", ""),
+                            "price": coin.get("current_price", 0),
+                            "pct_1h": pct_1h,
+                            "pct_24h": pct_24h,
+                            "volume_24h": volume,
+                            "market_cap": mcap,
+                            "source": "coingecko_movers",
+                        })
+
+            results.sort(key=lambda x: x.get("pct_1h", 0), reverse=True)
+            log(f"[SCANNER] CoinGecko movers: {len(results)} coins with activity")
+            return results[:30]
+
+        except Exception as e:
+            log(f"[SCANNER] CoinGecko movers error (attempt {attempt+1}): {e}")
+            _time.sleep(10)
+
+    log("[SCANNER] CoinGecko movers failed after 3 attempts")
+    return []
 
 
 def get_x_mention_velocity(symbol: str) -> dict:
@@ -307,6 +324,10 @@ def discover_candidates(available_coins: list) -> list:
             candidates[sym] = candidates.get(sym, {"symbol": sym, "sources": []})
             candidates[sym]["sources"].append("trending")
             candidates[sym]["name"] = coin.get("name", sym)
+
+    # Brief pause to avoid CoinGecko rate limit
+    import time as _time
+    _time.sleep(5)
 
     # Source 2: CoinGecko movers (volume + price action)
     for coin in get_coinbase_movers(available_coins):

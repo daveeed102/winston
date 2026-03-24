@@ -190,14 +190,29 @@ def score_token(candidate: dict, skip_x: bool = False) -> dict:
         candidate.get("pct_24h", 0),
     )
 
-    # Weighted average
-    total = (
-        vol_score * 0.25 +
-        price_score * 0.25 +
-        x_score * 0.20 +
-        trending_score * 0.15 +
-        buyer_score * 0.15
-    )
+    # Dynamic weights — if we have real market data, use balanced weights
+    # If market data is missing (all defaults), lean harder on X buzz + trending
+    has_market_data = candidate.get("volume_24h", 0) > 0 or candidate.get("pct_1h", 0) != 0
+
+    if has_market_data:
+        # Normal balanced weights
+        total = (
+            vol_score * 0.25 +
+            price_score * 0.25 +
+            x_score * 0.20 +
+            trending_score * 0.15 +
+            buyer_score * 0.15
+        )
+    else:
+        # No market data — lean on X buzz and trending presence
+        total = (
+            vol_score * 0.05 +
+            price_score * 0.10 +
+            x_score * 0.40 +
+            trending_score * 0.35 +
+            buyer_score * 0.10
+        )
+
     final_score = int(round(total))
 
     breakdown = {
