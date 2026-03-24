@@ -21,8 +21,8 @@ import aiohttp
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
 TRADE_AMOUNT_SOL = float(os.getenv("TRADE_AMOUNT_SOL", "0.07"))  # ~$10
-TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "30"))  # degen default
-MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "2"))
+TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "20"))  # 20% default, tightens after TP
+MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "1"))  # 1 hour max
 SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "500"))
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "")
@@ -441,9 +441,20 @@ class PoolDetector:
             log.warning(f"Extract mint err: {e}")
         return None
 
-# ─── TRAILING STOP MANAGER ──────────────────────────────────────────────────
+# ─── EXIT STRATEGY ENGINE ────────────────────────────────────────────────────
 
-class StopManager:
+class ExitEngine:
+    """
+    Smart exit strategy:
+    - Polls price every 2 seconds (not 5)
+    - At 2x: sells 50% (locks in house money), tightens stop to 15%
+    - At 3x: sells another 25%, tightens stop to 10%
+    - Remaining rides with tight stop until exit
+    - 20% trailing stop from peak (default)
+    - After any profit taken, stop tightens automatically
+    - 1 hour max hold (not 2)
+    """
+
     def __init__(self, jup: Jupiter, sol: Solana, discord: Discord):
         self.jup = jup
         self.sol = sol
@@ -454,60 +465,109 @@ class StopManager:
         self.positions.append(pos)
 
     async def run(self):
-        log.info(f"Stop manager: {TRAILING_STOP_PCT}% trail / {MAX_HOLD_HOURS}h max")
+        log.info(f"Exit engine: {TRAILING_STOP_PCT}% trail | {MAX_HOLD_HOURS}h max | 2s poll")
         while True:
             for pos in [p for p in self.positions if p.status == "open"]:
                 await self._check(pos)
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)  # Check every 2 seconds, not 5
 
     async def _check(self, pos: Position):
         price = await self.jup.price(pos.token.mint)
         if not price:
             return
 
-        # Timeout exit
+        gain_x = price / pos.entry_price if pos.entry_price > 0 else 1
+
+        # ── TIMEOUT EXIT ──
         if pos.expired:
-            log.warning(f"⏰ {pos.token.symbol} timeout — selling")
-            await self._sell(pos, price, "timeout")
+            log.warning(f"⏰ {pos.token.symbol} timeout — selling all")
+            await self._sell(pos, price, "timeout", sell_pct=100)
             return
 
-        # Update high water mark
+        # ── TAKE PROFIT TIERS ──
+        # At 2x: sell 50%, lock in house money
+        if gain_x >= 2.0 and not getattr(pos, '_took_2x', False):
+            pos._took_2x = True
+            log.info(f"🎯 {pos.token.symbol} hit 2x! Selling 50% — house money secured")
+            await self._sell(pos, price, "take_profit_2x", sell_pct=50)
+            # Tighten stop to 15% after taking profit
+            pos.stop_price = pos.high_price * 0.85
+            return
+
+        # At 3x: sell another 25% of original
+        if gain_x >= 3.0 and not getattr(pos, '_took_3x', False):
+            pos._took_3x = True
+            log.info(f"🚀 {pos.token.symbol} hit 3x! Selling 25% more")
+            await self._sell(pos, price, "take_profit_3x", sell_pct=50)  # 50% of remaining
+            # Tighten stop to 10%
+            pos.stop_price = pos.high_price * 0.90
+            return
+
+        # ── UPDATE HIGH WATER MARK ──
         if price > pos.high_price:
             pos.high_price = price
-            pos.stop_price = price * (1 - TRAILING_STOP_PCT / 100)
+            # Dynamic stop: tighter after profit taken
+            if getattr(pos, '_took_2x', False):
+                pos.stop_price = price * 0.85  # 15% after first TP
+            elif getattr(pos, '_took_3x', False):
+                pos.stop_price = price * 0.90  # 10% after second TP
+            else:
+                pos.stop_price = price * (1 - TRAILING_STOP_PCT / 100)  # default 20%
 
-        # Stop hit
+        # ── TRAILING STOP HIT ──
         if price <= pos.stop_price:
-            log.warning(f"🛑 {pos.token.symbol} stop @ ${price:.10f}")
-            await self._sell(pos, price, "trailing_stop")
+            log.warning(f"🛑 {pos.token.symbol} stop @ ${price:.10f} (peak was ${pos.high_price:.10f})")
+            await self._sell(pos, price, "trailing_stop", sell_pct=100)
 
-    async def _sell(self, pos: Position, price: float, reason: str):
-        pos.status = "closed"
+    async def _sell(self, pos: Position, price: float, reason: str, sell_pct: int = 100):
+        """Sell a percentage of the position."""
+        tokens_to_sell = pos.tokens_held * (sell_pct / 100)
+
+        if sell_pct >= 100:
+            pos.status = "closed"
+
         pos.exit_price = price
         pos.exit_reason = reason
         pos.pnl_usd = (price - pos.entry_price) * pos.tokens_held
 
+        log.info(f"Selling {sell_pct}% of {pos.token.symbol} ({reason}) @ ${price:.10f}")
+
         if pos.token.mint and self.sol.pubkey:
-            async with aiohttp.ClientSession() as session:
-                bal_before = await self.sol.balance(session)
+            try:
+                async with aiohttp.ClientSession() as session:
+                    bal_before = await self.sol.balance(session)
 
-            token_amount = int(pos.tokens_held * 1e6)
-            order = await self.jup.order(pos.token.mint, WSOL, token_amount, self.sol.pubkey)
-            if order and order.get("transaction"):
-                signed = self.sol.sign_tx(order["transaction"])
-                if signed:
-                    result = await self.jup.execute(order["requestId"], signed)
-                    if result:
-                        log.info(f"Sell OK: {result.get('signature', '?')[:20]}")
+                token_amount = int(tokens_to_sell * 1e6)
+                order = await self.jup.order(pos.token.mint, WSOL, token_amount, self.sol.pubkey)
+                if order and order.get("transaction"):
+                    signed = self.sol.sign_tx(order["transaction"])
+                    if signed:
+                        result = await self.jup.execute(order["requestId"], signed)
+                        if result:
+                            status = result.get("status", "")
+                            sig = result.get("signature", "?")
+                            if status == "Failed":
+                                log.error(f"Sell failed: {result.get('error', '?')}")
+                            else:
+                                log.info(f"Sell TX: {sig[:25]}...")
 
-                    await asyncio.sleep(3)
-                    async with aiohttp.ClientSession() as session:
-                        bal_after = await self.sol.balance(session)
-                    expected = int(order.get("outAmount", 0)) / 1e9
-                    pos.sell_gas = max(0, expected - (bal_after - bal_before)) if expected > 0 else 0.005
+                        await asyncio.sleep(3)
+                        async with aiohttp.ClientSession() as session:
+                            bal_after = await self.sol.balance(session)
+                        expected = int(order.get("outAmount", 0)) / 1e9
+                        pos.sell_gas += max(0, expected - (bal_after - bal_before)) if expected > 0 else 0.003
+                else:
+                    log.error(f"No sell route for {pos.token.symbol}")
+            except Exception as e:
+                log.error(f"Sell error: {e}")
 
-        await self.discord.sold(pos)
-        log.info(f"Closed {pos.token.symbol}: P&L ${pos.pnl_usd:+.4f} [{reason}]")
+        # Update remaining tokens
+        pos.tokens_held -= tokens_to_sell
+
+        # Discord alert only on full close
+        if pos.status == "closed":
+            await self.discord.sold(pos)
+            log.info(f"Closed {pos.token.symbol}: P&L ${pos.pnl_usd:+.4f} [{reason}]")
 
 # ─── MAIN BOT ───────────────────────────────────────────────────────────────
 
@@ -516,7 +576,7 @@ class SniperBot:
         self.sol = Solana(SOLANA_RPC_URL, WALLET_PRIVATE_KEY)
         self.jup = Jupiter()
         self.discord = Discord(DISCORD_WEBHOOK_URL)
-        self.stops = StopManager(self.jup, self.sol, self.discord)
+        self.exits = ExitEngine(self.jup, self.sol, self.discord)
         self.detector = PoolDetector(self.sol, self._on_token)
         self.start = time.time()
 
@@ -537,7 +597,7 @@ class SniperBot:
 
         await asyncio.gather(
             self.detector.listen(),
-            self.stops.run(),
+            self.exits.run(),
             self._heartbeat(),
         )
 
@@ -545,9 +605,9 @@ class SniperBot:
         """Called when a real new token mint is detected. Runs quality filters."""
 
         # Limit: max 3 open positions at once (don't blow the whole wallet)
-        open_count = len([p for p in self.stops.positions if p.status == "open"])
-        if open_count >= 3:
-            log.info(f"⏸️ {token.mint[:16]}: 3 positions open, skipping")
+        open_count = len([p for p in self.exits.positions if p.status == "open"])
+        if open_count >= 2:
+            log.info(f"⏸️ {token.mint[:16]}: 2 positions open, skipping")
             return
 
         try:
@@ -658,7 +718,7 @@ class SniperBot:
             stop_price=price * (1 - TRAILING_STOP_PCT / 100),
             buy_gas=gas,
         )
-        self.stops.add(pos)
+        self.exits.add(pos)
         await self.discord.bought(pos)
         log.info(f"💰 BOUGHT {tokens:.2f} {token.symbol} @ ${price:.10f} | gas: {gas:.5f} SOL")
 
@@ -666,7 +726,7 @@ class SniperBot:
         while True:
             await asyncio.sleep(300)
             uptime = (time.time() - self.start) / 60
-            open_pos = len([p for p in self.stops.positions if p.status == "open"])
+            open_pos = len([p for p in self.exits.positions if p.status == "open"])
             log.info(f"💓 {self.detector.count} tokens, {open_pos} open, {uptime:.0f}m up")
 
 # ─── RUN ─────────────────────────────────────────────────────────────────────
