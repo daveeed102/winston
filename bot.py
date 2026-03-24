@@ -33,6 +33,7 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 SOLANA_WS_URL = os.getenv("SOLANA_WS_URL", "")  # auto-derived from RPC if blank
 WALLET_PRIVATE_KEY = os.getenv("WALLET_PRIVATE_KEY", "")
+JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "")
 
 # Safety filters
 MIN_LIQUIDITY_SOL = float(os.getenv("MIN_LIQUIDITY_SOL", "5"))     # min SOL in pool
@@ -53,10 +54,10 @@ USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
 KNOWN_MINTS = {WSOL_MINT, USDC_MINT, USDT_MINT}
 
-# Jupiter API — using Ultra API (api.jup.ag works on Railway, quote-api.jup.ag doesn't)
+# Jupiter Swap API V2 (api.jup.ag — works on Railway)
 JUPITER_PRICE_URL = "https://api.jup.ag/price/v2"
-JUPITER_ULTRA_ORDER_URL = "https://api.jup.ag/ultra/v1/order"
-JUPITER_ULTRA_EXECUTE_URL = "https://api.jup.ag/ultra/v1/execute"
+JUPITER_ORDER_URL = "https://api.jup.ag/swap/v2/order"
+JUPITER_EXECUTE_URL = "https://api.jup.ag/swap/v2/execute"
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 
@@ -506,7 +507,7 @@ class ChainListener:
         return unique
 
 
-# ─── JUPITER ULTRA API ───────────────────────────────────────────────────────
+# ─── JUPITER SWAP API V2 ─────────────────────────────────────────────────────
 
 class JupiterDEX:
     """
@@ -515,6 +516,9 @@ class JupiterDEX:
     """
 
     async def _get_session(self) -> aiohttp.ClientSession:
+        headers = {"Content-Type": "application/json"}
+        if JUPITER_API_KEY:
+            headers["x-api-key"] = JUPITER_API_KEY
         try:
             from aiohttp import TCPConnector
             from aiohttp.resolver import AsyncResolver
@@ -522,7 +526,7 @@ class JupiterDEX:
             connector = TCPConnector(resolver=resolver, ssl=False)
         except Exception:
             connector = aiohttp.TCPConnector(ssl=False)
-        return aiohttp.ClientSession(connector=connector)
+        return aiohttp.ClientSession(connector=connector, headers=headers)
 
     async def get_price(self, mint: str, session=None) -> Optional[float]:
         s = await self._get_session()
@@ -541,32 +545,31 @@ class JupiterDEX:
 
     async def get_order(self, input_mint: str, output_mint: str,
                         amount: int, taker: str, session=None) -> Optional[dict]:
-        """Get an order from Jupiter Ultra API — returns a transaction to sign."""
+        """GET /swap/v2/order — returns quote + unsigned transaction."""
         s = await self._get_session()
         try:
-            payload = {
+            params = {
                 "inputMint": input_mint,
                 "outputMint": output_mint,
                 "amount": str(amount),
                 "taker": taker,
-                "slippageBps": SLIPPAGE_BPS,
             }
-            async with s.post(
-                JUPITER_ULTRA_ORDER_URL, json=payload,
+            async with s.get(
+                JUPITER_ORDER_URL, params=params,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 body = await resp.text()
-                log.error(f"Ultra order error {resp.status}: {body}")
+                log.error(f"Order error {resp.status}: {body[:200]}")
         except Exception as e:
-            log.error(f"Ultra order failed: {e}")
+            log.error(f"Order failed: {e}")
         finally:
             await s.close()
         return None
 
     async def execute_order(self, request_id: str, signed_tx: str, session=None) -> Optional[dict]:
-        """Execute a signed order via Jupiter Ultra — Jupiter lands the transaction."""
+        """POST /swap/v2/execute — Jupiter lands the transaction."""
         s = await self._get_session()
         try:
             payload = {
@@ -574,15 +577,15 @@ class JupiterDEX:
                 "requestId": request_id,
             }
             async with s.post(
-                JUPITER_ULTRA_EXECUTE_URL, json=payload,
+                JUPITER_EXECUTE_URL, json=payload,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 body = await resp.text()
-                log.error(f"Ultra execute error {resp.status}: {body}")
+                log.error(f"Execute error {resp.status}: {body[:200]}")
         except Exception as e:
-            log.error(f"Ultra execute failed: {e}")
+            log.error(f"Execute failed: {e}")
         finally:
             await s.close()
         return None
