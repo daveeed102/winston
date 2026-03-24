@@ -800,16 +800,24 @@ class SniperBot:
             log.error(f"Low SOL: {bal_before:.4f}")
             return
 
-        price = await self.jupiter.get_price(token.mint, session)
-        if not price:
-            log.warning(f"No price for {token.mint[:16]}")
-            return
-
+        # Get quote first — this is what matters, not the price
         sol_lamports = int(TRADE_AMOUNT_SOL * 1e9)
         quote = await self.jupiter.get_quote(WSOL_MINT, token.mint, sol_lamports, session)
         if not quote:
             log.error(f"No route for {token.symbol}")
             return
+
+        # Estimate price from quote (tokens out / SOL in)
+        out_amount = int(quote.get("outAmount", 0))
+        decimals = int(quote.get("outputMint", {}).get("decimals", 6))
+        tokens = out_amount / (10 ** decimals) if decimals else out_amount
+        estimated_price = TRADE_AMOUNT_SOL / tokens if tokens > 0 else 0
+
+        # Try Jupiter price as bonus, fall back to estimate
+        price = await self.jupiter.get_price(token.mint, session)
+        if not price:
+            price = estimated_price
+            log.info(f"Using estimated price for {token.symbol}: ${price:.10f}")
 
         swap = await self.jupiter.execute_swap(quote, self.solana.pubkey, session)
         if not swap:
@@ -825,10 +833,6 @@ class SniperBot:
         gas_paid = bal_before - bal_after - TRADE_AMOUNT_SOL
         buy_gas = max(0, gas_paid)
 
-        out_amount = int(quote.get("outAmount", 0))
-        decimals = int(quote.get("outputMint", {}).get("decimals", 6))
-        tokens = out_amount / (10 ** decimals) if decimals else out_amount
-
         stop_pct = 30.0 if DEGEN_MODE else TRAILING_STOP_PCT
         pos = Position(
             token=token, entry_price=price, amount_tokens=tokens,
@@ -838,7 +842,7 @@ class SniperBot:
         )
         self.stop_mgr.add(pos)
         await self.discord.bought(pos)
-        log.info(f"✅ BOUGHT {tokens:.2f} {token.symbol} @ ${price:.8f} for {TRADE_AMOUNT_SOL} SOL (gas: {buy_gas:.6f})")
+        log.info(f"✅ BOUGHT {tokens:.2f} {token.symbol} @ ${price:.10f} for {TRADE_AMOUNT_SOL} SOL (gas: {buy_gas:.6f})")
 
     async def _heartbeat_loop(self):
         while True:
