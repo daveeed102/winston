@@ -94,19 +94,38 @@ class Jupiter:
         except: conn = aiohttp.TCPConnector(ssl=False)
         return aiohttp.ClientSession(connector=conn, headers=headers)
 
-    async def price(self, mint):
+    async def price(self, mint, tokens_held=0):
+        """
+        Get current price. Try price API first, fall back to quote-based pricing.
+        Quote-based: ask Jupiter "how much SOL for X tokens?" and calculate price.
+        """
+        # Strategy 1: Price API (fast but 404s on new tokens)
         s = await self._sess()
         try:
-            async with s.get(f"{JUP_PRICE}?ids={mint}", timeout=aiohttp.ClientTimeout(total=8)) as r:
+            async with s.get(f"{JUP_PRICE}?ids={mint}", timeout=aiohttp.ClientTimeout(total=5)) as r:
                 if r.status == 200:
                     d = await r.json()
                     p = d.get("data",{}).get(mint,{}).get("price")
-                    return float(p) if p else None
-                else:
-                    log.warning(f"Price API {r.status} for {mint[:16]}")
-        except Exception as e:
-            log.warning(f"Price err: {e}")
+                    if p: return float(p)
+        except: pass
         finally: await s.close()
+
+        # Strategy 2: Quote-based pricing (works on brand new tokens!)
+        # Ask "how much SOL for 10000 tokens?" then calculate price
+        test_amount = int(10000 * 1e6)  # 10k tokens in smallest unit
+        s2 = await self._sess()
+        try:
+            params = {"inputMint": mint, "outputMint": WSOL, "amount": str(test_amount)}
+            async with s2.get(JUP_ORDER, params=params, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    out_sol = int(d.get("outAmount", "0")) / 1e9
+                    if out_sol > 0:
+                        price_per_token = out_sol / 10000
+                        return price_per_token
+        except: pass
+        finally: await s2.close()
+
         return None
 
     async def order(self, inp, out, amount, taker):
@@ -330,13 +349,11 @@ class ExitEngine:
         price = await self.jup.price(pos.token.mint)
 
         if not price:
-            # Track consecutive failures
             pos._price_fails = getattr(pos, '_price_fails', 0) + 1
-            if pos._price_fails % 10 == 1:  # Log every 10th failure
-                log.warning(f"⚠️ {pos.token.mint[:16]}: price check failed ({pos._price_fails}x)")
-            # After 60 consecutive failures (2 min), force sell at entry price
-            if pos._price_fails >= 60:
-                log.error(f"💀 {pos.token.mint[:16]}: price dead for 2min — emergency sell")
+            if pos._price_fails % 30 == 1:
+                log.warning(f"⚠️ {pos.token.mint[:16]}: no price ({pos._price_fails}x)")
+            if pos._price_fails >= 90:  # 3 min with no price
+                log.error(f"💀 {pos.token.mint[:16]}: price dead 3min — emergency sell")
                 await self._sell(pos, pos.entry_price, "price_dead", 100)
             return
 
