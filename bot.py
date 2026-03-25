@@ -102,7 +102,10 @@ class Jupiter:
                     d = await r.json()
                     p = d.get("data",{}).get(mint,{}).get("price")
                     return float(p) if p else None
-        except: pass
+                else:
+                    log.warning(f"Price API {r.status} for {mint[:16]}")
+        except Exception as e:
+            log.warning(f"Price err: {e}")
         finally: await s.close()
         return None
 
@@ -325,20 +328,34 @@ class ExitEngine:
 
     async def _check(self, pos):
         price = await self.jup.price(pos.token.mint)
-        if not price: return
 
+        if not price:
+            # Track consecutive failures
+            pos._price_fails = getattr(pos, '_price_fails', 0) + 1
+            if pos._price_fails % 10 == 1:  # Log every 10th failure
+                log.warning(f"⚠️ {pos.token.mint[:16]}: price check failed ({pos._price_fails}x)")
+            # After 60 consecutive failures (2 min), force sell at entry price
+            if pos._price_fails >= 60:
+                log.error(f"💀 {pos.token.mint[:16]}: price dead for 2min — emergency sell")
+                await self._sell(pos, pos.entry_price, "price_dead", 100)
+            return
+
+        pos._price_fails = 0  # Reset on success
         gain_x = price / pos.entry_price if pos.entry_price > 0 else 1
+
+        # Log current state every check so we can see it's alive
+        log.info(f"👁️ {pos.token.mint[:12]} ${price:.8f} ({gain_x:.2f}x) stop=${pos.stop_price:.8f}")
 
         # Timeout
         if pos.expired:
-            log.warning(f"⏰ {pos.token.symbol} timeout — selling all")
+            log.warning(f"⏰ {pos.token.mint[:16]} timeout — selling all")
             await self._sell(pos, price, "timeout", 100)
             return
 
         # Take profit at 2x
         if gain_x >= 2.0 and not pos.took_2x:
             pos.took_2x = True
-            log.info(f"🎯 {pos.token.symbol} 2x! Selling 50% — house money")
+            log.info(f"🎯 HIT 2x! Selling 50% — house money secured")
             await self._sell(pos, price, "take_profit_2x", 50)
             pos.stop_price = pos.high_price * 0.85
             return
@@ -346,7 +363,7 @@ class ExitEngine:
         # Take profit at 3x
         if gain_x >= 3.0 and not pos.took_3x:
             pos.took_3x = True
-            log.info(f"🚀 {pos.token.symbol} 3x! Selling 50% more")
+            log.info(f"🚀 HIT 3x! Selling 50% more")
             await self._sell(pos, price, "take_profit_3x", 50)
             pos.stop_price = pos.high_price * 0.90
             return
