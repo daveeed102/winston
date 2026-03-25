@@ -403,12 +403,13 @@ class ExitEngine:
 
     async def _sell(self, pos, price, reason, pct):
         tokens_to_sell = pos.tokens_held * (pct / 100)
-        if pct >= 100: pos.status = "closed"
         pos.exit_price = price
         pos.exit_reason = reason
         pos.pnl_usd = (price - pos.entry_price) * pos.original_tokens
 
         log.info(f"Selling {pct}% of {pos.token.symbol} ({reason})")
+
+        sell_succeeded = False
 
         if pos.token.mint and self.sol.pubkey:
             try:
@@ -424,12 +425,21 @@ class ExitEngine:
                                 log.error(f"Sell failed: {result.get('error','?')}")
                             else:
                                 log.info(f"Sell TX: {result.get('signature','?')[:25]}...")
+                                sell_succeeded = True
                 else:
-                    log.error(f"No sell route for {pos.token.symbol}")
+                    log.error(f"No sell route for {pos.token.symbol} — position stays open")
+                    return  # ← bail early, don't touch position state
             except Exception as e:
                 log.error(f"Sell err: {e}")
 
+        if not sell_succeeded:
+            log.error(f"Sell did not complete for {pos.token.symbol} — position stays open")
+            return  # ← bail early, don't touch position state
+
+        # Only reach here if sell actually went through
         pos.tokens_held -= tokens_to_sell
+        if pct >= 100:
+            pos.status = "closed"
         await self.discord.sold(pos, reason, pct)
 
         if pos.status == "closed":
