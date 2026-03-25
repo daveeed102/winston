@@ -504,9 +504,24 @@ class Bot:
                     if parsed.get("freezeAuthority"):
                         log.info(f"⛔ {token.mint[:16]}: freeze authority active")
                         return
-                    # Get name/symbol
+                    # Get name/symbol from account info (often empty for new tokens)
                     if parsed.get("symbol"): token.symbol = parsed["symbol"]
                     if parsed.get("name"): token.name = parsed["name"]
+
+                # METADATA: Try Pump.fun API for name/symbol if still unknown
+                if token.symbol == "???" or token.name == "Unknown":
+                    try:
+                        async with sess.get(
+                            f"https://frontend-api.pump.fun/coins/{token.mint}",
+                            timeout=aiohttp.ClientTimeout(total=5)
+                        ) as r:
+                            if r.status == 200:
+                                meta = await r.json()
+                                if meta.get("symbol"): token.symbol = meta["symbol"]
+                                if meta.get("name"): token.name = meta["name"]
+                                log.info(f"🏷️ Got metadata: {token.symbol} / {token.name}")
+                    except Exception as e:
+                        log.warning(f"Metadata fetch failed: {e}")
 
                 # FILTER 4: Must have enough liquidity — test with a small quote
                 test_order = await self.jup.order(WSOL, token.mint, int(0.01 * 1e9), self.sol.pubkey)
