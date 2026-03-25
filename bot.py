@@ -464,17 +464,64 @@ class Bot:
             log.info(f"⏸️ {token.mint[:16]}: {MAX_OPEN_POSITIONS} positions open")
             return
 
-        # Quick safety check via Jupiter — if we can't get a quote, skip
+        # ─── QUALITY FILTERS ───
         async with aiohttp.ClientSession() as sess:
-            # Check top holder
             try:
-                res = await self.sol.balance(sess)  # Just verify RPC works
-            except: pass
+                # FILTER 1: Must have at least 10 holders (sign of real activity)
+                holders_res = await self._rpc(sess, "getTokenLargestAccounts", [token.mint])
+                holders = holders_res.get("result", {}).get("value", [])
+                holder_count = len(holders)
+                if holder_count < 10:
+                    log.info(f"⛔ {token.mint[:16]}: only {holder_count} holders (need 10+)")
+                    return
 
-        log.info(f"✅ Buying {token.mint[:16]}... ({token.source})")
+                # FILTER 2: Top holder can't own more than 50%
+                supply_res = await self._rpc(sess, "getTokenSupply", [token.mint])
+                supply = supply_res.get("result", {}).get("value", {})
+                total = float(supply.get("amount", "0"))
+                if total > 0 and holders:
+                    top = float(holders[0].get("amount", "0"))
+                    top_pct = (top / total) * 100
+                    if top_pct > MAX_TOP_HOLDER_PCT:
+                        log.info(f"⛔ {token.mint[:16]}: top holder {top_pct:.0f}%")
+                        return
+
+                # FILTER 3: Freeze authority check
+                acct_res = await self._rpc(sess, "getAccountInfo", [token.mint, {"encoding": "jsonParsed"}])
+                acct = acct_res.get("result", {}).get("value", {})
+                if acct:
+                    parsed = acct.get("data", {}).get("parsed", {}).get("info", {})
+                    if parsed.get("freezeAuthority"):
+                        log.info(f"⛔ {token.mint[:16]}: freeze authority active")
+                        return
+                    # Get name/symbol
+                    if parsed.get("symbol"): token.symbol = parsed["symbol"]
+                    if parsed.get("name"): token.name = parsed["name"]
+
+                # FILTER 4: Must have enough liquidity — test with a small quote
+                test_order = await self.jup.order(WSOL, token.mint, int(0.01 * 1e9), self.sol.pubkey)
+                if not test_order or not test_order.get("outAmount"):
+                    log.info(f"⛔ {token.mint[:16]}: no liquidity")
+                    return
+
+                log.info(f"✅ {token.symbol} passed filters ({holder_count} holders) — buying!")
+
+            except Exception as e:
+                log.warning(f"Filter err: {e}")
+                # If filters fail, still try — Jupiter will reject bad tokens
+
         if BUY_DELAY_SECONDS > 0:
             await asyncio.sleep(BUY_DELAY_SECONDS)
         await self._buy(token)
+
+    async def _rpc(self, sess, method, params):
+        """Quick RPC helper."""
+        try:
+            async with sess.post(self.sol.rpc, json={"jsonrpc":"2.0","id":1,"method":method,"params":params},
+                                 timeout=aiohttp.ClientTimeout(total=8)) as r:
+                return await r.json()
+        except:
+            return {}
 
     async def _buy(self, token):
         if not self.sol.pubkey: return
