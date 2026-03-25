@@ -23,7 +23,7 @@ import aiohttp
 
 TRADE_AMOUNT_SOL = float(os.getenv("TRADE_AMOUNT_SOL", "0.07"))
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "20"))
-MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "1"))
+MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "0.75"))
 SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "500"))
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "")
@@ -71,8 +71,11 @@ class Position:
     buy_gas: float = 0.0
     sell_gas: float = 0.0
     opened_ts: float = 0.0
+    took_1_5x: bool = False
     took_2x: bool = False
     took_3x: bool = False
+    took_5x: bool = False
+    took_10x: bool = False
     original_tokens: float = 0.0
     def __post_init__(self):
         if not self.opened_ts: self.opened_ts = time.time()
@@ -363,52 +366,88 @@ class ExitEngine:
         # Log current state every check so we can see it's alive
         log.info(f"👁️ {pos.token.mint[:12]} ${price:.8f} ({gain_x:.2f}x) stop=${pos.stop_price:.8f}")
 
-        # Timeout
+        # Timeout — 45 min max hold
         if pos.expired:
             log.warning(f"⏰ {pos.token.mint[:16]} timeout — selling all")
             await self._sell(pos, price, "timeout", 100)
             return
 
-        # Take profit at 2x
-        if gain_x >= 2.0 and not pos.took_2x:
-            pos.took_2x = True
-            log.info(f"🎯 HIT 2x! Selling 50% — house money secured")
-            await self._sell(pos, price, "take_profit_2x", 50)
-            pos.stop_price = pos.high_price * 0.85
+        # ─── LADDER EXIT STRATEGY ───────────────────────────────────────
+        # Sell 20% at each tier, tighten stop each time. Last 20% rides.
+        if gain_x >= 10.0 and not pos.took_10x:
+            pos.took_10x = True
+            log.info(f"🚀🚀 HIT 10x! Selling 20%")
+            await self._sell(pos, price, "take_profit_10x", 20)
+            pos.stop_price = pos.high_price * 0.93  # 7% trail
             return
 
-        # Take profit at 3x
+        if gain_x >= 5.0 and not pos.took_5x:
+            pos.took_5x = True
+            log.info(f"🚀 HIT 5x! Selling 20%")
+            await self._sell(pos, price, "take_profit_5x", 20)
+            pos.stop_price = pos.high_price * 0.92  # 8% trail
+            return
+
         if gain_x >= 3.0 and not pos.took_3x:
             pos.took_3x = True
-            log.info(f"🚀 HIT 3x! Selling 50% more")
-            await self._sell(pos, price, "take_profit_3x", 50)
-            pos.stop_price = pos.high_price * 0.90
+            log.info(f"🎯 HIT 3x! Selling 20%")
+            await self._sell(pos, price, "take_profit_3x", 20)
+            pos.stop_price = pos.high_price * 0.90  # 10% trail
             return
 
-        # Update high water mark
+        if gain_x >= 2.0 and not pos.took_2x:
+            pos.took_2x = True
+            log.info(f"🎯 HIT 2x! Selling 20%")
+            await self._sell(pos, price, "take_profit_2x", 20)
+            pos.stop_price = pos.high_price * 0.88  # 12% trail
+            return
+
+        if gain_x >= 1.5 and not pos.took_1_5x:
+            pos.took_1_5x = True
+            log.info(f"💰 HIT 1.5x! Selling 20% — locking early profit")
+            await self._sell(pos, price, "take_profit_1_5x", 20)
+            pos.stop_price = pos.high_price * 0.85  # 15% trail
+            return
+
+        # Update high water mark + trailing stop
         if price > pos.high_price:
             pos.high_price = price
-            if pos.took_3x:
+            if pos.took_10x:
+                pos.stop_price = price * 0.93
+            elif pos.took_5x:
+                pos.stop_price = price * 0.92
+            elif pos.took_3x:
                 pos.stop_price = price * 0.90
             elif pos.took_2x:
+                pos.stop_price = price * 0.88
+            elif pos.took_1_5x:
                 pos.stop_price = price * 0.85
             else:
                 pos.stop_price = price * (1 - TRAILING_STOP_PCT / 100)
             log.info(f"📈 {pos.token.symbol} ${price:.8f} (stop ${pos.stop_price:.8f})")
 
-        # Trailing stop
+        # Trailing stop — sell remainder
         if price <= pos.stop_price:
             log.warning(f"🛑 {pos.token.symbol} stop @ ${price:.8f}")
             await self._sell(pos, price, "trailing_stop", 100)
 
     async def _sell(self, pos, price, reason, pct):
+        # Guard: mintless ghost position — force-close so it stops spamming
+        if not pos.token.mint:
+            log.error(f"No mint on position — force-closing without sell (tokens unrecoverable)")
+            pos.status = "closed"
+            pos.tokens_held = 0
+            await self.discord.sold(pos, reason + "_no_mint", pct)
+            return
+
         tokens_to_sell = pos.tokens_held * (pct / 100)
-        if pct >= 100: pos.status = "closed"
         pos.exit_price = price
         pos.exit_reason = reason
         pos.pnl_usd = (price - pos.entry_price) * pos.original_tokens
 
         log.info(f"Selling {pct}% of {pos.token.symbol} ({reason})")
+
+        sell_succeeded = False
 
         if pos.token.mint and self.sol.pubkey:
             try:
@@ -424,12 +463,35 @@ class ExitEngine:
                                 log.error(f"Sell failed: {result.get('error','?')}")
                             else:
                                 log.info(f"Sell TX: {result.get('signature','?')[:25]}...")
+                                sell_succeeded = True
                 else:
-                    log.error(f"No sell route for {pos.token.symbol}")
+                    # No route yet — retry up to 3 times with increasing delay
+                    for attempt in range(1, 4):
+                        log.warning(f"No sell route for {pos.token.symbol} — retry {attempt}/3 in {attempt*3}s")
+                        await asyncio.sleep(attempt * 3)
+                        retry_order = await self.jup.order(pos.token.mint, WSOL, amount, self.sol.pubkey)
+                        if retry_order and retry_order.get("transaction"):
+                            signed = self.sol.sign(retry_order["transaction"])
+                            if signed:
+                                result = await self.jup.execute(retry_order["requestId"], signed)
+                                if result and result.get("status") != "Failed":
+                                    log.info(f"Sell TX (retry {attempt}): {result.get('signature','?')[:25]}...")
+                                    sell_succeeded = True
+                                    break
+                    if not sell_succeeded:
+                        log.error(f"No sell route after 3 retries for {pos.token.symbol} — position stays open")
+                        return
             except Exception as e:
                 log.error(f"Sell err: {e}")
 
+        if not sell_succeeded:
+            log.error(f"Sell did not complete for {pos.token.symbol} — position stays open")
+            return  # ← bail early, don't touch position state
+
+        # Only reach here if sell actually went through
         pos.tokens_held -= tokens_to_sell
+        if pct >= 100:
+            pos.status = "closed"
         await self.discord.sold(pos, reason, pct)
 
         if pos.status == "closed":
@@ -494,15 +556,42 @@ class Bot:
                     if parsed.get("freezeAuthority"):
                         log.info(f"⛔ {token.mint[:16]}: freeze authority active")
                         return
-                    # Get name/symbol
+                    # Get name/symbol from account info (often empty for new tokens)
                     if parsed.get("symbol"): token.symbol = parsed["symbol"]
                     if parsed.get("name"): token.name = parsed["name"]
+
+                # METADATA: Try Pump.fun API for name/symbol if still unknown
+                if token.symbol == "???" or token.name == "Unknown":
+                    try:
+                        async with sess.get(
+                            f"https://frontend-api.pump.fun/coins/{token.mint}",
+                            timeout=aiohttp.ClientTimeout(total=5)
+                        ) as r:
+                            if r.status == 200:
+                                meta = await r.json()
+                                if meta.get("symbol"): token.symbol = meta["symbol"]
+                                if meta.get("name"): token.name = meta["name"]
+                                log.info(f"🏷️ Got metadata: {token.symbol} / {token.name}")
+                    except Exception as e:
+                        log.warning(f"Metadata fetch failed: {e}")
 
                 # FILTER 4: Must have enough liquidity — test with a small quote
                 test_order = await self.jup.order(WSOL, token.mint, int(0.01 * 1e9), self.sol.pubkey)
                 if not test_order or not test_order.get("outAmount"):
                     log.info(f"⛔ {token.mint[:16]}: no liquidity")
                     return
+
+                # FILTER 5: Momentum check — price must be rising
+                price_before = await self.jup.price(token.mint)
+                if price_before:
+                    await asyncio.sleep(4)
+                    price_after = await self.jup.price(token.mint)
+                    if price_after:
+                        move_pct = ((price_after - price_before) / price_before) * 100
+                        if move_pct < 5.0:
+                            log.info(f"⛔ {token.mint[:16]}: no momentum ({move_pct:.1f}% in 4s)")
+                            return
+                        log.info(f"📈 {token.mint[:16]}: momentum +{move_pct:.1f}% ✅")
 
                 log.info(f"✅ {token.symbol} passed filters ({holder_count} holders) — buying!")
 
@@ -524,6 +613,9 @@ class Bot:
             return {}
 
     async def _buy(self, token):
+        if not token.mint:
+            log.error("Buy aborted — token has no mint address")
+            return
         if not self.sol.pubkey: return
         async with aiohttp.ClientSession() as sess:
             bal = await self.sol.balance(sess)
