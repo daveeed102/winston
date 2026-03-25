@@ -225,7 +225,6 @@ class Detector:
 
             log_text = " ".join(logs)
 
-            # Detect Pump.fun graduation OR Raydium new pool
             is_pumpfun = PUMPFUN in log_text and ("Withdraw" in log_text or "migrate" in log_text.lower())
             is_raydium = "initialize2" in log_text or "InitializeInstruction2" in log_text
 
@@ -235,16 +234,25 @@ class Detector:
             if sig in self.seen: return
             self.seen.add(sig)
 
-            # EXTRACT MINT DIRECTLY FROM LOGS — no getTransaction needed!
-            mint = self._extract_mint_from_logs(log_text)
+            source = "pumpfun" if is_pumpfun else "raydium"
+            log.info(f"🆕 {source.upper()} pool (tx: {sig[:20]}...)")
+
+            # Extract mint — try getTransaction with 5 retries at 2s intervals
+            mint = None
+            async with aiohttp.ClientSession() as sess:
+                for attempt in range(5):
+                    mint = await self._extract_mint(sig, sess)
+                    if mint:
+                        break
+                    await asyncio.sleep(2)
 
             if not mint or mint in self.seen:
+                log.warning(f"No mint from {sig[:16]}")
                 return
 
             self.seen.add(mint)
             self.count += 1
 
-            source = "pumpfun" if is_pumpfun else "raydium"
             token = Token(mint=mint, source=source)
             log.info(f"🎯 {source.upper()} → {mint[:24]}...")
 
@@ -253,40 +261,39 @@ class Detector:
         except Exception as e:
             log.warning(f"Handle: {e}")
 
-    def _extract_mint_from_logs(self, log_text: str) -> Optional[str]:
-        """
-        Extract token mint from log text.
-        Strategy 1: Pump.fun mints always end with 'pump' — regex match.
-        Strategy 2: Look for base58 addresses in logs that aren't known programs.
-        """
-        # Strategy 1: Pump.fun mint (ends with "pump")
-        matches = PUMP_MINT_RE.findall(log_text)
-        if matches:
-            # Return the first unique pump mint
-            for m in matches:
-                if m not in self.seen and len(m) >= 32:
+    async def _extract_mint(self, sig: str, sess: aiohttp.ClientSession) -> Optional[str]:
+        """Fetch parsed transaction and find the token mint from postTokenBalances."""
+        try:
+            payload = {"jsonrpc":"2.0","id":1,"method":"getTransaction",
+                       "params":[sig,{"encoding":"jsonParsed","maxSupportedTransactionVersion":0}]}
+            async with sess.post(self.sol.rpc, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                data = await r.json()
+            
+            tx = data.get("result")
+            if not tx:
+                return None
+
+            meta = tx.get("meta", {})
+            if not meta or meta.get("err"):
+                return None
+
+            skip = {WSOL, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"}
+
+            # postTokenBalances — most reliable
+            for bal in meta.get("postTokenBalances", []):
+                m = bal.get("mint", "")
+                if m and m not in skip:
                     return m
 
-        # Strategy 2: For Raydium, find base58 addresses in log lines
-        # that contain "InitializeMint" or token-related keywords
-        known = {PUMPFUN, RAYDIUM_AMM, WSOL,
-                 "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-                 "11111111111111111111111111111111",
-                 "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
-                 "ComputeBudget111111111111111111111111111111",
-                 "SysvarRent111111111111111111111111111111111"}
+            # preTokenBalances
+            for bal in meta.get("preTokenBalances", []):
+                m = bal.get("mint", "")
+                if m and m not in skip:
+                    return m
 
-        # Look for addresses in "Program log:" lines
-        for word in log_text.split():
-            clean = word.strip(",.;:()[]{}\"'")
-            if (32 <= len(clean) <= 44
-                and all(c in "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz" for c in clean)
-                and clean not in known
-                and clean != WSOL
-                and not clean.startswith("AAAA")
-                and not clean.startswith("FAAA")):
-                return clean
-
+        except Exception:
+            pass
         return None
 
 # ─── EXIT ENGINE ─────────────────────────────────────────────────────────────
