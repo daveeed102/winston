@@ -465,8 +465,22 @@ class ExitEngine:
                                 log.info(f"Sell TX: {result.get('signature','?')[:25]}...")
                                 sell_succeeded = True
                 else:
-                    log.error(f"No sell route for {pos.token.symbol} — position stays open")
-                    return  # ← bail early, don't touch position state
+                    # No route yet — retry up to 3 times with increasing delay
+                    for attempt in range(1, 4):
+                        log.warning(f"No sell route for {pos.token.symbol} — retry {attempt}/3 in {attempt*3}s")
+                        await asyncio.sleep(attempt * 3)
+                        retry_order = await self.jup.order(pos.token.mint, WSOL, amount, self.sol.pubkey)
+                        if retry_order and retry_order.get("transaction"):
+                            signed = self.sol.sign(retry_order["transaction"])
+                            if signed:
+                                result = await self.jup.execute(retry_order["requestId"], signed)
+                                if result and result.get("status") != "Failed":
+                                    log.info(f"Sell TX (retry {attempt}): {result.get('signature','?')[:25]}...")
+                                    sell_succeeded = True
+                                    break
+                    if not sell_succeeded:
+                        log.error(f"No sell route after 3 retries for {pos.token.symbol} — position stays open")
+                        return
             except Exception as e:
                 log.error(f"Sell err: {e}")
 
