@@ -23,7 +23,7 @@ import aiohttp
 
 TRADE_AMOUNT_SOL = float(os.getenv("TRADE_AMOUNT_SOL", "0.07"))
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "20"))
-MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "1"))
+MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "0.75"))
 SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "500"))
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "")
@@ -71,8 +71,11 @@ class Position:
     buy_gas: float = 0.0
     sell_gas: float = 0.0
     opened_ts: float = 0.0
+    took_1_5x: bool = False
     took_2x: bool = False
     took_3x: bool = False
+    took_5x: bool = False
+    took_10x: bool = False
     original_tokens: float = 0.0
     def __post_init__(self):
         if not self.opened_ts: self.opened_ts = time.time()
@@ -363,45 +366,80 @@ class ExitEngine:
         # Log current state every check so we can see it's alive
         log.info(f"👁️ {pos.token.mint[:12]} ${price:.8f} ({gain_x:.2f}x) stop=${pos.stop_price:.8f}")
 
-        # Timeout
+        # Timeout — 45 min max hold
         if pos.expired:
             log.warning(f"⏰ {pos.token.mint[:16]} timeout — selling all")
             await self._sell(pos, price, "timeout", 100)
             return
 
-        # Take profit at 2x
-        if gain_x >= 2.0 and not pos.took_2x:
-            pos.took_2x = True
-            log.info(f"🎯 HIT 2x! Selling 50% — house money secured")
-            await self._sell(pos, price, "take_profit_2x", 50)
-            pos.stop_price = pos.high_price * 0.85
+        # ─── LADDER EXIT STRATEGY ───────────────────────────────────────
+        # Sell 20% at each tier, tighten stop each time. Last 20% rides.
+        if gain_x >= 10.0 and not pos.took_10x:
+            pos.took_10x = True
+            log.info(f"🚀🚀 HIT 10x! Selling 20%")
+            await self._sell(pos, price, "take_profit_10x", 20)
+            pos.stop_price = pos.high_price * 0.93  # 7% trail
             return
 
-        # Take profit at 3x
+        if gain_x >= 5.0 and not pos.took_5x:
+            pos.took_5x = True
+            log.info(f"🚀 HIT 5x! Selling 20%")
+            await self._sell(pos, price, "take_profit_5x", 20)
+            pos.stop_price = pos.high_price * 0.92  # 8% trail
+            return
+
         if gain_x >= 3.0 and not pos.took_3x:
             pos.took_3x = True
-            log.info(f"🚀 HIT 3x! Selling 50% more")
-            await self._sell(pos, price, "take_profit_3x", 50)
-            pos.stop_price = pos.high_price * 0.90
+            log.info(f"🎯 HIT 3x! Selling 20%")
+            await self._sell(pos, price, "take_profit_3x", 20)
+            pos.stop_price = pos.high_price * 0.90  # 10% trail
             return
 
-        # Update high water mark
+        if gain_x >= 2.0 and not pos.took_2x:
+            pos.took_2x = True
+            log.info(f"🎯 HIT 2x! Selling 20%")
+            await self._sell(pos, price, "take_profit_2x", 20)
+            pos.stop_price = pos.high_price * 0.88  # 12% trail
+            return
+
+        if gain_x >= 1.5 and not pos.took_1_5x:
+            pos.took_1_5x = True
+            log.info(f"💰 HIT 1.5x! Selling 20% — locking early profit")
+            await self._sell(pos, price, "take_profit_1_5x", 20)
+            pos.stop_price = pos.high_price * 0.85  # 15% trail
+            return
+
+        # Update high water mark + trailing stop
         if price > pos.high_price:
             pos.high_price = price
-            if pos.took_3x:
+            if pos.took_10x:
+                pos.stop_price = price * 0.93
+            elif pos.took_5x:
+                pos.stop_price = price * 0.92
+            elif pos.took_3x:
                 pos.stop_price = price * 0.90
             elif pos.took_2x:
+                pos.stop_price = price * 0.88
+            elif pos.took_1_5x:
                 pos.stop_price = price * 0.85
             else:
                 pos.stop_price = price * (1 - TRAILING_STOP_PCT / 100)
             log.info(f"📈 {pos.token.symbol} ${price:.8f} (stop ${pos.stop_price:.8f})")
 
-        # Trailing stop
+        # Trailing stop — sell remainder
         if price <= pos.stop_price:
             log.warning(f"🛑 {pos.token.symbol} stop @ ${price:.8f}")
             await self._sell(pos, price, "trailing_stop", 100)
 
     async def _sell(self, pos, price, reason, pct):
+        # Guard: mintless ghost position — force-close so it stops spamming
+        if not pos.token.mint:
+            log.error(f"No mint on position — force-closing without sell (tokens unrecoverable)")
+            pos.status = "closed"
+            pos.tokens_held = 0
+            await self.discord.sold(pos, reason + "_no_mint", pct)
+            return
+
         tokens_to_sell = pos.tokens_held * (pct / 100)
         pos.exit_price = price
         pos.exit_reason = reason
@@ -561,6 +599,9 @@ class Bot:
             return {}
 
     async def _buy(self, token):
+        if not token.mint:
+            log.error("Buy aborted — token has no mint address")
+            return
         if not self.sol.pubkey: return
         async with aiohttp.ClientSession() as sess:
             bal = await self.sol.balance(sess)
