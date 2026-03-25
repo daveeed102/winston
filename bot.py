@@ -504,6 +504,18 @@ class Bot:
                     log.info(f"⛔ {token.mint[:16]}: no liquidity")
                     return
 
+                # FILTER 5: Momentum check — price must be rising
+                price_before = await self.jup.price(token.mint)
+                if price_before:
+                    await asyncio.sleep(4)
+                    price_after = await self.jup.price(token.mint)
+                    if price_after:
+                        move_pct = ((price_after - price_before) / price_before) * 100
+                        if move_pct < 5.0:
+                            log.info(f"⛔ {token.mint[:16]}: no momentum ({move_pct:.1f}% in 4s)")
+                            return
+                        log.info(f"📈 {token.mint[:16]}: momentum +{move_pct:.1f}% ✅")
+
                 log.info(f"✅ {token.symbol} passed filters ({holder_count} holders) — buying!")
 
             except Exception as e:
