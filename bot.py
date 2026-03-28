@@ -1,23 +1,17 @@
 """
-DEGEN SNIPER v9 -- Ladder Exits, % Discord, House Money Runner
-===============================================================
-New in v9:
-  1. LADDER SELL STRATEGY -- instead of one hard exit, scale out:
-       Tier 1 (+25%): sell 50% of position -> locked profit, de-risked
-       Tier 2 (+50%): sell 50% of remaining (25% original) -> 75% secured
-       Runner (25% original): rides with TIGHT 20% trailing stop
-         catches moonshots with zero downside risk to original capital
-       Timeout: sell whatever remains at MAX_HOLD_MINUTES
-  2. DISCORD % ONLY -- all messages show % gain/loss, no dollar amounts.
-  3. Position tracks partial sells: tokens_held shrinks each ladder step.
-
+DEGEN SNIPER v7 — One At A Time, +25% Or Out
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Strategy:
-  1. Detect Pump.fun graduation -> Raydium migration
-  2. Hard filters: holders, top-3 concentration, freeze, liquidity floor
-  3. Momentum confirmation: live quote price must be rising (not cached)
-  4. Buy full -> Tier 1 sell at +25% -> Tier 2 at +50% -> runner rides
-  5. Early loss cut at 90s if down >12%
-  6. Cooldown -> repeat
+  1. Scan for a fresh token
+  2. Buy it — LOCK IN, ignore all other tokens until resolved
+  3. Sell 100% when ANY of these trigger:
+       a) Price hits 1.25x entry (+25% profit target) ← primary goal
+       b) 2-minute timer expires (cut losses, move on)
+       c) Trailing stop hit (protect capital on fast dumps)
+  4. Repeat
+
+No partial sells. No ladder. Clean in, clean out.
+One coin at a time — full focus, full position.
 """
 
 import asyncio
@@ -31,44 +25,21 @@ from typing import Optional
 
 import aiohttp
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
+# ─── CONFIG ──────────────────────────────────────────────────────────────────
 
-TRADE_AMOUNT_SOL   = float(os.getenv("TRADE_AMOUNT_SOL",   "0.061"))
-TRAILING_STOP_PCT  = float(os.getenv("TRAILING_STOP_PCT",  "35"))
-MAX_HOLD_MINUTES   = float(os.getenv("MAX_HOLD_MINUTES",   "3"))
-SLIPPAGE_BPS       = int(os.getenv("SLIPPAGE_BPS",         "1000"))
-PROFIT_TARGET_X    = float(os.getenv("PROFIT_TARGET_X",    "1.25"))  # Tier 1 trigger
-MIN_MOMENTUM_PCT   = float(os.getenv("MIN_MOMENTUM_PCT",   "8"))
-MIN_LIQUIDITY_SOL  = float(os.getenv("MIN_LIQUIDITY_SOL",  "1.0"))
-MAX_TOP_HOLDER_PCT = float(os.getenv("MAX_TOP_HOLDER_PCT", "40"))
-BUY_DELAY_SECONDS  = float(os.getenv("BUY_DELAY_SECONDS",  "0"))
-DEGEN_MODE         = os.getenv("DEGEN_MODE", "true").lower() == "true"
-
-# ── LADDER SELL CONFIG ────────────────────────────────────────────────────────
-# Tier 1: at PROFIT_TARGET_X (+25%), sell this fraction
-LADDER_T1_FRACTION = 0.50   # sell 50% at +25%  -> profit locked, still riding
-# Tier 2: at LADDER_T2_X (+50%), sell this fraction of REMAINING tokens
-LADDER_T2_X        = 1.50   # trigger at 1.5x entry (+50%)
-LADDER_T2_FRACTION = 0.50   # sell 50% of remaining = 25% of original
-# Runner: last ~25% of original position -- rides with tighter stop + more time
-RUNNER_STOP_PCT    = 20.0   # tight trailing stop on runner (20% below its high)
-RUNNER_MAX_MINUTES = 8.0    # runner gets up to 8 min total from entry
-
-# ── FEE CONFIG ────────────────────────────────────────────────────────────────
-# ~5000 lamports/sig, 2 sigs/tx, up to 4 sell txs + 1 buy
-ESTIMATED_FEES_SOL  = 0.000015 + (TRADE_AMOUNT_SOL * 0.001)
-BREAKEVEN_X         = (TRADE_AMOUNT_SOL + ESTIMATED_FEES_SOL * 2) / TRADE_AMOUNT_SOL
-
-# ── OTHER CONFIG ──────────────────────────────────────────────────────────────
-TRADE_COOLDOWN_SECS   = 8
-EARLY_LOSS_EXIT_PCT   = 12.0   # cut full position if down this % at checkpoint
-EARLY_EXIT_AFTER_SECS = 90
-STOP_ENGAGE_PCT       = 3.0    # main stop only engages after +3%
+TRADE_AMOUNT_SOL  = float(os.getenv("TRADE_AMOUNT_SOL",   "0.061"))
+TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT",  "25"))   # wider — memecoins are volatile   # % below entry/high before bail
+MAX_HOLD_MINUTES  = float(os.getenv("MAX_HOLD_MINUTES",   "2"))    # hard timeout
+SLIPPAGE_BPS      = int(os.getenv("SLIPPAGE_BPS",         "500"))
+PROFIT_TARGET_X   = float(os.getenv("PROFIT_TARGET_X",    "1.25")) # sell ALL at 1.25x
+MIN_MOMENTUM_PCT  = float(os.getenv("MIN_MOMENTUM_PCT",   "5"))   # min % rise in 3s before buying
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 SOLANA_RPC_URL      = os.getenv("SOLANA_RPC_URL",      "")
 WALLET_PRIVATE_KEY  = os.getenv("WALLET_PRIVATE_KEY",  "")
 JUPITER_API_KEY     = os.getenv("JUPITER_API_KEY",     "")
+MAX_TOP_HOLDER_PCT  = float(os.getenv("MAX_TOP_HOLDER_PCT", "50"))
+BUY_DELAY_SECONDS   = float(os.getenv("BUY_DELAY_SECONDS",  "0"))
 
 PUMPFUN     = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 RAYDIUM_AMM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
@@ -85,50 +56,41 @@ logging.basicConfig(
 )
 log = logging.getLogger("sniper")
 
-# ── MODELS ────────────────────────────────────────────────────────────────────
+# ─── MODELS ──────────────────────────────────────────────────────────────────
 
 @dataclass
 class Token:
-    mint:   str
+    mint: str
     symbol: str = "???"
-    name:   str = "Unknown"
+    name: str = "Unknown"
     source: str = ""
 
 @dataclass
 class Position:
-    token:          Token
-    entry_price:    float = 0.0
-    tokens_held:    float = 0.0   # decreases as we ladder out
-    cost_sol:       float = 0.0   # original SOL spent
-    high_price:     float = 0.0
-    stop_price:     float = 0.0
-    stop_engaged:   bool  = False
-    t1_done:        bool  = False  # Tier 1 sell executed
-    t2_done:        bool  = False  # Tier 2 sell executed
-    is_runner:      bool  = False  # True once both tiers are done
-    opened_ts:      float = 0.0
-    sol_recouped:   float = 0.0    # total SOL received from partial sells
+    token: Token
+    entry_price: float = 0.0
+    tokens_held: float = 0.0
+    cost_sol: float = 0.0
+    high_price: float = 0.0
+    stop_price: float = 0.0
+    opened_ts: float = 0.0
 
     def __post_init__(self):
-        if not self.opened_ts:
-            self.opened_ts = time.time()
+        if not self.opened_ts: self.opened_ts = time.time()
 
     @property
     def hold_secs(self): return time.time() - self.opened_ts
     @property
     def hold_mins(self):  return self.hold_secs / 60
     @property
-    def timed_out(self):
-        limit = RUNNER_MAX_MINUTES if self.is_runner else MAX_HOLD_MINUTES
-        return self.hold_secs >= limit * 60
+    def timed_out(self):  return self.hold_secs >= MAX_HOLD_MINUTES * 60
 
-# ── JUPITER ───────────────────────────────────────────────────────────────────
+# ─── JUPITER ─────────────────────────────────────────────────────────────────
 
 class Jupiter:
     def _headers(self):
         h = {"Content-Type": "application/json"}
-        if JUPITER_API_KEY:
-            h["x-api-key"] = JUPITER_API_KEY
+        if JUPITER_API_KEY: h["x-api-key"] = JUPITER_API_KEY
         return h
 
     async def _sess(self):
@@ -142,7 +104,8 @@ class Jupiter:
             conn = aiohttp.TCPConnector(ssl=False, limit=10)
         return aiohttp.ClientSession(connector=conn, headers=self._headers())
 
-    async def price(self, mint) -> Optional[float]:
+    async def price(self, mint):
+        # Try price API first
         s = await self._sess()
         try:
             async with s.get(f"{JUP_PRICE}?ids={mint}",
@@ -150,20 +113,39 @@ class Jupiter:
                 if r.status == 200:
                     d = await r.json()
                     p = d.get("data", {}).get(mint, {}).get("price")
-                    if p:
-                        return float(p)
-        except:
-            pass
-        finally:
-            await s.close()
-        return await self.quote_price(mint)
+                    if p: return float(p)
+        except: pass
+        finally: await s.close()
 
-    async def quote_price(self, mint) -> Optional[float]:
-        """Live AMM quote -- bypasses cached price API entirely."""
+        # Quote-based fallback (works on brand new tokens)
+        s2 = await self._sess()
+        try:
+            params = {"inputMint": mint, "outputMint": WSOL, "amount": str(int(10000 * 1e6))}
+            async with s2.get(JUP_ORDER, params=params,
+                              timeout=aiohttp.ClientTimeout(total=6)) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    out_sol = int(d.get("outAmount", "0")) / 1e9
+                    if out_sol > 0: return out_sol / 10000
+        except: pass
+        finally: await s2.close()
+        return None
+
+    async def quote_price(self, mint):
+        """
+        LIVE quote-based price — bypasses the Jupiter price API cache entirely.
+        Used for momentum checks where stale cached prices return 0.0% movement.
+        Asks the AMM directly: how much SOL for 10k tokens right now?
+        Returns price per token in SOL, or None if no route.
+        """
         s = await self._sess()
         try:
-            params = {"inputMint": mint, "outputMint": WSOL,
-                      "amount": str(int(1_000_000 * 1e6))}
+            # Use a meaningful amount — 1M tokens to get a stable quote
+            params = {
+                "inputMint": mint,
+                "outputMint": WSOL,
+                "amount": str(int(1_000_000 * 1e6))
+            }
             async with s.get(JUP_ORDER, params=params,
                              timeout=aiohttp.ClientTimeout(total=6)) as r:
                 if r.status == 200:
@@ -171,11 +153,15 @@ class Jupiter:
                     out_sol = int(d.get("outAmount", "0")) / 1e9
                     if out_sol > 0:
                         return out_sol / 1_000_000
+                    # outAmount was 0 — try smaller amount (low liquidity)
+                else:
+                    log.debug(f"quote_price {r.status} for {mint[:16]}")
         except Exception as e:
-            log.debug(f"quote_price 1M err: {e}")
+            log.debug(f"quote_price err: {e}")
         finally:
             await s.close()
-        # Fallback with smaller amount for thin pools
+
+        # Fallback: try with 10k tokens
         s2 = await self._sess()
         try:
             params = {"inputMint": mint, "outputMint": WSOL,
@@ -187,66 +173,40 @@ class Jupiter:
                     out_sol = int(d.get("outAmount", "0")) / 1e9
                     if out_sol > 0:
                         return out_sol / 10_000
-        except:
-            pass
+        except: pass
         finally:
             await s2.close()
         return None
 
-    async def order(self, inp, out, amount, taker) -> Optional[dict]:
+    async def order(self, inp, out, amount, taker):
         s = await self._sess()
         try:
-            params = {"inputMint": inp, "outputMint": out,
-                      "amount": str(amount), "taker": taker,
-                      "slippageBps": str(SLIPPAGE_BPS)}
+            params = {
+                "inputMint": inp, "outputMint": out,
+                "amount": str(amount), "taker": taker,
+                "slippageBps": str(SLIPPAGE_BPS)
+            }
             async with s.get(JUP_ORDER, params=params,
                              timeout=aiohttp.ClientTimeout(total=12)) as r:
-                if r.status == 200:
-                    return await r.json()
+                if r.status == 200: return await r.json()
                 log.error(f"Jup order {r.status}: {(await r.text())[:200]}")
-        except Exception as e:
-            log.error(f"Jup order: {e}")
-        finally:
-            await s.close()
+        except Exception as e: log.error(f"Jup order: {e}")
+        finally: await s.close()
         return None
 
-    async def execute(self, req_id, signed_b64) -> Optional[dict]:
+    async def execute(self, req_id, signed_b64):
         s = await self._sess()
         try:
             async with s.post(JUP_EXECUTE,
                 json={"signedTransaction": signed_b64, "requestId": req_id},
                 timeout=aiohttp.ClientTimeout(total=30)) as r:
-                if r.status == 200:
-                    return await r.json()
+                if r.status == 200: return await r.json()
                 log.error(f"Jup exec {r.status}: {(await r.text())[:200]}")
-        except Exception as e:
-            log.error(f"Jup exec: {e}")
-        finally:
-            await s.close()
+        except Exception as e: log.error(f"Jup exec: {e}")
+        finally: await s.close()
         return None
 
-    async def liquidity_sol(self, mint) -> float:
-        """Estimate SOL pool depth via price impact of a 1 SOL buy."""
-        s = await self._sess()
-        try:
-            params = {"inputMint": WSOL, "outputMint": mint,
-                      "amount": str(int(1 * 1e9)),
-                      "taker": "11111111111111111111111111111111"}
-            async with s.get(JUP_ORDER, params=params,
-                             timeout=aiohttp.ClientTimeout(total=6)) as r:
-                if r.status == 200:
-                    d = await r.json()
-                    impact = float(d.get("priceImpactPct", "100") or "100")
-                    if impact <= 0:
-                        return 999.0
-                    return 1.0 / (impact / 100.0)
-        except Exception as e:
-            log.debug(f"liquidity_sol err: {e}")
-        finally:
-            await s.close()
-        return 0.0
-
-# ── SOLANA ────────────────────────────────────────────────────────────────────
+# ─── SOLANA ──────────────────────────────────────────────────────────────────
 
 class Solana:
     def __init__(self, rpc, pk):
@@ -255,17 +215,14 @@ class Solana:
         self.keypair = self.pubkey = None
         if pk:
             try:
-                from solders.keypair import Keypair
-                import base58
+                from solders.keypair import Keypair; import base58
                 self.keypair = Keypair.from_bytes(base58.b58decode(pk))
                 self.pubkey  = str(self.keypair.pubkey())
                 log.info(f"Wallet: {self.pubkey[:8]}...{self.pubkey[-4:]}")
-            except Exception as e:
-                log.error(f"Wallet load: {e}")
+            except Exception as e: log.error(f"Wallet load: {e}")
 
-    async def balance(self, sess) -> float:
-        if not self.pubkey:
-            return 0.0
+    async def balance(self, sess):
+        if not self.pubkey: return 0.0
         try:
             async with sess.post(self.rpc,
                 json={"jsonrpc": "2.0", "id": 1, "method": "getBalance",
@@ -273,37 +230,38 @@ class Solana:
                 timeout=aiohttp.ClientTimeout(total=10)) as r:
                 d = await r.json()
                 return d.get("result", {}).get("value", 0) / 1e9
-        except:
-            return 0.0
+        except: return 0.0
 
-    def sign(self, tx_b64) -> Optional[str]:
-        if not self.keypair:
-            return None
+    def sign(self, tx_b64):
+        if not self.keypair: return None
         try:
             from solders.transaction import VersionedTransaction
             raw    = b64.b64decode(tx_b64)
             txn    = VersionedTransaction.from_bytes(raw)
             signed = VersionedTransaction(txn.message, [self.keypair])
             return b64.b64encode(bytes(signed)).decode()
-        except Exception as e:
-            log.error(f"Sign: {e}")
-            return None
+        except Exception as e: log.error(f"Sign: {e}"); return None
 
-# ── DISCORD ───────────────────────────────────────────────────────────────────
+# ─── DISCORD ─────────────────────────────────────────────────────────────────
 
 class Discord:
     def __init__(self, url):
         self.url = url
-        self._sol_price = 150.0
+        self._sol_price = 150.0  # fallback, refreshed on each trade
 
-    async def _fetch_sol_price(self) -> float:
+    async def _fetch_sol_price(self):
+        """Get current SOL/USD from Jupiter price API."""
         try:
             async with aiohttp.ClientSession() as s:
-                async with s.get(f"https://api.jup.ag/price/v2?ids={WSOL}",
-                                 timeout=aiohttp.ClientTimeout(total=5)) as r:
+                async with s.get(
+                    "https://api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112",
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as r:
                     if r.status == 200:
                         d = await r.json()
-                        p = d.get("data", {}).get(WSOL, {}).get("price")
+                        p = (d.get("data", {})
+                               .get("So11111111111111111111111111111111111111112", {})
+                               .get("price"))
                         if p:
                             self._sol_price = float(p)
         except:
@@ -311,130 +269,98 @@ class Discord:
         return self._sol_price
 
     async def send(self, payload):
-        if not self.url:
-            return
+        """Send with retries — fixes the Discord connection dropping after 2h."""
+        if not self.url: return
         for attempt in range(3):
             try:
                 async with aiohttp.ClientSession() as s:
-                    r = await s.post(self.url, json=payload,
-                                     timeout=aiohttp.ClientTimeout(total=10))
+                    r = await s.post(
+                        self.url, json=payload,
+                        timeout=aiohttp.ClientTimeout(total=10)
+                    )
                     await r.release()
                     return
             except Exception as e:
                 if attempt == 2:
-                    log.debug(f"Discord send failed: {e}")
+                    log.debug(f"Discord send failed after 3 attempts: {e}")
                 await asyncio.sleep(1)
 
     def _label(self, p: "Position") -> str:
+        """Human-readable name — never shows ???"""
         if p.token.symbol and p.token.symbol != "???":
             return p.token.symbol
         if p.token.name and p.token.name not in ("Unknown", ""):
             return p.token.name[:12]
         return p.token.mint[:8] + "..."
 
-    def _pct_str(self, gain_x: float) -> str:
-        """Convert a gain multiplier to a clean % string: +25%, -8%, etc."""
-        pct = (gain_x - 1.0) * 100
-        return f"+{pct:.1f}%" if pct >= 0 else f"{pct:.1f}%"
-
     async def bought(self, p: "Position"):
-        label = self._label(p)
-        t1_pct = (PROFIT_TARGET_X - 1) * 100
-        t2_pct = (LADDER_T2_X - 1) * 100
+        sol_usd   = await self._fetch_sol_price()
+        spent_usd = p.cost_sol * sol_usd
+        label     = self._label(p)
+        target_usd = spent_usd * PROFIT_TARGET_X
         await self.send({"embeds": [{
             "title": f"💰 BOUGHT — {label}",
             "color": 0x00AAFF,
             "description": (
-                f"Entry locked in. Ladder exits armed:\n"
-                f"**Tier 1** +{t1_pct:.0f}% → sell {LADDER_T1_FRACTION*100:.0f}%\n"
-                f"**Tier 2** +{t2_pct:.0f}% → sell half of remaining\n"
-                f"**Runner** rides with {RUNNER_STOP_PCT:.0f}% trailing stop"
+                f"Spent **${spent_usd:.2f}** ({p.cost_sol:.4f} SOL)
+"
+                f"🎯 Target: **${target_usd:.2f}** (+{(PROFIT_TARGET_X-1)*100:.0f}%)"
             ),
             "fields": [
-                {"name": "Stop Engages", "value": f"After +{STOP_ENGAGE_PCT:.0f}%",          "inline": True},
-                {"name": "Timeout",      "value": f"Tiers {MAX_HOLD_MINUTES}m / Runner {RUNNER_MAX_MINUTES:.0f}m", "inline": True},
-                {"name": "Chart",        "value": f"[Solscan](https://solscan.io/token/{p.token.mint})", "inline": True},
+                {"name": "Stop Loss",  "value": f"{TRAILING_STOP_PCT}% trailing",  "inline": True},
+                {"name": "Timeout",    "value": f"{MAX_HOLD_MINUTES} min",          "inline": True},
+                {"name": "Chart",      "value": f"[Solscan](https://solscan.io/token/{p.token.mint})", "inline": True},
             ]
         }]})
 
-    async def partial_sold(self, p: "Position", tier: str, gain_x: float, frac_sold: float):
-        """Notify of a ladder sell (Tier 1 or Tier 2)."""
-        label    = self._label(p)
-        pct_str  = self._pct_str(gain_x)
-        is_win   = gain_x >= 1.0
-        color    = 0x00FF88 if is_win else 0xFF4444
-        sold_pct = frac_sold * 100
-        await self.send({"embeds": [{
-            "title": f"📤 {tier} SOLD — {label}",
-            "color": color,
-            "description": (
-                f"Sold **{sold_pct:.0f}%** of position at **{pct_str}**\n"
-                f"Profit locked. Remainder still riding."
-            ),
-            "fields": [
-                {"name": "Gain",   "value": pct_str,                                                     "inline": True},
-                {"name": "Held",   "value": f"{p.hold_mins:.1f} min",                                    "inline": True},
-                {"name": "Chart",  "value": f"[Solscan](https://solscan.io/token/{p.token.mint})",       "inline": True},
-            ]
-        }]})
-
-    async def sold(self, p: "Position", reason: str, gain_x: float, is_runner: bool = False):
-        """Final close-out notification (runner exit or full sell)."""
-        label   = self._label(p)
-        pct_str = self._pct_str(gain_x)
-        is_win  = gain_x >= BREAKEVEN_X
-        color   = 0x00FF88 if is_win else 0xFF4444
-
-        if is_runner:
-            emoji = "🚀 RUNNER CLOSED" if is_win else "🏳️ RUNNER STOPPED"
-        else:
-            emoji = "✅ PROFIT" if is_win else "❌ LOSS"
-
+    async def sold(self, p: "Position", reason: str, gain_x: float, pnl_sol: float):
+        sol_usd   = await self._fetch_sol_price()
+        spent_usd = p.cost_sol * sol_usd
+        pnl_usd   = pnl_sol * sol_usd
+        sell_usd  = spent_usd + pnl_usd
+        label     = self._label(p)
+        is_profit = pnl_usd >= 0
+        color     = 0x00FF88 if is_profit else 0xFF4444
+        emoji     = "✅ PROFIT" if is_profit else "❌ LOSS"
+        pnl_str   = f"+${pnl_usd:.2f}" if is_profit else f"-${abs(pnl_usd):.2f}"
         reason_map = {
-            "timeout":       "⏰ Timeout",
-            "trailing_stop": "🛑 Trailing stop",
-            "early_loss":    "✂️ Early loss cut",
+            "timeout_2min":  "⏰ 2-min timeout",
+            "trailing_stop": "🛑 Stop loss",
             "price_dead":    "💀 No price feed",
-            "runner_stop":   "🛑 Runner stop",
-            "runner_timeout":"⏰ Runner timeout",
         }
         reason_clean = reason_map.get(reason, f"🎯 {reason}")
-
-        # Build a summary line based on what tiers fired
-        summary_parts = []
-        if p.t1_done:
-            summary_parts.append(f"T1 sold at +{(PROFIT_TARGET_X-1)*100:.0f}%")
-        if p.t2_done:
-            summary_parts.append(f"T2 sold at +{(LADDER_T2_X-1)*100:.0f}%")
-        summary_parts.append(f"Final at {pct_str}")
-        summary = " | ".join(summary_parts)
-
         await self.send({"embeds": [{
             "title": f"{emoji} — {label}",
             "color": color,
             "description": (
-                f"**{pct_str}** final exit after {p.hold_mins:.1f}min\n"
-                f"{summary}"
+                f"Bought for **${spent_usd:.2f}** → Sold for **${sell_usd:.2f}**
+"
+                f"**{pnl_str}** ({gain_x:.3f}x) in {p.hold_mins:.1f}min"
             ),
             "fields": [
-                {"name": "Reason", "value": reason_clean,                                              "inline": True},
-                {"name": "Tiers",  "value": f"T1={'done' if p.t1_done else 'skip'} T2={'done' if p.t2_done else 'skip'}", "inline": True},
-                {"name": "Chart",  "value": f"[Solscan](https://solscan.io/token/{p.token.mint})",    "inline": True},
+                {"name": "Reason",   "value": reason_clean,                  "inline": True},
+                {"name": "SOL P&L",  "value": f"{pnl_sol:+.5f} SOL",        "inline": True},
+                {"name": "Chart",    "value": f"[Solscan](https://solscan.io/token/{p.token.mint})", "inline": True},
             ]
         }]})
 
     async def info(self, msg: str):
         await self.send({"content": msg})
 
-# ── DETECTOR ──────────────────────────────────────────────────────────────────
+# ─── DETECTOR ────────────────────────────────────────────────────────────────
 
 class Detector:
+    """
+    Listens to Pump.fun + Raydium WebSocket logs.
+    When locked=True the bot already has a position — all incoming tokens
+    are silently dropped so we stay focused on the live trade.
+    """
     def __init__(self, sol):
-        self.sol    = sol
-        self.seen   = set()
-        self.count  = 0
-        self.queue  = asyncio.Queue()
-        self.locked = False
+        self.sol   = sol
+        self.seen  = set()
+        self.count = 0
+        self.queue = asyncio.Queue()  # tokens ready to evaluate
+        self.locked = False            # True while a position is open
 
     async def listen(self):
         while True:
@@ -442,7 +368,7 @@ class Detector:
                 log.info("Connecting WS...")
                 async with aiohttp.ClientSession() as sess:
                     async with sess.ws_connect(self.sol.ws, heartbeat=30) as ws:
-                        log.info("WebSocket connected -- scanning for pools")
+                        log.info("WebSocket connected — scanning for pools")
                         await ws.send_json({
                             "jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
                             "params": [{"mentions": [PUMPFUN]}, {"commitment": "confirmed"}]
@@ -453,32 +379,43 @@ class Detector:
                         })
                         async for msg in ws:
                             if msg.type == aiohttp.WSMsgType.TEXT:
+                                # Do NOT use create_task here — that runs handlers
+                                # in parallel so multiple events all see locked=False
+                                # and queue multiple tokens. Handle sequentially.
                                 await self._handle(msg.data)
                             elif msg.type in (aiohttp.WSMsgType.ERROR,
                                              aiohttp.WSMsgType.CLOSED):
                                 break
             except Exception as e:
                 log.error(f"WS error: {e}")
-            log.info("WS disconnected -- reconnecting in 5s")
+            log.info("WS disconnected — reconnecting in 5s")
             await asyncio.sleep(5)
 
     async def _handle(self, raw):
+        # Drop immediately if locked — we have a position, don't care
         if self.locked:
             return
+
         try:
-            data  = json.loads(raw)
-            if "params" not in data:
-                return
+            data = json.loads(raw)
+            if "params" not in data: return
             value = data["params"]["result"].get("value", {})
             logs  = value.get("logs", [])
             sig   = value.get("signature", "")
-            if not logs or not sig:
-                return
-            if sig in self.seen:
-                return
+            if not logs or not sig: return
+            if sig in self.seen: return
 
             log_text = " ".join(logs)
 
+            # Only process Pump.fun events
+            if PUMPFUN not in log_text: return
+
+            # Detect Pump.fun GRADUATION events — this is when a coin
+            # migrates from Pump.fun to Raydium and gets real liquidity added.
+            # This is a consistent pump trigger: bots and traders pile in
+            # at graduation, creating momentum we can ride.
+            # "Withdraw" + PUMPFUN = graduation/migration to Raydium.
+            # Also catch Raydium pool initializations directly.
             is_graduation = (
                 PUMPFUN in log_text and
                 ("Withdraw" in log_text or "migrate" in log_text.lower())
@@ -493,8 +430,10 @@ class Detector:
 
             self.seen.add(sig)
             source = "pumpfun" if is_graduation else "raydium"
-            log.info(f"GRADUATION detected ({source}) -- tx {sig[:20]}...")
+            log.info(f"GRADUATION detected ({source}) — tx {sig[:20]}...")
 
+            # Strategy 1: getTransaction (most reliable — RPC tells us exactly
+            # which token moved). Retry up to 5x with short waits.
             mint = None
             async with aiohttp.ClientSession() as sess:
                 for attempt in range(10):
@@ -504,13 +443,16 @@ class Detector:
                         break
                     await asyncio.sleep(2)
 
+            # Strategy 2: Parse directly from the WebSocket log strings.
+            # Pump.fun graduation logs always contain the token mint address
+            # ending in "pump". We scan specifically for that pattern.
             if not mint:
                 mint = self._mint_from_logs(logs, source)
                 if mint:
                     log.info(f"Mint via log scan: {mint[:20]}...")
 
             if not mint:
-                log.warning(f"No mint from {sig[:16]} -- skipping")
+                log.warning(f"No mint from {sig[:16]} — skipping")
                 return
 
             if mint in self.seen:
@@ -523,12 +465,16 @@ class Detector:
 
             if not self.locked and self.queue.empty():
                 await self.queue.put(token)
-                self.locked = True
+                self.locked = True  # Lock now so no other handler queues while we process
 
         except Exception as e:
             log.warning(f"Handle err: {e}")
 
-    async def _extract_mint(self, sig, sess) -> Optional[str]:
+    async def _extract_mint(self, sig: str, sess: aiohttp.ClientSession) -> Optional[str]:
+        """
+        Fetch the transaction and pull the token mint from postTokenBalances.
+        Returns None if the RPC hasn't indexed the tx yet (result is null).
+        """
         try:
             payload = {
                 "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
@@ -538,62 +484,85 @@ class Detector:
             async with sess.post(self.sol.rpc, json=payload,
                                  timeout=aiohttp.ClientTimeout(total=8)) as r:
                 data = await r.json()
+
             tx = data.get("result")
             if not tx:
-                return None
+                return None  # Not indexed yet — caller will retry
+
             meta = tx.get("meta", {})
             if not meta or meta.get("err"):
                 return None
+
             skip = {WSOL,
                     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
                     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"}
+
             for bal in meta.get("postTokenBalances", []):
                 m = bal.get("mint", "")
                 if m and m not in skip:
                     return m
+
             for bal in meta.get("preTokenBalances", []):
                 m = bal.get("mint", "")
                 if m and m not in skip:
                     return m
+
         except Exception as e:
             log.debug(f"extract_mint err: {e}")
         return None
 
+    # Known Solana program/system addresses — never valid token mints
     _KNOWN_PROGRAMS = {
-        WSOL, PUMPFUN, RAYDIUM_AMM,
-        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
-        "11111111111111111111111111111111",
-        "ComputeBudget111111111111111111111111111111",
-        "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
-        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-        "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
-        "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",
-        "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
-        "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",
-        "SysvarRent111111111111111111111111111111111",
-        "SysvarC1ock11111111111111111111111111111111",
+        WSOL,
+        PUMPFUN,
+        RAYDIUM_AMM,
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+        "11111111111111111111111111111111",                # System
+        "ComputeBudget111111111111111111111111111111",     # Compute budget
+        "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL", # Associated token
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  # Token program
+        "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",  # Token-2022
+        "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",  # Pump fee
+        "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  # Pump.fun (dup)
+        "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",  # Metaplex
+        "SysvarRent111111111111111111111111111111111",    # Sysvar
+        "SysvarC1ock11111111111111111111111111111111",    # Sysvar clock
     }
 
-    def _mint_from_logs(self, logs, source) -> Optional[str]:
+    def _mint_from_logs(self, logs: list, source: str) -> Optional[str]:
+        """
+        Fallback: extract mint directly from WebSocket log strings.
+        Only used when getTransaction hasn't indexed yet.
+
+        Pump.fun token mints ALWAYS end with 'pump' — this is a protocol
+        invariant, not a coincidence. No Solana program address ends in 'pump'.
+        So for pumpfun source we can scan specifically for that pattern.
+        """
         import re
+
+        # For Pump.fun graduations: mint always ends in "pump"
         if source == "pumpfun":
-            pump_re = re.compile(r'([1-9A-HJ-NP-Za-km-z]{32,44}pump)')
+            pump_re = re.compile(r'([1-9A-HJ-NP-Za-km-z]{32,44}pump)')
             for line in logs:
                 for m in pump_re.finditer(line):
                     addr = m.group(1)
                     if addr not in self._KNOWN_PROGRAMS:
                         return addr
+
+        # For Raydium: scan for 43-44 char base58 addresses not in known programs
         b58 = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
-        addr_re = re.compile(r'([1-9A-HJ-NP-Za-km-z]{43,44})')
+        addr_re = re.compile(r'([1-9A-HJ-NP-Za-km-z]{43,44})')
         for line in logs:
             for m in addr_re.finditer(line):
                 addr = m.group(1)
-                if addr not in self._KNOWN_PROGRAMS and all(c in b58 for c in addr):
+                if (addr not in self._KNOWN_PROGRAMS and
+                        all(c in b58 for c in addr)):
                     return addr
+
         return None
 
-# ── BOT ───────────────────────────────────────────────────────────────────────
+# ─── BOT ─────────────────────────────────────────────────────────────────────
 
 class Bot:
     def __init__(self):
@@ -605,18 +574,15 @@ class Bot:
         self.trades_won  = 0
         self.trades_lost = 0
         self.total_pnl   = 0.0
-        self._rug_blacklist: set = set()
 
     async def run(self):
-        log.info("=" * 62)
-        log.info("  DEGEN SNIPER v9 -- Ladder Exits + % Discord")
+        log.info("=" * 55)
+        log.info("  DEGEN SNIPER v7 — One At A Time")
         log.info(f"  {TRADE_AMOUNT_SOL} SOL/trade")
-        log.info(f"  Tier 1: sell {LADDER_T1_FRACTION*100:.0f}% at +{(PROFIT_TARGET_X-1)*100:.0f}%")
-        log.info(f"  Tier 2: sell half remaining at +{(LADDER_T2_X-1)*100:.0f}%")
-        log.info(f"  Runner: {RUNNER_STOP_PCT:.0f}% trailing stop, {RUNNER_MAX_MINUTES:.0f}min max")
-        log.info(f"  Momentum: +{MIN_MOMENTUM_PCT:.0f}% | Min liq: {MIN_LIQUIDITY_SOL} SOL")
-        log.info(f"  Early loss: -{EARLY_LOSS_EXIT_PCT:.0f}% at {EARLY_EXIT_AFTER_SECS}s")
-        log.info("=" * 62)
+        log.info(f"  Target: {PROFIT_TARGET_X}x (+25%) — sell ALL")
+        log.info(f"  Timeout: {MAX_HOLD_MINUTES}min | Stop: {TRAILING_STOP_PCT}%")
+        log.info(f"  Jupiter key: {'SET' if JUPITER_API_KEY else 'MISSING'}")
+        log.info("=" * 55)
 
         async with aiohttp.ClientSession() as s:
             if self.sol.pubkey:
@@ -629,156 +595,143 @@ class Bot:
             self._heartbeat(),
         )
 
-    # ── MAIN TRADE LOOP ───────────────────────────────────────────────────────
+    # ── MAIN TRADE LOOP ──────────────────────────────────────────────────────
 
     async def _trade_loop(self):
-        log.info("Trade loop ready -- waiting for first token")
+        """
+        Single sequential loop:
+          wait for token -> filter -> buy -> watch -> sell -> repeat
+        While a position is open, detector.locked = True so no new
+        tokens are queued.
+        """
+        log.info("Trade loop ready — waiting for first token")
         while True:
+            # Block until a token arrives
             token = await self.detector.queue.get()
+
+            # Lock — stop queueing new tokens
             self.detector.locked = True
-            log.info(f"LOCKED IN on {token.mint[:20]}...")
+            log.info(f"LOCKED IN on {token.mint[:20]}... — ignoring other tokens")
 
             try:
-                if token.mint in self._rug_blacklist:
-                    log.info(f"SKIP {token.mint[:16]}: blacklisted rug")
-                    continue
-
+                # Filter
                 passed = await self._filter(token)
                 if not passed:
-                    log.info(f"SKIP {token.mint[:16]} -- failed filters")
+                    log.info(f"SKIP {token.mint[:16]} — failed filters, looking again")
+                    self.detector.locked = False
                     continue
 
-                if MIN_MOMENTUM_PCT > 0:
-                    momentum_ok = await self._check_momentum(token)
-                    if not momentum_ok:
-                        log.info(f"SKIP {token.mint[:16]}: momentum too weak (<{MIN_MOMENTUM_PCT}%)")
-                        continue
+                # No momentum filter — graduation itself is the signal.
+                # The trailing stop (25%) and 2-min timeout protect capital.
+                log.info(f"Filters passed for {token.symbol} — buying on graduation signal")
 
+                # Buy
                 pos = await self._buy(token)
                 if not pos:
-                    log.info(f"BUY FAILED for {token.symbol} -- unlocking")
+                    log.info(f"BUY FAILED for {token.symbol} — unlocking, looking again")
+                    self.detector.locked = False
                     continue
 
-                reason = await self._watch(pos)
-
-                if reason in ("trailing_stop", "early_loss", "runner_stop"):
-                    self._rug_blacklist.add(token.mint)
-                    log.info(f"Blacklisted {token.mint[:16]} after {reason}")
+                # Watch until exit
+                await self._watch(pos)
 
             except Exception as e:
                 log.error(f"Trade loop error: {e}")
                 import traceback; traceback.print_exc()
             finally:
+                # Always unlock — even if something crashes
                 self.detector.locked = False
-                log.info("UNLOCKED -- scanning for next coin")
+                log.info("UNLOCKED — scanning for next coin")
+                # Drain stale tokens that queued during the trade
                 while not self.detector.queue.empty():
                     try: self.detector.queue.get_nowait()
                     except: break
                 log.info(f"Stats: {self.trades_won}W / {self.trades_lost}L | "
                          f"Net {self.total_pnl:+.5f} SOL")
-                if TRADE_COOLDOWN_SECS > 0:
-                    log.info(f"Cooldown {TRADE_COOLDOWN_SECS}s...")
-                    await asyncio.sleep(TRADE_COOLDOWN_SECS)
 
-    # ── FILTER ────────────────────────────────────────────────────────────────
+    # ── FILTER ───────────────────────────────────────────────────────────────
 
     async def _filter(self, token: Token) -> bool:
+        """Quick parallel filter — holder count, freeze, liquidity."""
         async with aiohttp.ClientSession() as sess:
             try:
-                holder_task  = asyncio.create_task(
-                    self._rpc(sess, "getTokenLargestAccounts", [token.mint]))
-                acct_task    = asyncio.create_task(
+                holder_task = asyncio.create_task(
+                    self._rpc(sess, "getTokenLargestAccounts", [token.mint])
+                )
+                acct_task = asyncio.create_task(
                     self._rpc(sess, "getAccountInfo",
-                              [token.mint, {"encoding": "jsonParsed"}]))
-                liq_task     = asyncio.create_task(
-                    self.jup.order(WSOL, token.mint, int(0.005 * 1e9), self.sol.pubkey))
-                liq_sol_task = asyncio.create_task(
-                    self.jup.liquidity_sol(token.mint))
+                              [token.mint, {"encoding": "jsonParsed"}])
+                )
+                liq_task = asyncio.create_task(
+                    self.jup.order(WSOL, token.mint,
+                                   int(0.005 * 1e9), self.sol.pubkey)
+                )
 
-                holders_res, acct_res, liq_order, liq_sol = await asyncio.gather(
-                    holder_task, acct_task, liq_task, liq_sol_task,
-                    return_exceptions=True)
+                holders_res, acct_res, liq_order = await asyncio.gather(
+                    holder_task, acct_task, liq_task, return_exceptions=True
+                )
 
+                # Holder count
                 if isinstance(holders_res, Exception) or not holders_res:
-                    log.info(f"SKIP {token.mint[:16]}: holder RPC failed"); return False
+                    log.info(f"SKIP {token.mint[:16]}: holder RPC failed")
+                    return False
                 holders = holders_res.get("result", {}).get("value", [])
                 if len(holders) < 5:
-                    log.info(f"SKIP {token.mint[:16]}: only {len(holders)} holders"); return False
+                    log.info(f"SKIP {token.mint[:16]}: only {len(holders)} holders")
+                    return False
 
+                # Top holder concentration
                 supply_res = await self._rpc(sess, "getTokenSupply", [token.mint])
-                total = float(supply_res.get("result", {}).get("value", {}).get("amount", "0"))
+                total = float(supply_res.get("result", {})
+                                        .get("value", {})
+                                        .get("amount", "0"))
                 if total > 0 and holders:
-                    top1     = float(holders[0].get("amount", "0"))
-                    top1_pct = (top1 / total) * 100
-                    if top1_pct > MAX_TOP_HOLDER_PCT:
-                        log.info(f"SKIP {token.mint[:16]}: top holder {top1_pct:.0f}%"); return False
-                    top3_pct = (sum(float(h.get("amount","0")) for h in holders[:3]) / total) * 100
-                    if top3_pct > 60:
-                        log.info(f"SKIP {token.mint[:16]}: top-3 = {top3_pct:.0f}% (rug risk)"); return False
+                    top     = float(holders[0].get("amount", "0"))
+                    top_pct = (top / total) * 100
+                    if top_pct > MAX_TOP_HOLDER_PCT:
+                        log.info(f"SKIP {token.mint[:16]}: top holder {top_pct:.0f}%")
+                        return False
 
+                # Freeze authority + grab name/symbol
                 if not isinstance(acct_res, Exception) and acct_res:
                     acct = acct_res.get("result", {}).get("value", {})
                     if acct:
-                        parsed = acct.get("data", {}).get("parsed", {}).get("info", {})
+                        parsed = (acct.get("data", {})
+                                      .get("parsed", {})
+                                      .get("info", {}))
                         if parsed.get("freezeAuthority"):
-                            log.info(f"SKIP {token.mint[:16]}: freeze authority"); return False
+                            log.info(f"SKIP {token.mint[:16]}: freeze authority")
+                            return False
                         if parsed.get("symbol"): token.symbol = parsed["symbol"]
                         if parsed.get("name"):   token.name   = parsed["name"]
 
+                # Liquidity check
                 if (isinstance(liq_order, Exception) or not liq_order
                         or not liq_order.get("outAmount")):
-                    log.info(f"SKIP {token.mint[:16]}: no liquidity route"); return False
+                    log.info(f"SKIP {token.mint[:16]}: no liquidity")
+                    return False
 
-                if not isinstance(liq_sol, Exception) and liq_sol < MIN_LIQUIDITY_SOL:
-                    log.info(f"SKIP {token.mint[:16]}: liq ~{liq_sol:.2f} SOL < floor"); return False
-
+                # Fetch metadata from Pump.fun — always try, not just when ???
                 try:
-                    async with sess.get(f"https://frontend-api.pump.fun/coins/{token.mint}",
-                                        timeout=aiohttp.ClientTimeout(total=4)) as r:
+                    async with sess.get(
+                        f"https://frontend-api.pump.fun/coins/{token.mint}",
+                        timeout=aiohttp.ClientTimeout(total=4)
+                    ) as r:
                         if r.status == 200:
                             meta = await r.json()
                             if meta.get("symbol"): token.symbol = meta["symbol"]
                             if meta.get("name"):   token.name   = meta["name"]
                 except: pass
 
-                label = (token.symbol if token.symbol != "???"
-                         else (token.name[:10] if token.name != "Unknown" else token.mint[:8]))
-                liq_display = liq_sol if not isinstance(liq_sol, Exception) else 0
-                log.info(f"PASS {label} ({token.mint[:16]}) -- "
-                         f"{len(holders)} holders, liq ~{liq_display:.1f} SOL")
+                label = token.symbol if token.symbol != "???" else (token.name[:10] if token.name != "Unknown" else token.mint[:8])
+                log.info(f"PASS {label} ({token.mint[:16]}) — {len(holders)} holders")
                 return True
 
             except Exception as e:
                 log.warning(f"Filter error: {e}")
                 return False
 
-    # ── MOMENTUM CHECK ────────────────────────────────────────────────────────
-
-    async def _check_momentum(self, token: Token) -> bool:
-        log.info(f"Checking momentum for {token.symbol}...")
-        p1 = await self.jup.quote_price(token.mint)
-        if not p1:
-            log.info("  No price p1 -- skipping (will buy)")
-            return True
-        await asyncio.sleep(3)
-        p2 = await self.jup.quote_price(token.mint)
-        if not p2:
-            log.info("  No price p2 -- skipping (will buy)")
-            return True
-        change_pct = ((p2 - p1) / p1) * 100
-        log.info(f"  Momentum: {change_pct:+.1f}%")
-        if change_pct >= MIN_MOMENTUM_PCT:
-            return True
-        await asyncio.sleep(2)
-        p3 = await self.jup.quote_price(token.mint)
-        if p3:
-            change_pct2 = ((p3 - p1) / p1) * 100
-            log.info(f"  Momentum retry: {change_pct2:+.1f}%")
-            if change_pct2 >= MIN_MOMENTUM_PCT:
-                return True
-        return False
-
-    # ── BUY ───────────────────────────────────────────────────────────────────
+    # ── BUY ──────────────────────────────────────────────────────────────────
 
     async def _buy(self, token: Token) -> Optional[Position]:
         if not self.sol.pubkey:
@@ -787,9 +740,8 @@ class Bot:
         async with aiohttp.ClientSession() as sess:
             bal = await self.sol.balance(sess)
 
-        min_needed = TRADE_AMOUNT_SOL + ESTIMATED_FEES_SOL + 0.003
-        if bal < min_needed:
-            log.error(f"Low balance: {bal:.4f} SOL -- need {min_needed:.4f}")
+        if bal < TRADE_AMOUNT_SOL + 0.005:
+            log.error(f"Low balance: {bal:.4f} SOL — need {TRADE_AMOUNT_SOL + 0.005:.4f}")
             return None
 
         if BUY_DELAY_SECONDS > 0:
@@ -803,6 +755,7 @@ class Bot:
         tx_b64  = order.get("transaction", "")
         req_id  = order.get("requestId", "")
         out_amt = int(order.get("outAmount", "0"))
+
         if not tx_b64 or not req_id:
             log.error("Bad Jupiter order response"); return None
 
@@ -818,14 +771,13 @@ class Bot:
         sig = result.get("signature", "?")
         log.info(f"BUY TX: {sig[:35]}...")
 
+        # Wait for chain then get real price
         await asyncio.sleep(2)
         async with aiohttp.ClientSession() as sess:
             bal_after = await self.sol.balance(sess)
 
         tokens = out_amt / 1e6
-        price  = await self.jup.quote_price(token.mint)
-        if not price:
-            price = await self.jup.price(token.mint)
+        price  = await self.jup.price(token.mint)
         if not price:
             price = TRADE_AMOUNT_SOL / tokens if tokens > 0 else 0.0
 
@@ -837,31 +789,24 @@ class Bot:
             tokens_held = tokens,
             cost_sol    = TRADE_AMOUNT_SOL,
             high_price  = price,
-            stop_price  = 0.0,
-            stop_engaged = False,
+            stop_price  = price * (1 - TRAILING_STOP_PCT / 100),
         )
         await self.discord.bought(pos)
         log.info(f"BOUGHT {tokens:.0f} {token.symbol} @ ${price:.10f}")
-        log.info(f"  T1 at +{(PROFIT_TARGET_X-1)*100:.0f}%  T2 at +{(LADDER_T2_X-1)*100:.0f}%  Runner rides")
-        log.info(f"  Gas: {gas:.5f} SOL")
+        log.info(f"  Target: ${price * PROFIT_TARGET_X:.10f} | "
+                 f"Stop: ${pos.stop_price:.10f} | Gas: {gas:.5f} SOL")
         return pos
 
-    # ── WATCH + LADDER EXIT ───────────────────────────────────────────────────
+    # ── WATCH + EXIT ──────────────────────────────────────────────────────────
 
-    async def _watch(self, pos: Position) -> str:
+    async def _watch(self, pos: Position):
         """
-        Main watch loop. Executes the ladder sell strategy:
-          - Tier 1 at PROFIT_TARGET_X: sell LADDER_T1_FRACTION of position
-          - Tier 2 at LADDER_T2_X: sell LADDER_T2_FRACTION of remaining
-          - Runner: remaining tokens ride with RUNNER_STOP_PCT trailing stop
-          - Early loss cut at EARLY_EXIT_AFTER_SECS if down EARLY_LOSS_EXIT_PCT
-          - Timeout at MAX_HOLD_MINUTES (or RUNNER_MAX_MINUTES once runner mode)
-        Returns the final exit reason string.
+        Poll price every 1s.
+        Exit on: 1.25x target hit | 2-min timeout | trailing stop.
         """
-        log.info(f"WATCHING {pos.token.symbol} | "
-                 f"T1=+{(PROFIT_TARGET_X-1)*100:.0f}% T2=+{(LADDER_T2_X-1)*100:.0f}% Runner rides")
-        price_fails    = 0
-        early_cut_done = False
+        log.info(f"WATCHING {pos.token.symbol} — target {PROFIT_TARGET_X}x "
+                 f"in {MAX_HOLD_MINUTES}min or stop out")
+        price_fails = 0
 
         while True:
             await asyncio.sleep(1)
@@ -871,130 +816,53 @@ class Bot:
             if not price:
                 price_fails += 1
                 if price_fails % 15 == 1:
-                    log.warning(f"No price {pos.token.symbol} ({price_fails}x)")
+                    log.warning(f"No price for {pos.token.symbol} ({price_fails}x)")
+                # If price totally dead for 1 min, emergency sell
                 if price_fails >= 60:
-                    log.error(f"Price dead 60s -- emergency sell {pos.token.symbol}")
-                    await self._sell_all(pos, pos.entry_price, "price_dead")
-                    return "price_dead"
+                    log.error(f"Price dead 60s — emergency sell {pos.token.symbol}")
+                    await self._sell(pos, pos.entry_price, "price_dead")
+                    return
                 continue
 
             price_fails = 0
             gain_x = price / pos.entry_price if pos.entry_price > 0 else 1.0
-            pct_str = self.discord._pct_str(gain_x)
 
-            log.info(f"  {pos.token.symbol:8s} {pct_str:>8s} "
-                     f"stop={'RUN' if pos.is_runner else ('ON' if pos.stop_engaged else 'off')} "
-                     f"held={pos.hold_mins:.1f}m "
-                     f"{'[RUNNER]' if pos.is_runner else ''}")
+            log.info(f"  {pos.token.symbol:8s} ${price:.8f} "
+                     f"({gain_x:.3f}x) stop=${pos.stop_price:.8f} "
+                     f"held={pos.hold_mins:.1f}m")
 
-            # ── TIER 1: first take-profit ─────────────────────────────────
-            if not pos.t1_done and gain_x >= PROFIT_TARGET_X:
-                log.info(f"TIER 1 HIT {pct_str} -- selling {LADDER_T1_FRACTION*100:.0f}% of {pos.token.symbol}")
-                await self._sell_partial(pos, LADDER_T1_FRACTION, price, "Tier 1")
-                await self.discord.partial_sold(pos, "TIER 1", gain_x, LADDER_T1_FRACTION)
-                pos.t1_done = True
+            # ── EXIT 1: Profit target hit ─────────────────────────────────
+            if gain_x >= PROFIT_TARGET_X:
+                log.info(f"TARGET HIT {gain_x:.3f}x — selling all {pos.token.symbol}!")
+                await self._sell(pos, price, f"profit_{gain_x:.2f}x")
+                return
 
-            # ── TIER 2: second take-profit ────────────────────────────────
-            if pos.t1_done and not pos.t2_done and gain_x >= LADDER_T2_X:
-                log.info(f"TIER 2 HIT {pct_str} -- selling {LADDER_T2_FRACTION*100:.0f}% remaining of {pos.token.symbol}")
-                await self._sell_partial(pos, LADDER_T2_FRACTION, price, "Tier 2")
-                await self.discord.partial_sold(pos, "TIER 2", gain_x, LADDER_T2_FRACTION)
-                pos.t2_done    = True
-                pos.is_runner  = True
-                pos.high_price = price
-                pos.stop_price = price * (1 - RUNNER_STOP_PCT / 100)
-                pos.stop_engaged = True
-                log.info(f"  RUNNER MODE -- {pos.tokens_held:.0f} tokens left, "
-                         f"stop at ${pos.stop_price:.10f} ({RUNNER_STOP_PCT:.0f}% below high)")
-
-            # ── RUNNER LOGIC (after both tiers done) ──────────────────────
-            if pos.is_runner:
-                # Update runner trailing high
-                if price > pos.high_price:
-                    pos.high_price = price
-                    pos.stop_price = price * (1 - RUNNER_STOP_PCT / 100)
-                    log.info(f"  RUNNER NEW HIGH {pct_str} -> stop ${pos.stop_price:.10f}")
-
-                # Runner stop hit
-                if price <= pos.stop_price:
-                    log.warning(f"RUNNER STOP HIT {pct_str} -- closing {pos.token.symbol}")
-                    await self._sell_all(pos, price, "runner_stop")
-                    await self.discord.sold(pos, "runner_stop", gain_x, is_runner=True)
-                    self._record_pnl(gain_x)
-                    return "runner_stop"
-
-                # Runner timeout
-                if pos.timed_out:
-                    log.warning(f"RUNNER TIMEOUT {pos.hold_mins:.1f}min -- closing {pos.token.symbol} {pct_str}")
-                    await self._sell_all(pos, price, "runner_timeout")
-                    await self.discord.sold(pos, "runner_timeout", gain_x, is_runner=True)
-                    self._record_pnl(gain_x)
-                    return "runner_timeout"
-
-                continue  # runner is alive, keep watching
-
-            # ── NON-RUNNER LOGIC ──────────────────────────────────────────
-
-            # Early loss cut (only before Tier 1 fires)
-            if (not pos.t1_done and not early_cut_done and
-                    pos.hold_secs >= EARLY_EXIT_AFTER_SECS and
-                    gain_x < (1 - EARLY_LOSS_EXIT_PCT / 100)):
-                log.warning(f"EARLY LOSS CUT {pct_str} at {pos.hold_secs:.0f}s -- "
-                            f"selling ALL {pos.token.symbol}")
-                await self._sell_all(pos, price, "early_loss")
-                await self.discord.sold(pos, "early_loss", gain_x)
-                self._record_pnl(gain_x)
-                return "early_loss"
-            early_cut_done = pos.hold_secs > EARLY_EXIT_AFTER_SECS
-
-            # Timeout on full/tier-1-partial position
+            # ── EXIT 2: 2-minute timeout ──────────────────────────────────
             if pos.timed_out:
-                log.warning(f"TIMEOUT {pos.hold_mins:.1f}min {pct_str} -- "
-                            f"closing {pos.token.symbol}")
-                await self._sell_all(pos, price, "timeout")
-                await self.discord.sold(pos, "timeout", gain_x)
-                self._record_pnl(gain_x)
-                return "timeout"
+                log.warning(f"TIMEOUT {pos.hold_mins:.1f}min — selling {pos.token.symbol} ({gain_x:.2f}x)")
+                await self._sell(pos, price, "timeout_2min")
+                return
 
-            # Main trailing stop (engages after STOP_ENGAGE_PCT, before T1)
-            if not pos.t1_done:
-                if not pos.stop_engaged and gain_x >= (1 + STOP_ENGAGE_PCT / 100):
-                    pos.stop_engaged = True
-                    pos.stop_price   = price * (1 - TRAILING_STOP_PCT / 100)
-                    log.info(f"  STOP ENGAGED at {pct_str} -> stop ${pos.stop_price:.10f}")
+            # ── UPDATE trailing stop ──────────────────────────────────────
+            if price > pos.high_price:
+                pos.high_price = price
+                pos.stop_price = price * (1 - TRAILING_STOP_PCT / 100)
+                log.info(f"  NEW HIGH ${price:.8f} -> stop ${pos.stop_price:.8f}")
 
-                if pos.stop_engaged and price > pos.high_price:
-                    pos.high_price = price
-                    pos.stop_price = price * (1 - TRAILING_STOP_PCT / 100)
+            # ── EXIT 3: Trailing stop ─────────────────────────────────────
+            if pos.stop_price > 0 and price <= pos.stop_price:
+                log.warning(f"STOP HIT ${price:.8f} ({gain_x:.2f}x) — "
+                            f"selling {pos.token.symbol}")
+                await self._sell(pos, price, "trailing_stop")
+                return
 
-                if pos.stop_engaged and pos.stop_price > 0 and price <= pos.stop_price:
-                    log.warning(f"TRAILING STOP HIT {pct_str} -- "
-                                f"selling ALL {pos.token.symbol}")
-                    await self._sell_all(pos, price, "trailing_stop")
-                    await self.discord.sold(pos, "trailing_stop", gain_x)
-                    self._record_pnl(gain_x)
-                    return "trailing_stop"
-
-            # After T1 but before T2: use same main stop (protect locked profit)
-            elif pos.t1_done and not pos.t2_done:
-                # Re-engage stop relative to T1 price to protect that locked gain
-                if not pos.stop_engaged:
-                    pos.stop_engaged = True
-                    pos.stop_price   = price * (1 - TRAILING_STOP_PCT / 100)
-                if price > pos.high_price:
-                    pos.high_price = price
-                    pos.stop_price = price * (1 - TRAILING_STOP_PCT / 100)
-                if pos.stop_price > 0 and price <= pos.stop_price:
-                    log.warning(f"POST-T1 STOP HIT {pct_str} -- "
-                                f"selling remainder of {pos.token.symbol}")
-                    await self._sell_all(pos, price, "trailing_stop")
-                    await self.discord.sold(pos, "trailing_stop", gain_x)
-                    self._record_pnl(gain_x)
-                    return "trailing_stop"
-
-    # ── SELL HELPERS ──────────────────────────────────────────────────────────
+    # ── SELL ─────────────────────────────────────────────────────────────────
 
     async def _get_real_token_balance(self, mint: str) -> tuple:
+        """
+        Fetch actual on-chain token balance from wallet.
+        Returns (raw_amount, decimals) — the ground truth, not an estimate.
+        """
         async with aiohttp.ClientSession() as sess:
             try:
                 async with sess.post(
@@ -1013,25 +881,43 @@ class Bot:
                                 .get("data", {})
                                 .get("parsed", {})
                                 .get("info", {}))
-                    ta  = info.get("tokenAmount", {})
+                    ta = info.get("tokenAmount", {})
                     raw = int(ta.get("amount", 0))
                     dec = int(ta.get("decimals", 6))
                     if raw > 0:
-                        log.info(f"Real balance: {raw} raw ({raw / 10**dec:.4f} tokens)")
+                        log.info(f"Real balance: {raw} raw ({raw / 10**dec:.4f} tokens, {dec} decimals)")
                         return raw, dec
             except Exception as e:
                 log.error(f"Balance fetch error: {e}")
         return 0, 6
 
-    async def _execute_sell(self, mint: str, raw_amount: int, label: str) -> bool:
-        """Execute a sell order. Returns True if successful."""
+    async def _sell(self, pos: Position, price: float, reason: str):
+        gain_x  = price / pos.entry_price if pos.entry_price > 0 else 1.0
+        pnl_sol = (price * pos.tokens_held) - pos.cost_sol
+        log.info(f"SELLING 100% of {pos.token.symbol} — {reason} "
+                 f"({gain_x:.3f}x, {pnl_sol:+.5f} SOL)")
+
+        # Always fetch REAL on-chain balance — never trust the estimate
+        # This is the fix for partial sells
+        raw_amount, decimals = await self._get_real_token_balance(pos.token.mint)
+
         if raw_amount <= 0:
-            log.error(f"Sell amount is 0 for {label} -- cannot sell")
-            return False
+            # Fallback to estimate if RPC fails
+            raw_amount = int(pos.tokens_held * (10 ** 6))
+            log.warning(f"Could not fetch real balance — using estimate: {raw_amount}")
+
+        if raw_amount <= 0:
+            log.error(f"Sell amount is 0 for {pos.token.symbol} — cannot sell"); return
+
+        log.info(f"Selling raw amount: {raw_amount} (decimals: {decimals})")
 
         sell_succeeded = False
+
+        # Up to 5 attempts — keep trying until it goes through
         for attempt in range(1, 6):
-            order = await self.jup.order(mint, WSOL, raw_amount, self.sol.pubkey)
+            order = await self.jup.order(
+                pos.token.mint, WSOL, raw_amount, self.sol.pubkey
+            )
             if order and order.get("transaction"):
                 signed = self.sol.sign(order["transaction"])
                 if signed:
@@ -1040,87 +926,42 @@ class Bot:
                         if result.get("status") == "Failed":
                             err = result.get("error", "?")
                             log.error(f"Sell attempt {attempt} failed: {err}")
+                            log.error(f"Full: {json.dumps(result)[:300]}")
+                            # If "insufficient funds" try with 98% of balance
                             if "insufficient" in str(err).lower() or attempt == 3:
                                 raw_amount = int(raw_amount * 0.98)
-                                log.warning(f"Retrying with 98%: {raw_amount}")
+                                log.warning(f"Retrying with 98% amount: {raw_amount}")
                         else:
                             sig = result.get("signature", "?")
-                            log.info(f"SELL TX [{label}]: {sig[:35]}...")
+                            log.info(f"SELL TX: {sig[:35]}...")
                             sell_succeeded = True
                             break
             else:
-                log.warning(f"No sell route attempt {attempt}/5 [{label}]")
+                log.warning(f"No sell route attempt {attempt}/5 — "
+                            f"mint={pos.token.mint[:20]} amount={raw_amount}")
 
             if not sell_succeeded and attempt < 5:
                 wait = min(attempt * 2, 6)
-                log.info(f"Retrying in {wait}s...")
+                log.info(f"Retrying sell in {wait}s...")
                 await asyncio.sleep(wait)
 
         if not sell_succeeded:
-            log.error(f"SELL FAILED after 5 attempts [{label}]")
-        return sell_succeeded
-
-    async def _sell_partial(self, pos: Position, fraction: float, price: float, label: str):
-        """Sell `fraction` of currently held tokens. Updates pos.tokens_held."""
-        raw_total, decimals = await self._get_real_token_balance(pos.token.mint)
-
-        if raw_total <= 0:
-            raw_total = int(pos.tokens_held * (10 ** 6))
-            log.warning(f"Using estimated balance: {raw_total}")
-
-        raw_to_sell = int(raw_total * fraction)
-        if raw_to_sell <= 0:
-            log.warning(f"Partial sell amount is 0 [{label}]")
+            log.error(f"SELL FAILED after 5 attempts — {pos.token.symbol}")
+            log.error(f"  mint={pos.token.mint}")
+            log.error(f"  raw_amount={raw_amount}")
             return
 
-        # Dust check
-        token_val_sol = (raw_to_sell / 10**decimals) * price
-        if token_val_sol < ESTIMATED_FEES_SOL:
-            log.warning(f"Dust partial ({token_val_sol:.8f} SOL) -- skipping")
-            return
-
-        log.info(f"PARTIAL SELL [{label}]: {raw_to_sell} raw ({fraction*100:.0f}% of {raw_total})")
-        ok = await self._execute_sell(pos.token.mint, raw_to_sell, label)
-        if ok:
-            tokens_sold = raw_to_sell / (10 ** decimals)
-            sol_received = tokens_sold * price
-            pos.tokens_held  -= tokens_sold
-            pos.sol_recouped += sol_received
-            log.info(f"  Sold {tokens_sold:.0f} tokens for ~{sol_received:.5f} SOL | "
-                     f"{pos.tokens_held:.0f} tokens remain")
-
-    async def _sell_all(self, pos: Position, price: float, reason: str):
-        """Sell all remaining tokens."""
-        gain_x  = price / pos.entry_price if pos.entry_price > 0 else 1.0
-        pct_str = self.discord._pct_str(gain_x)
-        log.info(f"SELL ALL {pos.token.symbol} -- {reason} ({pct_str})")
-
-        raw_amount, decimals = await self._get_real_token_balance(pos.token.mint)
-        if raw_amount <= 0:
-            raw_amount = int(pos.tokens_held * (10 ** 6))
-            log.warning(f"Using estimate: {raw_amount}")
-        if raw_amount <= 0:
-            log.error(f"Nothing to sell for {pos.token.symbol}")
-            return
-
-        token_val_sol = (raw_amount / 10**decimals) * price
-        if token_val_sol < ESTIMATED_FEES_SOL:
-            log.warning(f"Dust position ({token_val_sol:.8f} SOL) -- not worth fee, skipping")
-            return
-
-        await self._execute_sell(pos.token.mint, raw_amount, reason)
-
-    def _record_pnl(self, gain_x: float):
-        """Record win/loss in session stats."""
-        if gain_x >= BREAKEVEN_X:
+        # Update session stats
+        if pnl_sol >= 0:
             self.trades_won += 1
         else:
             self.trades_lost += 1
-        # Rough PnL estimate (partial sells complicate exact accounting)
-        pnl_est = TRADE_AMOUNT_SOL * (gain_x - 1) - ESTIMATED_FEES_SOL * 2
-        self.total_pnl += pnl_est
+        self.total_pnl += pnl_sol
 
-    # ── HELPERS ───────────────────────────────────────────────────────────────
+        await self.discord.sold(pos, reason, gain_x, pnl_sol)
+        log.info(f"CLOSED {pos.token.symbol}: {gain_x:.3f}x | {pnl_sol:+.5f} SOL")
+
+    # ── HELPERS ──────────────────────────────────────────────────────────────
 
     async def _rpc(self, sess, method, params):
         try:
@@ -1137,21 +978,22 @@ class Bot:
     async def _heartbeat(self):
         while True:
             await asyncio.sleep(60)
-            uptime  = (time.time() - self.start) / 60
-            status  = "LOCKED" if self.detector.locked else "SCANNING"
+            uptime = (time.time() - self.start) / 60
+            status = "LOCKED IN" if self.detector.locked else "SCANNING"
             sol_usd = await self.discord._fetch_sol_price()
             pnl_usd = self.total_pnl * sol_usd
             log.info(f"HEARTBEAT [{status}] | up {uptime:.0f}m | "
                      f"{self.detector.count} tokens seen | "
                      f"{self.trades_won}W {self.trades_lost}L | "
-                     f"net {self.total_pnl:+.5f} SOL | "
-                     f"rugs blacklisted: {len(self._rug_blacklist)}")
+                     f"net {self.total_pnl:+.5f} SOL ({pnl_usd:+.2f} USD) | "
+                     f"SOL=${sol_usd:.0f}")
+            # Send a keepalive ping to Discord every 30min to prevent webhook timeout
             if int(uptime) % 30 == 0 and int(uptime) > 0:
-                pnl_str = f"+{(self.total_pnl/TRADE_AMOUNT_SOL)*100:.1f}%" if self.total_pnl >= 0 else f"{(self.total_pnl/TRADE_AMOUNT_SOL)*100:.1f}%"
+                pnl_str = f"+${pnl_usd:.2f}" if pnl_usd >= 0 else f"-${abs(pnl_usd):.2f}"
                 await self.discord.info(
-                    f"💓 **Sniper v9 alive** | {uptime:.0f}min up | "
+                    f"💓 **Winston alive** | {uptime:.0f}min up | "
                     f"{self.trades_won}W {self.trades_lost}L | "
-                    f"Net: **{pnl_str}** | rugs skipped: {len(self._rug_blacklist)}"
+                    f"Net: **{pnl_str}** | SOL=${sol_usd:.0f}"
                 )
 
 if __name__ == "__main__":
