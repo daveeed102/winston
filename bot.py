@@ -131,6 +131,53 @@ class Jupiter:
         finally: await s2.close()
         return None
 
+    async def quote_price(self, mint):
+        """
+        LIVE quote-based price — bypasses the Jupiter price API cache entirely.
+        Used for momentum checks where stale cached prices return 0.0% movement.
+        Asks the AMM directly: how much SOL for 10k tokens right now?
+        Returns price per token in SOL, or None if no route.
+        """
+        s = await self._sess()
+        try:
+            # Use a meaningful amount — 1M tokens to get a stable quote
+            params = {
+                "inputMint": mint,
+                "outputMint": WSOL,
+                "amount": str(int(1_000_000 * 1e6))
+            }
+            async with s.get(JUP_ORDER, params=params,
+                             timeout=aiohttp.ClientTimeout(total=6)) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    out_sol = int(d.get("outAmount", "0")) / 1e9
+                    if out_sol > 0:
+                        return out_sol / 1_000_000
+                    # outAmount was 0 — try smaller amount (low liquidity)
+                else:
+                    log.debug(f"quote_price {r.status} for {mint[:16]}")
+        except Exception as e:
+            log.debug(f"quote_price err: {e}")
+        finally:
+            await s.close()
+
+        # Fallback: try with 10k tokens
+        s2 = await self._sess()
+        try:
+            params = {"inputMint": mint, "outputMint": WSOL,
+                      "amount": str(int(10_000 * 1e6))}
+            async with s2.get(JUP_ORDER, params=params,
+                              timeout=aiohttp.ClientTimeout(total=6)) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    out_sol = int(d.get("outAmount", "0")) / 1e9
+                    if out_sol > 0:
+                        return out_sol / 10_000
+        except: pass
+        finally:
+            await s2.close()
+        return None
+
     async def order(self, inp, out, amount, taker):
         s = await self._sess()
         try:
@@ -448,22 +495,29 @@ class Bot:
                     self.detector.locked = False
                     continue
 
-                # 3-second momentum check after filters pass
-                # Watch price for 3s — only buy if moving UP
-                log.info(f"Locked in on {token.symbol} — watching momentum for 3s...")
-                price_t0 = await self.jup.price(token.mint)
+                # 3-second momentum check — uses LIVE AMM quotes, not cached price API
+                # quote_price() hits the AMM directly so both readings are fresh
+                log.info(f"Momentum check: {token.symbol} ({token.mint[:16]}) — sampling live AMM...")
+                price_t0 = await self.jup.quote_price(token.mint)
+                log.info(f"  t=0s price: {price_t0:.12f} SOL" if price_t0 else "  t=0s price: NO DATA")
                 await asyncio.sleep(3)
-                price_t3 = await self.jup.price(token.mint)
+                price_t3 = await self.jup.quote_price(token.mint)
+                log.info(f"  t=3s price: {price_t3:.12f} SOL" if price_t3 else "  t=3s price: NO DATA")
 
                 if price_t0 and price_t3:
                     move_pct = ((price_t3 - price_t0) / price_t0) * 100
+                    log.info(f"  movement: {move_pct:+.2f}% (need {MIN_MOMENTUM_PCT}%+)")
                     if move_pct < MIN_MOMENTUM_PCT:
-                        log.info(f"SKIP {token.symbol}: only {move_pct:.1f}% in 3s — need {MIN_MOMENTUM_PCT}%+, unlocking")
+                        log.info(f"SKIP {token.symbol}: {move_pct:.2f}% < {MIN_MOMENTUM_PCT}% threshold — unlocking")
                         self.detector.locked = False
                         continue
-                    log.info(f"MOMENTUM {token.symbol}: +{move_pct:.1f}% in 3s — target met ({MIN_MOMENTUM_PCT}%+) BUYING!")
+                    log.info(f"MOMENTUM CONFIRMED {token.symbol}: +{move_pct:.2f}% in 3s — BUYING!")
+                elif price_t0 and not price_t3:
+                    log.info(f"SKIP {token.symbol}: lost price feed at t=3s — liquidity dried up, unlocking")
+                    self.detector.locked = False
+                    continue
                 else:
-                    log.info(f"No price data for {token.symbol} yet (brand new) — skipping, unlocking")
+                    log.info(f"SKIP {token.symbol}: no AMM price at t=0 — not yet liquid, unlocking")
                     self.detector.locked = False
                     continue
 
