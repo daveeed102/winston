@@ -366,41 +366,52 @@ class Detector:
 
             self.seen.add(sig)
             source = "pumpfun" if is_graduation else "raydium"
-            log.info(f"GRADUATION detected ({source}) — tx {sig[:20]}...")
 
-            # Strategy 1: getTransaction (most reliable — RPC tells us exactly
-            # which token moved). Retry up to 5x with short waits.
-            mint = None
-            async with aiohttp.ClientSession() as sess:
-                for attempt in range(10):
-                    mint = await self._extract_mint(sig, sess)
+            # LOCK IMMEDIATELY — before the slow mint fetch.
+            # This prevents multiple parallel _handle tasks from all
+            # trying to buy different coins at the same time.
+            if self.locked:
+                return  # Another graduation is already being processed
+            self.locked = True
+            log.info(f"GRADUATION detected ({source}) — tx {sig[:20]}... — locked")
+
+            try:
+                # Strategy 1: getTransaction — RPC tells us exactly which token moved.
+                mint = None
+                async with aiohttp.ClientSession() as sess:
+                    for attempt in range(10):
+                        mint = await self._extract_mint(sig, sess)
+                        if mint:
+                            log.info(f"Mint via getTransaction (attempt {attempt+1}): {mint[:20]}...")
+                            break
+                        await asyncio.sleep(2)
+
+                # Strategy 2: Scan log strings for addresses ending in "pump"
+                if not mint:
+                    mint = self._mint_from_logs(logs, source)
                     if mint:
-                        log.info(f"Mint via getTransaction (attempt {attempt+1}): {mint[:20]}...")
-                        break
-                    await asyncio.sleep(2)
+                        log.info(f"Mint via log scan: {mint[:20]}...")
 
-            # Strategy 2: Parse directly from the WebSocket log strings.
-            # Pump.fun graduation logs always contain the token mint address
-            # ending in "pump". We scan specifically for that pattern.
-            if not mint:
-                mint = self._mint_from_logs(logs, source)
-                if mint:
-                    log.info(f"Mint via log scan: {mint[:20]}...")
+                if not mint:
+                    log.warning(f"No mint from {sig[:16]} — skipping")
+                    self.locked = False
+                    return
 
-            if not mint:
-                log.warning(f"No mint from {sig[:16]} — skipping")
-                return
+                if mint in self.seen:
+                    self.locked = False
+                    return
+                self.seen.add(mint)
 
-            if mint in self.seen:
-                return
-            self.seen.add(mint)
+                self.count += 1
+                token = Token(mint=mint, source=source)
+                log.info(f"DETECTED {source.upper()} -> {mint[:24]}...")
 
-            self.count += 1
-            token = Token(mint=mint, source=source)
-            log.info(f"DETECTED {source.upper()} -> {mint[:24]}...")
-
-            if not self.locked:
+                # Put in queue — trade loop will unlock after processing
                 await self.queue.put(token)
+
+            except Exception as e:
+                log.warning(f"Handle inner err: {e}")
+                self.locked = False
 
         except Exception as e:
             log.warning(f"Handle err: {e}")
