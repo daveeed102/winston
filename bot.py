@@ -264,7 +264,6 @@ class Detector:
                             "jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
                             "params": [{"mentions": [PUMPFUN]}, {"commitment": "confirmed"}]
                         })
-                        await ws.send_json({
                         async for msg in ws:
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 asyncio.create_task(self._handle(msg.data))
