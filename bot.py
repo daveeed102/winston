@@ -368,17 +368,24 @@ class Detector:
             source = "pumpfun" if is_graduation else "raydium"
             log.info(f"GRADUATION detected ({source}) — tx {sig[:20]}...")
 
-            # Use getTransaction to get the actual token mint from postTokenBalances.
-            # This is reliable — the RPC returns exactly which token changed hands.
-            # We retry quickly (3x at 1s intervals) since graduation txs index fast.
+            # Strategy 1: getTransaction (most reliable — RPC tells us exactly
+            # which token moved). Retry up to 5x with short waits.
             mint = None
             async with aiohttp.ClientSession() as sess:
-                for attempt in range(3):
+                for attempt in range(5):
                     mint = await self._extract_mint(sig, sess)
                     if mint:
+                        log.info(f"Mint via getTransaction (attempt {attempt+1}): {mint[:20]}...")
                         break
-                    if attempt < 2:
-                        await asyncio.sleep(1)
+                    await asyncio.sleep(1.5)
+
+            # Strategy 2: Parse directly from the WebSocket log strings.
+            # Pump.fun graduation logs always contain the token mint address
+            # ending in "pump". We scan specifically for that pattern.
+            if not mint:
+                mint = self._mint_from_logs(logs, source)
+                if mint:
+                    log.info(f"Mint via log scan: {mint[:20]}...")
 
             if not mint:
                 log.warning(f"No mint from {sig[:16]} — skipping")
@@ -401,8 +408,7 @@ class Detector:
     async def _extract_mint(self, sig: str, sess: aiohttp.ClientSession) -> Optional[str]:
         """
         Fetch the transaction and pull the token mint from postTokenBalances.
-        This is what v5 used — it asks the RPC which token actually moved,
-        so we always get the real mint address, never a program address.
+        Returns None if the RPC hasn't indexed the tx yet (result is null).
         """
         try:
             payload = {
@@ -416,7 +422,7 @@ class Detector:
 
             tx = data.get("result")
             if not tx:
-                return None
+                return None  # Not indexed yet — caller will retry
 
             meta = tx.get("meta", {})
             if not meta or meta.get("err"):
@@ -426,13 +432,11 @@ class Detector:
                     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
                     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"}
 
-            # postTokenBalances is the most reliable — shows what actually changed
             for bal in meta.get("postTokenBalances", []):
                 m = bal.get("mint", "")
                 if m and m not in skip:
                     return m
 
-            # preTokenBalances as fallback
             for bal in meta.get("preTokenBalances", []):
                 m = bal.get("mint", "")
                 if m and m not in skip:
@@ -440,6 +444,57 @@ class Detector:
 
         except Exception as e:
             log.debug(f"extract_mint err: {e}")
+        return None
+
+    # Known Solana program/system addresses — never valid token mints
+    _KNOWN_PROGRAMS = {
+        WSOL,
+        PUMPFUN,
+        RAYDIUM_AMM,
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+        "11111111111111111111111111111111",                # System
+        "ComputeBudget111111111111111111111111111111",     # Compute budget
+        "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL", # Associated token
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  # Token program
+        "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",  # Token-2022
+        "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",  # Pump fee
+        "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  # Pump.fun (dup)
+        "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",  # Metaplex
+        "SysvarRent111111111111111111111111111111111",    # Sysvar
+        "SysvarC1ock11111111111111111111111111111111",    # Sysvar clock
+    }
+
+    def _mint_from_logs(self, logs: list, source: str) -> Optional[str]:
+        """
+        Fallback: extract mint directly from WebSocket log strings.
+        Only used when getTransaction hasn't indexed yet.
+
+        Pump.fun token mints ALWAYS end with 'pump' — this is a protocol
+        invariant, not a coincidence. No Solana program address ends in 'pump'.
+        So for pumpfun source we can scan specifically for that pattern.
+        """
+        import re
+
+        # For Pump.fun graduations: mint always ends in "pump"
+        if source == "pumpfun":
+            pump_re = re.compile(r'([1-9A-HJ-NP-Za-km-z]{32,44}pump)')
+            for line in logs:
+                for m in pump_re.finditer(line):
+                    addr = m.group(1)
+                    if addr not in self._KNOWN_PROGRAMS:
+                        return addr
+
+        # For Raydium: scan for 43-44 char base58 addresses not in known programs
+        b58 = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+        addr_re = re.compile(r'([1-9A-HJ-NP-Za-km-z]{43,44})')
+        for line in logs:
+            for m in addr_re.finditer(line):
+                addr = m.group(1)
+                if (addr not in self._KNOWN_PROGRAMS and
+                        all(c in b58 for c in addr)):
+                    return addr
+
         return None
 
 # ─── BOT ─────────────────────────────────────────────────────────────────────
