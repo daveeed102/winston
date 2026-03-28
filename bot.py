@@ -368,12 +368,20 @@ class Detector:
             source = "pumpfun" if is_graduation else "raydium"
             log.info(f"GRADUATION detected ({source}) — tx {sig[:20]}...")
 
-            # INSTANT mint extraction — read directly from log strings.
-            # No getTransaction RPC call needed. Zero latency.
-            mint = self._mint_from_logs(logs, source)
+            # Use getTransaction to get the actual token mint from postTokenBalances.
+            # This is reliable — the RPC returns exactly which token changed hands.
+            # We retry quickly (3x at 1s intervals) since graduation txs index fast.
+            mint = None
+            async with aiohttp.ClientSession() as sess:
+                for attempt in range(3):
+                    mint = await self._extract_mint(sig, sess)
+                    if mint:
+                        break
+                    if attempt < 2:
+                        await asyncio.sleep(1)
 
             if not mint:
-                log.warning(f"No mint in logs for {sig[:16]} — skipping")
+                log.warning(f"No mint from {sig[:16]} — skipping")
                 return
 
             if mint in self.seen:
@@ -382,7 +390,7 @@ class Detector:
 
             self.count += 1
             token = Token(mint=mint, source=source)
-            log.info(f"DETECTED {source.upper()} -> {mint[:24]}... (instant)")
+            log.info(f"DETECTED {source.upper()} -> {mint[:24]}...")
 
             if not self.locked:
                 await self.queue.put(token)
@@ -390,50 +398,48 @@ class Detector:
         except Exception as e:
             log.warning(f"Handle err: {e}")
 
-    _B58  = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
-
-    def _skip_addrs(self):
-        return {WSOL,
-                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-                "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
-                PUMPFUN, RAYDIUM_AMM}
-
-    def _mint_from_logs(self, logs: list, source: str) -> Optional[str]:
+    async def _extract_mint(self, sig: str, sess: aiohttp.ClientSession) -> Optional[str]:
         """
-        Extract token mint directly from WebSocket log strings.
-        No RPC call, no delay. Reads the addresses Solana already printed.
-
-        Pump.fun mints always end with 'pump' (43-44 chars base58).
-        Raydium mints are standard 43-44 char base58 addresses.
+        Fetch the transaction and pull the token mint from postTokenBalances.
+        This is what v5 used — it asks the RPC which token actually moved,
+        so we always get the real mint address, never a program address.
         """
-        import re
-        skip = self._skip_addrs()
+        try:
+            payload = {
+                "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
+                "params": [sig, {"encoding": "jsonParsed",
+                                 "maxSupportedTransactionVersion": 0}]
+            }
+            async with sess.post(self.sol.rpc, json=payload,
+                                 timeout=aiohttp.ClientTimeout(total=8)) as r:
+                data = await r.json()
 
-        # Pump.fun: look specifically for addresses ending in 'pump'
-        if source == "pumpfun":
-            pump_re = re.compile(r'\b([1-9A-HJ-NP-Za-km-z]{32,44}pump)\b')
-            for line in logs:
-                for m in pump_re.finditer(line):
-                    addr = m.group(1)
-                    if addr not in skip:
-                        log.debug(f"Pump mint from log: {addr}")
-                        return addr
+            tx = data.get("result")
+            if not tx:
+                return None
 
-        # Raydium / generic fallback: any 43-44 char base58 address
-        # Prioritise lines that mention 'mint' or 'initialize'
-        addr_re = re.compile(r'\b([1-9A-HJ-NP-Za-km-z]{43,44})\b')
-        priority = [l for l in logs if any(
-            kw in l for kw in ("initialize", "mint", "Mint", "token", "Token")
-        )]
-        rest = [l for l in logs if l not in priority]
+            meta = tx.get("meta", {})
+            if not meta or meta.get("err"):
+                return None
 
-        for line in priority + rest:
-            for m in addr_re.finditer(line):
-                addr = m.group(1)
-                if addr not in skip and all(c in self._B58 for c in addr):
-                    log.debug(f"Raydium mint from log: {addr}")
-                    return addr
+            skip = {WSOL,
+                    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"}
 
+            # postTokenBalances is the most reliable — shows what actually changed
+            for bal in meta.get("postTokenBalances", []):
+                m = bal.get("mint", "")
+                if m and m not in skip:
+                    return m
+
+            # preTokenBalances as fallback
+            for bal in meta.get("preTokenBalances", []):
+                m = bal.get("mint", "")
+                if m and m not in skip:
+                    return m
+
+        except Exception as e:
+            log.debug(f"extract_mint err: {e}")
         return None
 
 # ─── BOT ─────────────────────────────────────────────────────────────────────
