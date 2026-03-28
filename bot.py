@@ -291,14 +291,27 @@ class Detector:
 
             log_text = " ".join(logs)
 
-            # Only brand new Pump.fun launches.
-            # "Instruction: Create" fires when a fresh token is minted.
-            # IGNORE "Withdraw"/"migrate" — those are Raydium graduations.
-            is_new_launch = (
-                PUMPFUN in log_text and
-                "Instruction: Create" in log_text
-            )
-            if not is_new_launch: return
+            # Only process Pump.fun events
+            if PUMPFUN not in log_text: return
+
+            # Log ALL Pump.fun log lines so we can see the exact keywords
+            # This tells us what a new launch looks like vs a migration
+            log.info(f"PUMPFUN EVENT [{sig[:16]}] logs:")
+            for line in logs:
+                if line.strip():
+                    log.info(f"  | {line[:120]}")
+
+            # Known migration/graduation keywords — these are OLD coins, skip
+            is_migration = any(kw in log_text for kw in (
+                "Withdraw", "withdraw", "migrate", "Migrate",
+                "InitializeInstruction2", "initialize2",
+            ))
+            if is_migration:
+                log.info(f"  -> SKIP: migration/graduation event")
+                return
+
+            # Must be a new token event — log it and proceed
+            log.info(f"  -> NEW LAUNCH candidate")
             self.seen.add(sig)
 
             source = "pumpfun"
