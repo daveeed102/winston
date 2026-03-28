@@ -556,31 +556,9 @@ class Bot:
                     self.detector.locked = False
                     continue
 
-                # 3-second momentum check — uses LIVE AMM quotes, not cached price API
-                # quote_price() hits the AMM directly so both readings are fresh
-                log.info(f"Momentum check: {token.symbol} ({token.mint[:16]}) — sampling live AMM...")
-                price_t0 = await self.jup.quote_price(token.mint)
-                log.info(f"  t=0s price: {price_t0:.12f} SOL" if price_t0 else "  t=0s price: NO DATA")
-                await asyncio.sleep(3)
-                price_t3 = await self.jup.quote_price(token.mint)
-                log.info(f"  t=3s price: {price_t3:.12f} SOL" if price_t3 else "  t=3s price: NO DATA")
-
-                if price_t0 and price_t3:
-                    move_pct = ((price_t3 - price_t0) / price_t0) * 100
-                    log.info(f"  movement: {move_pct:+.2f}% (need {MIN_MOMENTUM_PCT}%+)")
-                    if move_pct < MIN_MOMENTUM_PCT:
-                        log.info(f"SKIP {token.symbol}: {move_pct:.2f}% < {MIN_MOMENTUM_PCT}% threshold — unlocking")
-                        self.detector.locked = False
-                        continue
-                    log.info(f"MOMENTUM CONFIRMED {token.symbol}: +{move_pct:.2f}% in 3s — BUYING!")
-                elif price_t0 and not price_t3:
-                    log.info(f"SKIP {token.symbol}: lost price feed at t=3s — liquidity dried up, unlocking")
-                    self.detector.locked = False
-                    continue
-                else:
-                    log.info(f"SKIP {token.symbol}: no AMM price at t=0 — not yet liquid, unlocking")
-                    self.detector.locked = False
-                    continue
+                # No momentum filter — graduation itself is the signal.
+                # The trailing stop (25%) and 2-min timeout protect capital.
+                log.info(f"Filters passed for {token.symbol} — buying on graduation signal")
 
                 # Buy
                 pos = await self._buy(token)
