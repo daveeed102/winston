@@ -302,8 +302,7 @@ class Discord:
             "title": f"💰 BOUGHT — {label}",
             "color": 0x00AAFF,
             "description": (
-                f"Spent **${spent_usd:.2f}** ({p.cost_sol:.4f} SOL)
-"
+                f"Spent **${spent_usd:.2f}** ({p.cost_sol:.4f} SOL)\n"
                 f"🎯 Target: **${target_usd:.2f}** (+{(PROFIT_TARGET_X-1)*100:.0f}%)"
             ),
             "fields": [
@@ -333,8 +332,7 @@ class Discord:
             "title": f"{emoji} — {label}",
             "color": color,
             "description": (
-                f"Bought for **${spent_usd:.2f}** → Sold for **${sell_usd:.2f}**
-"
+                f"Bought for **${spent_usd:.2f}** → Sold for **${sell_usd:.2f}**\n"
                 f"**{pnl_str}** ({gain_x:.3f}x) in {p.hold_mins:.1f}min"
             ),
             "fields": [
