@@ -318,7 +318,10 @@ class Detector:
                         })
                         async for msg in ws:
                             if msg.type == aiohttp.WSMsgType.TEXT:
-                                asyncio.create_task(self._handle(msg.data))
+                                # Do NOT use create_task here — that runs handlers
+                                # in parallel so multiple events all see locked=False
+                                # and queue multiple tokens. Handle sequentially.
+                                await self._handle(msg.data)
                             elif msg.type in (aiohttp.WSMsgType.ERROR,
                                              aiohttp.WSMsgType.CLOSED):
                                 break
@@ -366,52 +369,42 @@ class Detector:
 
             self.seen.add(sig)
             source = "pumpfun" if is_graduation else "raydium"
+            log.info(f"GRADUATION detected ({source}) — tx {sig[:20]}...")
 
-            # LOCK IMMEDIATELY — before the slow mint fetch.
-            # This prevents multiple parallel _handle tasks from all
-            # trying to buy different coins at the same time.
-            if self.locked:
-                return  # Another graduation is already being processed
-            self.locked = True
-            log.info(f"GRADUATION detected ({source}) — tx {sig[:20]}... — locked")
-
-            try:
-                # Strategy 1: getTransaction — RPC tells us exactly which token moved.
-                mint = None
-                async with aiohttp.ClientSession() as sess:
-                    for attempt in range(10):
-                        mint = await self._extract_mint(sig, sess)
-                        if mint:
-                            log.info(f"Mint via getTransaction (attempt {attempt+1}): {mint[:20]}...")
-                            break
-                        await asyncio.sleep(2)
-
-                # Strategy 2: Scan log strings for addresses ending in "pump"
-                if not mint:
-                    mint = self._mint_from_logs(logs, source)
+            # Strategy 1: getTransaction (most reliable — RPC tells us exactly
+            # which token moved). Retry up to 5x with short waits.
+            mint = None
+            async with aiohttp.ClientSession() as sess:
+                for attempt in range(10):
+                    mint = await self._extract_mint(sig, sess)
                     if mint:
-                        log.info(f"Mint via log scan: {mint[:20]}...")
+                        log.info(f"Mint via getTransaction (attempt {attempt+1}): {mint[:20]}...")
+                        break
+                    await asyncio.sleep(2)
 
-                if not mint:
-                    log.warning(f"No mint from {sig[:16]} — skipping")
-                    self.locked = False
-                    return
+            # Strategy 2: Parse directly from the WebSocket log strings.
+            # Pump.fun graduation logs always contain the token mint address
+            # ending in "pump". We scan specifically for that pattern.
+            if not mint:
+                mint = self._mint_from_logs(logs, source)
+                if mint:
+                    log.info(f"Mint via log scan: {mint[:20]}...")
 
-                if mint in self.seen:
-                    self.locked = False
-                    return
-                self.seen.add(mint)
+            if not mint:
+                log.warning(f"No mint from {sig[:16]} — skipping")
+                return
 
-                self.count += 1
-                token = Token(mint=mint, source=source)
-                log.info(f"DETECTED {source.upper()} -> {mint[:24]}...")
+            if mint in self.seen:
+                return
+            self.seen.add(mint)
 
-                # Put in queue — trade loop will unlock after processing
+            self.count += 1
+            token = Token(mint=mint, source=source)
+            log.info(f"DETECTED {source.upper()} -> {mint[:24]}...")
+
+            if not self.locked and self.queue.empty():
                 await self.queue.put(token)
-
-            except Exception as e:
-                log.warning(f"Handle inner err: {e}")
-                self.locked = False
+                self.locked = True  # Lock now so no other handler queues while we process
 
         except Exception as e:
             log.warning(f"Handle err: {e}")
