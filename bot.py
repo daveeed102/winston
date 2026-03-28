@@ -643,6 +643,9 @@ class Bot:
                     log.info(f"SKIP {token.mint[:16]}: blacklisted rug")
                     continue
 
+              # 🔥 WAIT for token to become tradable
+                await asyncio.sleep(5)
+
                 passed = await self._filter(token)
                 if not passed:
                     log.info(f"SKIP {token.mint[:16]} -- failed filters")
@@ -702,8 +705,19 @@ class Bot:
                 if isinstance(holders_res, Exception) or not holders_res:
                     log.info(f"SKIP {token.mint[:16]}: holder RPC failed"); return False
                 holders = holders_res.get("result", {}).get("value", [])
-                if len(holders) < 5:
-                    log.info(f"SKIP {token.mint[:16]}: only {len(holders)} holders"); return False
+                # 🔥 NEW: retry holder fetch if too early
+if len(holders) < 2:
+    log.info(f"Holders low ({len(holders)}) — retrying...")
+    await asyncio.sleep(3)
+
+    holders_res_retry = await self._rpc(sess, "getTokenLargestAccounts", [token.mint])
+    holders_retry = holders_res_retry.get("result", {}).get("value", [])
+
+    if len(holders_retry) < 2:
+        log.info(f"SKIP {token.mint[:16]}: only {len(holders_retry)} holders after retry")
+        return False
+    else:
+        holders = holders_retry
 
                 supply_res = await self._rpc(sess, "getTokenSupply", [token.mint])
                 total = float(supply_res.get("result", {}).get("value", {}).get("amount", "0"))
