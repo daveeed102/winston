@@ -372,12 +372,12 @@ class Detector:
             # which token moved). Retry up to 5x with short waits.
             mint = None
             async with aiohttp.ClientSession() as sess:
-                for attempt in range(5):
+                for attempt in range(10):
                     mint = await self._extract_mint(sig, sess)
                     if mint:
                         log.info(f"Mint via getTransaction (attempt {attempt+1}): {mint[:20]}...")
                         break
-                    await asyncio.sleep(1.5)
+                    await asyncio.sleep(2)
 
             # Strategy 2: Parse directly from the WebSocket log strings.
             # Pump.fun graduation logs always contain the token mint address
