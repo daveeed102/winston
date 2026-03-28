@@ -265,9 +265,6 @@ class Detector:
                             "params": [{"mentions": [PUMPFUN]}, {"commitment": "confirmed"}]
                         })
                         await ws.send_json({
-                            "jsonrpc": "2.0", "id": 2, "method": "logsSubscribe",
-                            "params": [{"mentions": [RAYDIUM_AMM]}, {"commitment": "confirmed"}]
-                        })
                         async for msg in ws:
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 asyncio.create_task(self._handle(msg.data))
@@ -293,17 +290,19 @@ class Detector:
             if not logs or not sig: return
             if sig in self.seen: return
 
-            log_text   = " ".join(logs)
-            is_pumpfun = PUMPFUN in log_text and (
-                "Withdraw" in log_text or "migrate" in log_text.lower()
-            )
-            is_raydium = ("initialize2" in log_text or
-                          "InitializeInstruction2" in log_text)
+            log_text = " ".join(logs)
 
-            if not is_pumpfun and not is_raydium: return
+            # Only brand new Pump.fun launches.
+            # "Instruction: Create" fires when a fresh token is minted.
+            # IGNORE "Withdraw"/"migrate" — those are Raydium graduations.
+            is_new_launch = (
+                PUMPFUN in log_text and
+                "Instruction: Create" in log_text
+            )
+            if not is_new_launch: return
             self.seen.add(sig)
 
-            source = "pumpfun" if is_pumpfun else "raydium"
+            source = "pumpfun"
 
             # INSTANT mint extraction — read directly from log strings.
             # No getTransaction RPC call needed. Zero latency.
@@ -431,6 +430,23 @@ class Bot:
                     log.info(f"SKIP {token.mint[:16]} — failed filters, looking again")
                     self.detector.locked = False
                     continue
+
+                # 3-second momentum check after filters pass
+                # Watch price for 3s — only buy if moving UP
+                log.info(f"Locked in on {token.symbol} — watching momentum for 3s...")
+                price_t0 = await self.jup.price(token.mint)
+                await asyncio.sleep(3)
+                price_t3 = await self.jup.price(token.mint)
+
+                if price_t0 and price_t3:
+                    move_pct = ((price_t3 - price_t0) / price_t0) * 100
+                    if move_pct <= 0:
+                        log.info(f"SKIP {token.symbol}: down {move_pct:.1f}% in 3s — not buying, unlocking")
+                        self.detector.locked = False
+                        continue
+                    log.info(f"MOMENTUM {token.symbol}: +{move_pct:.1f}% in 3s — BUYING!")
+                else:
+                    log.info(f"No price data for {token.symbol} yet (brand new) — buying!")
 
                 # Buy
                 pos = await self._buy(token)
