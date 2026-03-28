@@ -245,41 +245,102 @@ class Solana:
 # ─── DISCORD ─────────────────────────────────────────────────────────────────
 
 class Discord:
-    def __init__(self, url): self.url = url
+    def __init__(self, url):
+        self.url = url
+        self._sol_price = 150.0  # fallback, refreshed on each trade
 
-    async def send(self, payload):
-        if not self.url: return
+    async def _fetch_sol_price(self):
+        """Get current SOL/USD from Jupiter price API."""
         try:
             async with aiohttp.ClientSession() as s:
-                await s.post(self.url, json=payload,
-                             timeout=aiohttp.ClientTimeout(total=5))
-        except: pass
+                async with s.get(
+                    "https://api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112",
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as r:
+                    if r.status == 200:
+                        d = await r.json()
+                        p = (d.get("data", {})
+                               .get("So11111111111111111111111111111111111111112", {})
+                               .get("price"))
+                        if p:
+                            self._sol_price = float(p)
+        except:
+            pass
+        return self._sol_price
 
-    async def bought(self, p: Position):
+    async def send(self, payload):
+        """Send with retries — fixes the Discord connection dropping after 2h."""
+        if not self.url: return
+        for attempt in range(3):
+            try:
+                async with aiohttp.ClientSession() as s:
+                    r = await s.post(
+                        self.url, json=payload,
+                        timeout=aiohttp.ClientTimeout(total=10)
+                    )
+                    await r.release()
+                    return
+            except Exception as e:
+                if attempt == 2:
+                    log.debug(f"Discord send failed after 3 attempts: {e}")
+                await asyncio.sleep(1)
+
+    def _label(self, p: "Position") -> str:
+        """Human-readable name — never shows ???"""
+        if p.token.symbol and p.token.symbol != "???":
+            return p.token.symbol
+        if p.token.name and p.token.name not in ("Unknown", ""):
+            return p.token.name[:12]
+        return p.token.mint[:8] + "..."
+
+    async def bought(self, p: "Position"):
+        sol_usd   = await self._fetch_sol_price()
+        spent_usd = p.cost_sol * sol_usd
+        label     = self._label(p)
+        target_usd = spent_usd * PROFIT_TARGET_X
         await self.send({"embeds": [{
-            "title": f"BOUGHT {p.token.symbol}",
+            "title": f"💰 BOUGHT — {label}",
             "color": 0x00AAFF,
+            "description": (
+                f"Spent **${spent_usd:.2f}** ({p.cost_sol:.4f} SOL)
+"
+                f"🎯 Target: **${target_usd:.2f}** (+{(PROFIT_TARGET_X-1)*100:.0f}%)"
+            ),
             "fields": [
-                {"name": "Entry",    "value": f"${p.entry_price:.10f}", "inline": True},
-                {"name": "Spent",    "value": f"{p.cost_sol:.4f} SOL",  "inline": True},
-                {"name": "Target",   "value": f"+25% ({PROFIT_TARGET_X}x)", "inline": True},
-                {"name": "Timeout",  "value": f"{MAX_HOLD_MINUTES}min",  "inline": True},
-                {"name": "Stop",     "value": f"{TRAILING_STOP_PCT}% trail", "inline": True},
-                {"name": "Token",    "value": f"[Solscan](https://solscan.io/token/{p.token.mint})", "inline": False},
+                {"name": "Stop Loss",  "value": f"{TRAILING_STOP_PCT}% trailing",  "inline": True},
+                {"name": "Timeout",    "value": f"{MAX_HOLD_MINUTES} min",          "inline": True},
+                {"name": "Chart",      "value": f"[Solscan](https://solscan.io/token/{p.token.mint})", "inline": True},
             ]
         }]})
 
-    async def sold(self, p: Position, reason: str, gain_x: float, pnl_sol: float):
-        color  = 0x00FF88 if pnl_sol >= 0 else 0xFF4444
-        emoji  = "PROFIT" if pnl_sol >= 0 else "LOSS"
+    async def sold(self, p: "Position", reason: str, gain_x: float, pnl_sol: float):
+        sol_usd   = await self._fetch_sol_price()
+        spent_usd = p.cost_sol * sol_usd
+        pnl_usd   = pnl_sol * sol_usd
+        sell_usd  = spent_usd + pnl_usd
+        label     = self._label(p)
+        is_profit = pnl_usd >= 0
+        color     = 0x00FF88 if is_profit else 0xFF4444
+        emoji     = "✅ PROFIT" if is_profit else "❌ LOSS"
+        pnl_str   = f"+${pnl_usd:.2f}" if is_profit else f"-${abs(pnl_usd):.2f}"
+        reason_map = {
+            "timeout_2min":  "⏰ 2-min timeout",
+            "trailing_stop": "🛑 Stop loss",
+            "price_dead":    "💀 No price feed",
+        }
+        reason_clean = reason_map.get(reason, f"🎯 {reason}")
         await self.send({"embeds": [{
-            "title": f"{emoji} SOLD {p.token.symbol} — {reason}",
+            "title": f"{emoji} — {label}",
             "color": color,
+            "description": (
+                f"Bought for **${spent_usd:.2f}** → Sold for **${sell_usd:.2f}**
+"
+                f"**{pnl_str}** ({gain_x:.3f}x) in {p.hold_mins:.1f}min"
+            ),
             "fields": [
-                {"name": "Result",  "value": f"{gain_x:.3f}x  ({pnl_sol:+.5f} SOL)", "inline": False},
-                {"name": "Entry",   "value": f"${p.entry_price:.10f}",                "inline": True},
-                {"name": "Held",    "value": f"{p.hold_mins:.1f}min",                 "inline": True},
-                {"name": "Reason",  "value": reason,                                  "inline": True},
+                {"name": "Reason",   "value": reason_clean,                  "inline": True},
+                {"name": "SOL P&L",  "value": f"{pnl_sol:+.5f} SOL",        "inline": True},
+                {"name": "Chart",    "value": f"[Solscan](https://solscan.io/token/{p.token.mint})", "inline": True},
             ]
         }]})
 
@@ -650,20 +711,20 @@ class Bot:
                     log.info(f"SKIP {token.mint[:16]}: no liquidity")
                     return False
 
-                # Best-effort metadata from Pump.fun
-                if token.symbol == "???":
-                    try:
-                        async with sess.get(
-                            f"https://frontend-api.pump.fun/coins/{token.mint}",
-                            timeout=aiohttp.ClientTimeout(total=3)
-                        ) as r:
-                            if r.status == 200:
-                                meta = await r.json()
-                                if meta.get("symbol"): token.symbol = meta["symbol"]
-                                if meta.get("name"):   token.name   = meta["name"]
-                    except: pass
+                # Fetch metadata from Pump.fun — always try, not just when ???
+                try:
+                    async with sess.get(
+                        f"https://frontend-api.pump.fun/coins/{token.mint}",
+                        timeout=aiohttp.ClientTimeout(total=4)
+                    ) as r:
+                        if r.status == 200:
+                            meta = await r.json()
+                            if meta.get("symbol"): token.symbol = meta["symbol"]
+                            if meta.get("name"):   token.name   = meta["name"]
+                except: pass
 
-                log.info(f"PASS {token.symbol} ({token.mint[:16]}) — {len(holders)} holders")
+                label = token.symbol if token.symbol != "???" else (token.name[:10] if token.name != "Unknown" else token.mint[:8])
+                log.info(f"PASS {label} ({token.mint[:16]}) — {len(holders)} holders")
                 return True
 
             except Exception as e:
@@ -919,10 +980,21 @@ class Bot:
             await asyncio.sleep(60)
             uptime = (time.time() - self.start) / 60
             status = "LOCKED IN" if self.detector.locked else "SCANNING"
+            sol_usd = await self.discord._fetch_sol_price()
+            pnl_usd = self.total_pnl * sol_usd
             log.info(f"HEARTBEAT [{status}] | up {uptime:.0f}m | "
                      f"{self.detector.count} tokens seen | "
                      f"{self.trades_won}W {self.trades_lost}L | "
-                     f"net {self.total_pnl:+.5f} SOL")
+                     f"net {self.total_pnl:+.5f} SOL ({pnl_usd:+.2f} USD) | "
+                     f"SOL=${sol_usd:.0f}")
+            # Send a keepalive ping to Discord every 30min to prevent webhook timeout
+            if int(uptime) % 30 == 0 and int(uptime) > 0:
+                pnl_str = f"+${pnl_usd:.2f}" if pnl_usd >= 0 else f"-${abs(pnl_usd):.2f}"
+                await self.discord.info(
+                    f"💓 **Winston alive** | {uptime:.0f}min up | "
+                    f"{self.trades_won}W {self.trades_lost}L | "
+                    f"Net: **{pnl_str}** | SOL=${sol_usd:.0f}"
+                )
 
 if __name__ == "__main__":
     try:
