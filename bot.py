@@ -265,6 +265,10 @@ class Detector:
                             "jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
                             "params": [{"mentions": [PUMPFUN]}, {"commitment": "confirmed"}]
                         })
+                        await ws.send_json({
+                            "jsonrpc": "2.0", "id": 2, "method": "logsSubscribe",
+                            "params": [{"mentions": [RAYDIUM_AMM]}, {"commitment": "confirmed"}]
+                        })
                         async for msg in ws:
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 asyncio.create_task(self._handle(msg.data))
@@ -295,22 +299,27 @@ class Detector:
             # Only process Pump.fun events
             if PUMPFUN not in log_text: return
 
-            # Only trigger on brand new token CREATION.
-            # Real new launches have InitializeMint2 (mint account created).
-            # Buy/Sell txs on EXISTING coins never have this — they just
-            # call Buy or Sell on a pre-existing mint. This is the key filter.
-            # CreateV2 = Pump.fun v2 new token. Create+InitializeMint2 = v1.
-            is_new_token = (
-                "Instruction: CreateV2" in log_text or
-                ("Instruction: Create" in log_text and
-                 "Instruction: InitializeMint2" in log_text)
+            # Detect Pump.fun GRADUATION events — this is when a coin
+            # migrates from Pump.fun to Raydium and gets real liquidity added.
+            # This is a consistent pump trigger: bots and traders pile in
+            # at graduation, creating momentum we can ride.
+            # "Withdraw" + PUMPFUN = graduation/migration to Raydium.
+            # Also catch Raydium pool initializations directly.
+            is_graduation = (
+                PUMPFUN in log_text and
+                ("Withdraw" in log_text or "migrate" in log_text.lower())
             )
-            if not is_new_token:
-                return  # Buy/Sell on existing coin — skip entirely
+            is_raydium_pool = (
+                RAYDIUM_AMM in log_text and
+                ("initialize2" in log_text or "InitializeInstruction2" in log_text)
+            )
+
+            if not is_graduation and not is_raydium_pool:
+                return
 
             self.seen.add(sig)
-            source = "pumpfun"
-            log.info(f"NEW TOKEN LAUNCH — tx {sig[:20]}...")
+            source = "pumpfun" if is_graduation else "raydium"
+            log.info(f"GRADUATION detected ({source}) — tx {sig[:20]}...")
 
             # INSTANT mint extraction — read directly from log strings.
             # No getTransaction RPC call needed. Zero latency.
