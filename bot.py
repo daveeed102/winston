@@ -280,17 +280,18 @@ class Detector:
             await asyncio.sleep(5)
 
     async def _handle(self, raw):
-        # Drop immediately if locked — we have a position
+        # Drop immediately if locked — we have a position, don't care
         if self.locked:
             return
 
         try:
             data = json.loads(raw)
             if "params" not in data: return
-            value    = data["params"]["result"].get("value", {})
-            logs     = value.get("logs", [])
-            sig      = value.get("signature", "")
+            value = data["params"]["result"].get("value", {})
+            logs  = value.get("logs", [])
+            sig   = value.get("signature", "")
             if not logs or not sig: return
+            if sig in self.seen: return
 
             log_text   = " ".join(logs)
             is_pumpfun = PUMPFUN in log_text and (
@@ -300,60 +301,76 @@ class Detector:
                           "InitializeInstruction2" in log_text)
 
             if not is_pumpfun and not is_raydium: return
-            if sig in self.seen: return
             self.seen.add(sig)
 
             source = "pumpfun" if is_pumpfun else "raydium"
-            log.info(f"NEW {source.upper()} pool — tx {sig[:20]}...")
 
-            # Fetch mint
-            mint = None
-            async with aiohttp.ClientSession() as sess:
-                for attempt in range(5):
-                    mint = await self._extract_mint(sig, sess)
-                    if mint: break
-                    await asyncio.sleep(2)
+            # INSTANT mint extraction — read directly from log strings.
+            # No getTransaction RPC call needed. Zero latency.
+            mint = self._mint_from_logs(logs, source)
 
-            if not mint or mint in self.seen:
-                log.warning(f"No mint from {sig[:16]}")
+            if not mint:
+                log.warning(f"No mint in logs for {sig[:16]} — skipping")
                 return
 
+            if mint in self.seen:
+                return
             self.seen.add(mint)
+
             self.count += 1
             token = Token(mint=mint, source=source)
-            log.info(f"DETECTED {source.upper()} -> {mint[:24]}...")
+            log.info(f"DETECTED {source.upper()} -> {mint[:24]}... (instant)")
 
-            # Only queue if still unlocked
             if not self.locked:
                 await self.queue.put(token)
 
         except Exception as e:
             log.warning(f"Handle err: {e}")
 
-    async def _extract_mint(self, sig, sess):
-        try:
-            payload = {
-                "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
-                "params": [sig, {"encoding": "jsonParsed",
-                                 "maxSupportedTransactionVersion": 0}]
-            }
-            async with sess.post(self.sol.rpc, json=payload,
-                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
-                data = await r.json()
-            tx   = data.get("result")
-            if not tx: return None
-            meta = tx.get("meta", {})
-            if not meta or meta.get("err"): return None
-            skip = {WSOL,
-                    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-                    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"}
-            for bal in meta.get("postTokenBalances", []):
-                m = bal.get("mint", "")
-                if m and m not in skip: return m
-            for bal in meta.get("preTokenBalances", []):
-                m = bal.get("mint", "")
-                if m and m not in skip: return m
-        except: pass
+    _B58  = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+
+    def _skip_addrs(self):
+        return {WSOL,
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+                PUMPFUN, RAYDIUM_AMM}
+
+    def _mint_from_logs(self, logs: list, source: str) -> Optional[str]:
+        """
+        Extract token mint directly from WebSocket log strings.
+        No RPC call, no delay. Reads the addresses Solana already printed.
+
+        Pump.fun mints always end with 'pump' (43-44 chars base58).
+        Raydium mints are standard 43-44 char base58 addresses.
+        """
+        import re
+        skip = self._skip_addrs()
+
+        # Pump.fun: look specifically for addresses ending in 'pump'
+        if source == "pumpfun":
+            pump_re = re.compile(r'\b([1-9A-HJ-NP-Za-km-z]{32,44}pump)\b')
+            for line in logs:
+                for m in pump_re.finditer(line):
+                    addr = m.group(1)
+                    if addr not in skip:
+                        log.debug(f"Pump mint from log: {addr}")
+                        return addr
+
+        # Raydium / generic fallback: any 43-44 char base58 address
+        # Prioritise lines that mention 'mint' or 'initialize'
+        addr_re = re.compile(r'\b([1-9A-HJ-NP-Za-km-z]{43,44})\b')
+        priority = [l for l in logs if any(
+            kw in l for kw in ("initialize", "mint", "Mint", "token", "Token")
+        )]
+        rest = [l for l in logs if l not in priority]
+
+        for line in priority + rest:
+            for m in addr_re.finditer(line):
+                addr = m.group(1)
+                if addr not in skip and all(c in self._B58 for c in addr):
+                    log.debug(f"Raydium mint from log: {addr}")
+                    return addr
+
         return None
 
 # ─── BOT ─────────────────────────────────────────────────────────────────────
