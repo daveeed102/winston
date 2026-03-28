@@ -28,10 +28,11 @@ import aiohttp
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
 TRADE_AMOUNT_SOL  = float(os.getenv("TRADE_AMOUNT_SOL",   "0.061"))
-TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT",  "12"))   # % below entry/high before bail
+TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT",  "25"))   # wider — memecoins are volatile   # % below entry/high before bail
 MAX_HOLD_MINUTES  = float(os.getenv("MAX_HOLD_MINUTES",   "2"))    # hard timeout
 SLIPPAGE_BPS      = int(os.getenv("SLIPPAGE_BPS",         "500"))
 PROFIT_TARGET_X   = float(os.getenv("PROFIT_TARGET_X",    "1.25")) # sell ALL at 1.25x
+MIN_MOMENTUM_PCT  = float(os.getenv("MIN_MOMENTUM_PCT",   "5"))   # min % rise in 3s before buying
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 SOLANA_RPC_URL      = os.getenv("SOLANA_RPC_URL",      "")
@@ -294,27 +295,22 @@ class Detector:
             # Only process Pump.fun events
             if PUMPFUN not in log_text: return
 
-            # Log ALL Pump.fun log lines so we can see the exact keywords
-            # This tells us what a new launch looks like vs a migration
-            log.info(f"PUMPFUN EVENT [{sig[:16]}] logs:")
-            for line in logs:
-                if line.strip():
-                    log.info(f"  | {line[:120]}")
+            # Only trigger on brand new token CREATION.
+            # Real new launches have InitializeMint2 (mint account created).
+            # Buy/Sell txs on EXISTING coins never have this — they just
+            # call Buy or Sell on a pre-existing mint. This is the key filter.
+            # CreateV2 = Pump.fun v2 new token. Create+InitializeMint2 = v1.
+            is_new_token = (
+                "Instruction: CreateV2" in log_text or
+                ("Instruction: Create" in log_text and
+                 "Instruction: InitializeMint2" in log_text)
+            )
+            if not is_new_token:
+                return  # Buy/Sell on existing coin — skip entirely
 
-            # Known migration/graduation keywords — these are OLD coins, skip
-            is_migration = any(kw in log_text for kw in (
-                "Withdraw", "withdraw", "migrate", "Migrate",
-                "InitializeInstruction2", "initialize2",
-            ))
-            if is_migration:
-                log.info(f"  -> SKIP: migration/graduation event")
-                return
-
-            # Must be a new token event — log it and proceed
-            log.info(f"  -> NEW LAUNCH candidate")
             self.seen.add(sig)
-
             source = "pumpfun"
+            log.info(f"NEW TOKEN LAUNCH — tx {sig[:20]}...")
 
             # INSTANT mint extraction — read directly from log strings.
             # No getTransaction RPC call needed. Zero latency.
@@ -452,13 +448,15 @@ class Bot:
 
                 if price_t0 and price_t3:
                     move_pct = ((price_t3 - price_t0) / price_t0) * 100
-                    if move_pct <= 0:
-                        log.info(f"SKIP {token.symbol}: down {move_pct:.1f}% in 3s — not buying, unlocking")
+                    if move_pct < MIN_MOMENTUM_PCT:
+                        log.info(f"SKIP {token.symbol}: only {move_pct:.1f}% in 3s — need {MIN_MOMENTUM_PCT}%+, unlocking")
                         self.detector.locked = False
                         continue
-                    log.info(f"MOMENTUM {token.symbol}: +{move_pct:.1f}% in 3s — BUYING!")
+                    log.info(f"MOMENTUM {token.symbol}: +{move_pct:.1f}% in 3s — target met ({MIN_MOMENTUM_PCT}%+) BUYING!")
                 else:
-                    log.info(f"No price data for {token.symbol} yet (brand new) — buying!")
+                    log.info(f"No price data for {token.symbol} yet (brand new) — skipping, unlocking")
+                    self.detector.locked = False
+                    continue
 
                 # Buy
                 pos = await self._buy(token)
@@ -693,21 +691,65 @@ class Bot:
 
     # ── SELL ─────────────────────────────────────────────────────────────────
 
+    async def _get_real_token_balance(self, mint: str) -> tuple:
+        """
+        Fetch actual on-chain token balance from wallet.
+        Returns (raw_amount, decimals) — the ground truth, not an estimate.
+        """
+        async with aiohttp.ClientSession() as sess:
+            try:
+                async with sess.post(
+                    self.sol.rpc,
+                    json={"jsonrpc": "2.0", "id": 1,
+                          "method": "getTokenAccountsByOwner",
+                          "params": [self.sol.pubkey,
+                                     {"mint": mint},
+                                     {"encoding": "jsonParsed"}]},
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as r:
+                    data = await r.json()
+                accounts = data.get("result", {}).get("value", [])
+                for acct in accounts:
+                    info = (acct.get("account", {})
+                                .get("data", {})
+                                .get("parsed", {})
+                                .get("info", {}))
+                    ta = info.get("tokenAmount", {})
+                    raw = int(ta.get("amount", 0))
+                    dec = int(ta.get("decimals", 6))
+                    if raw > 0:
+                        log.info(f"Real balance: {raw} raw ({raw / 10**dec:.4f} tokens, {dec} decimals)")
+                        return raw, dec
+            except Exception as e:
+                log.error(f"Balance fetch error: {e}")
+        return 0, 6
+
     async def _sell(self, pos: Position, price: float, reason: str):
         gain_x  = price / pos.entry_price if pos.entry_price > 0 else 1.0
         pnl_sol = (price * pos.tokens_held) - pos.cost_sol
         log.info(f"SELLING 100% of {pos.token.symbol} — {reason} "
                  f"({gain_x:.3f}x, {pnl_sol:+.5f} SOL)")
 
-        amount = int(pos.tokens_held * 1e6)
-        if amount <= 0:
-            log.error(f"Sell amount is 0 for {pos.token.symbol}"); return
+        # Always fetch REAL on-chain balance — never trust the estimate
+        # This is the fix for partial sells
+        raw_amount, decimals = await self._get_real_token_balance(pos.token.mint)
+
+        if raw_amount <= 0:
+            # Fallback to estimate if RPC fails
+            raw_amount = int(pos.tokens_held * (10 ** 6))
+            log.warning(f"Could not fetch real balance — using estimate: {raw_amount}")
+
+        if raw_amount <= 0:
+            log.error(f"Sell amount is 0 for {pos.token.symbol} — cannot sell"); return
+
+        log.info(f"Selling raw amount: {raw_amount} (decimals: {decimals})")
 
         sell_succeeded = False
 
-        for attempt in range(1, 4):
+        # Up to 5 attempts — keep trying until it goes through
+        for attempt in range(1, 6):
             order = await self.jup.order(
-                pos.token.mint, WSOL, amount, self.sol.pubkey
+                pos.token.mint, WSOL, raw_amount, self.sol.pubkey
             )
             if order and order.get("transaction"):
                 signed = self.sol.sign(order["transaction"])
@@ -715,25 +757,31 @@ class Bot:
                     result = await self.jup.execute(order["requestId"], signed)
                     if result:
                         if result.get("status") == "Failed":
-                            log.error(f"Sell attempt {attempt} failed: "
-                                      f"{result.get('error','?')}")
+                            err = result.get("error", "?")
+                            log.error(f"Sell attempt {attempt} failed: {err}")
                             log.error(f"Full: {json.dumps(result)[:300]}")
+                            # If "insufficient funds" try with 98% of balance
+                            if "insufficient" in str(err).lower() or attempt == 3:
+                                raw_amount = int(raw_amount * 0.98)
+                                log.warning(f"Retrying with 98% amount: {raw_amount}")
                         else:
                             sig = result.get("signature", "?")
                             log.info(f"SELL TX: {sig[:35]}...")
                             sell_succeeded = True
                             break
             else:
-                log.warning(f"No sell route attempt {attempt}/3 — "
-                            f"mint={pos.token.mint[:20]} amount={amount}")
+                log.warning(f"No sell route attempt {attempt}/5 — "
+                            f"mint={pos.token.mint[:20]} amount={raw_amount}")
 
-            if not sell_succeeded and attempt < 3:
-                await asyncio.sleep(attempt * 2)
+            if not sell_succeeded and attempt < 5:
+                wait = min(attempt * 2, 6)
+                log.info(f"Retrying sell in {wait}s...")
+                await asyncio.sleep(wait)
 
         if not sell_succeeded:
-            log.error(f"SELL FAILED after 3 attempts — {pos.token.symbol}")
+            log.error(f"SELL FAILED after 5 attempts — {pos.token.symbol}")
             log.error(f"  mint={pos.token.mint}")
-            log.error(f"  tokens={pos.tokens_held:.0f} raw_amount={amount}")
+            log.error(f"  raw_amount={raw_amount}")
             return
 
         # Update session stats
