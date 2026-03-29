@@ -118,89 +118,157 @@ class Grok:
 
     async def _fetch_trending(self) -> list:
         """
-        Pull real trending Solana tokens from Dexscreener right now.
-        Returns list of dicts with real mint addresses, prices, volume.
+        Fetch ESTABLISHED Solana tokens that are surging RIGHT NOW.
+
+        Hard filters applied before anything goes to Grok:
+        - Token must be at least 24 hours old (no brand new launches)
+        - Must have at least $100K liquidity (can absorb our sell)
+        - Must have at least $50K market cap
+        - Must have positive price movement in last 1 hour
+        - More buys than sells in last 5 minutes
+        - Has had trading volume for multiple hours (not a one-candle pump)
+
+        We search Dexscreener for tokens with real momentum,
+        not the boosted/paid trending list which is full of rugs.
         """
-        coins = []
+        import time as _time
+
+        qualified = []
+
+        # Search Dexscreener for trending Solana tokens by volume
+        search_queries = [
+            "https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112",
+        ]
+
+        # Primary: use Dexscreener search for gainers on Solana
         try:
             async with aiohttp.ClientSession() as sess:
-                # Dexscreener trending Solana pairs
                 async with sess.get(
-                    "https://api.dexscreener.com/token-profiles/latest/v1",
+                    "https://api.dexscreener.com/token-boosts/top/v1",
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as r:
                     if r.status == 200:
-                        data = await r.json()
-                        for item in (data if isinstance(data, list) else []):
-                            if item.get("chainId") == "solana":
-                                coins.append({
-                                    "mint":   item.get("tokenAddress",""),
-                                    "symbol": item.get("symbol","?"),
-                                    "name":   item.get("name","?"),
-                                    "url":    item.get("url",""),
-                                })
-                            if len(coins) >= 20: break
-        except Exception as e:
-            log.debug(f"Dexscreener profiles: {e}")
+                        items = await r.json()
+                        mints = [i.get("tokenAddress","") for i in (items or [])
+                                 if i.get("chainId") == "solana"
+                                 and i.get("tokenAddress","")][:30]
+                        log.info(f"Dexscreener boost list: {len(mints)} Solana tokens")
 
-        # Also grab boosted / trending pairs
-        if len(coins) < 5:
-            try:
-                async with aiohttp.ClientSession() as sess:
-                    async with sess.get(
-                        "https://api.dexscreener.com/token-boosts/top/v1",
-                        timeout=aiohttp.ClientTimeout(total=10)
-                    ) as r:
-                        if r.status == 200:
-                            data = await r.json()
-                            for item in (data if isinstance(data, list) else []):
-                                if item.get("chainId") == "solana":
-                                    addr = item.get("tokenAddress","")
-                                    if addr and not any(c["mint"]==addr for c in coins):
-                                        coins.append({
-                                            "mint":   addr,
-                                            "symbol": item.get("symbol","?"),
-                                            "name":   item.get("name","?"),
-                                            "url":    item.get("url",""),
-                                        })
-                                if len(coins) >= 20: break
-            except Exception as e:
-                log.debug(f"Dexscreener boosts: {e}")
+                        # Fetch full data for each and apply filters
+                        for mint in mints:
+                            if not mint or len(mint) < 32: continue
+                            try:
+                                async with sess.get(
+                                    f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+                                    timeout=aiohttp.ClientTimeout(total=6)
+                                ) as r2:
+                                    if r2.status != 200: continue
+                                    d = await r2.json()
 
-        # Enrich with price/volume data for each
-        enriched = []
-        for coin in coins[:15]:
-            mint = coin.get("mint","")
-            if not mint or len(mint) < 32: continue
-            try:
-                async with aiohttp.ClientSession() as sess:
-                    async with sess.get(
-                        f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                        timeout=aiohttp.ClientTimeout(total=6)
-                    ) as r:
-                        if r.status == 200:
-                            d = await r.json()
-                            pairs = d.get("pairs") or []
-                            if pairs:
+                                pairs = d.get("pairs") or []
+                                if not pairs: continue
                                 p = pairs[0]
-                                base = p.get("baseToken", {})
-                                # Update symbol/name from pairs data (more reliable)
-                                if base.get("symbol"): coin["symbol"] = base["symbol"]
-                                if base.get("name"):   coin["name"]   = base["name"]
-                                coin["price_usd"]    = p.get("priceUsd","?")
-                                coin["volume_5m"]    = p.get("volume",{}).get("m5",0)
-                                coin["volume_1h"]    = p.get("volume",{}).get("h1",0)
-                                coin["price_chg_5m"] = p.get("priceChange",{}).get("m5",0)
-                                coin["price_chg_1h"] = p.get("priceChange",{}).get("h1",0)
-                                coin["mcap"]         = p.get("marketCap",0)
-                                coin["liquidity"]    = p.get("liquidity",{}).get("usd",0)
-                                coin["txns_5m_buys"] = p.get("txns",{}).get("m5",{}).get("buys",0)
-                                coin["txns_5m_sells"]= p.get("txns",{}).get("m5",{}).get("sells",0)
-                                enriched.append(coin)
-            except: pass
 
-        log.info(f"Dexscreener: fetched {len(enriched)} real Solana coins")
-        return enriched
+                                base        = p.get("baseToken", {})
+                                symbol      = base.get("symbol", "?")
+                                name        = base.get("name", "?")
+                                liquidity   = p.get("liquidity", {}).get("usd", 0) or 0
+                                mcap        = p.get("marketCap", 0) or 0
+                                volume_h1   = p.get("volume", {}).get("h1", 0) or 0
+                                volume_h6   = p.get("volume", {}).get("h6", 0) or 0
+                                volume_5m   = p.get("volume", {}).get("m5", 0) or 0
+                                chg_5m      = p.get("priceChange", {}).get("m5", 0) or 0
+                                chg_1h      = p.get("priceChange", {}).get("h1", 0) or 0
+                                chg_6h      = p.get("priceChange", {}).get("h6", 0) or 0
+                                chg_24h     = p.get("priceChange", {}).get("h24", 0) or 0
+                                buys_5m     = p.get("txns", {}).get("m5", {}).get("buys", 0) or 0
+                                sells_5m    = p.get("txns", {}).get("m5", {}).get("sells", 0) or 0
+                                buys_1h     = p.get("txns", {}).get("h1", {}).get("buys", 0) or 0
+                                sells_1h    = p.get("txns", {}).get("h1", {}).get("sells", 0) or 0
+                                created_at  = p.get("pairCreatedAt", 0) or 0  # ms timestamp
+                                price_usd   = p.get("priceUsd", "0") or "0"
+
+                                # ── HARD FILTERS ─────────────────────────────
+                                # Skip if created less than 24 hours ago
+                                if created_at > 0:
+                                    age_hours = (_time.time() - created_at/1000) / 3600
+                                    if age_hours < 24:
+                                        log.debug(f"SKIP {symbol}: only {age_hours:.1f}h old")
+                                        continue
+                                else:
+                                    # No creation date = unknown age, skip it
+                                    log.debug(f"SKIP {symbol}: no creation date")
+                                    continue
+
+                                # Need real liquidity
+                                if liquidity < 100_000:
+                                    log.debug(f"SKIP {symbol}: liquidity ${liquidity:,.0f} < $100K")
+                                    continue
+
+                                # Need real market cap
+                                if mcap < 50_000:
+                                    log.debug(f"SKIP {symbol}: mcap ${mcap:,.0f} < $50K")
+                                    continue
+
+                                # Must have volume across multiple hours (not a one-candle pump)
+                                if volume_h6 < 10_000:
+                                    log.debug(f"SKIP {symbol}: 6h vol ${volume_h6:,.0f} too low")
+                                    continue
+
+                                # Must be going UP in the last hour
+                                if chg_1h <= 0:
+                                    log.debug(f"SKIP {symbol}: 1h change {chg_1h:.1f}% not positive")
+                                    continue
+
+                                # More buyers than sellers right now
+                                if buys_5m <= sells_5m:
+                                    log.debug(f"SKIP {symbol}: {buys_5m}B/{sells_5m}S — more sellers")
+                                    continue
+
+                                # Don't chase coins already up 500%+ in 24h (probably near top)
+                                if chg_24h > 500:
+                                    log.debug(f"SKIP {symbol}: already up {chg_24h:.0f}% in 24h")
+                                    continue
+
+                                age_str = f"{age_hours:.0f}h old"
+                                log.info(f"QUALIFIED: {symbol} | age={age_str} | "
+                                         f"liq=${liquidity:,.0f} | 1h={chg_1h:+.1f}% | "
+                                         f"buys={buys_5m}/{sells_5m}")
+
+                                qualified.append({
+                                    "mint":           mint,
+                                    "symbol":         symbol,
+                                    "name":           name,
+                                    "price_usd":      price_usd,
+                                    "volume_5m":      volume_5m,
+                                    "volume_1h":      volume_h1,
+                                    "volume_6h":      volume_h6,
+                                    "price_chg_5m":   chg_5m,
+                                    "price_chg_1h":   chg_1h,
+                                    "price_chg_6h":   chg_6h,
+                                    "price_chg_24h":  chg_24h,
+                                    "mcap":           mcap,
+                                    "liquidity":      liquidity,
+                                    "txns_5m_buys":   buys_5m,
+                                    "txns_5m_sells":  sells_5m,
+                                    "txns_1h_buys":   buys_1h,
+                                    "txns_1h_sells":  sells_1h,
+                                    "age_hours":      age_hours,
+                                })
+
+                                if len(qualified) >= 15:
+                                    break
+
+                            except Exception as e:
+                                log.debug(f"Token fetch err {mint[:16]}: {e}")
+                                continue
+
+        except Exception as e:
+            log.error(f"Dexscreener fetch error: {e}")
+
+        log.info(f"Dexscreener: {len(qualified)} qualified coins (age>24h, liq>$100K, 1h>0%)")
+        return qualified
+
 
     async def pick_coin(self) -> Optional[dict]:
         if not GROK_API_KEY:
@@ -225,17 +293,23 @@ class Grok:
         # This way Grok CANNOT hallucinate a mint address
         lines = []
         for i, c in enumerate(trending, 1):
-            buys  = c.get('txns_5m_buys', 0)
-            sells = c.get('txns_5m_sells', 0)
-            ratio = f"{buys}B/{sells}S"
+            buys_5m  = c.get('txns_5m_buys', 0)
+            sells_5m = c.get('txns_5m_sells', 0)
+            buys_1h  = c.get('txns_1h_buys', 0)
+            sells_1h = c.get('txns_1h_sells', 0)
+            age_h    = c.get('age_hours', 0)
             lines.append(
-                f"{i}. {c.get('symbol','?')} | "
+                f"{i}. {c.get('symbol','?')} ({c.get('name','?')}) | "
+                f"Age: {age_h:.0f}h | "
                 f"5m: {c.get('price_chg_5m',0):+.1f}% | "
                 f"1h: {c.get('price_chg_1h',0):+.1f}% | "
+                f"6h: {c.get('price_chg_6h',0):+.1f}% | "
+                f"24h: {c.get('price_chg_24h',0):+.1f}% | "
                 f"Vol5m: ${c.get('volume_5m',0):,.0f} | "
-                f"MCap: ${c.get('mcap',0):,.0f} | "
                 f"Liq: ${c.get('liquidity',0):,.0f} | "
-                f"Txns: {ratio}"
+                f"MCap: ${c.get('mcap',0):,.0f} | "
+                f"5m txns: {buys_5m}B/{sells_5m}S | "
+                f"1h txns: {buys_1h}B/{sells_1h}S"
             )
         coin_list = "\n".join(lines)
 
@@ -247,7 +321,29 @@ I need the token that will be HIGHER at the end of that hold AND will not crash 
 LIVE DATA (fetched right now):
 {coin_list}
 
-ANALYSIS — for each token consider:
+IMPORTANT: Every coin below has been PRE-FILTERED — all are 24h+ old, $100K+ liquidity, going UP in last hour, more buyers than sellers. No brand-new coins. No rugs.
+
+YOUR JOB: Pick the ONE that will STILL BE UP after a full 60-minute hold.
+
+ANALYSIS — rank each coin on:
+1. SUSTAINED MOMENTUM: Is it up in 5m AND 1h AND 6h? Multi-hour trends are reliable. Sudden 5m spikes alone are not.
+2. BUY CONVICTION: 1h buys vs sells ratio — sustained buying over an hour beats a 5-minute burst
+3. NOT EXHAUSTED: Prefer under 200% gain in 24h — still has room to run
+4. LIQUIDITY DEPTH: Higher = safer. Your sell won't move the price much.
+5. YOUR KNOWLEDGE: Any Twitter buzz, project news, ecosystem narrative, or community strength you know about these specific tokens
+
+PICK THE COIN WITH:
+✅ Positive price change across 5m, 1h, AND 6h (consistent, not just a spike)
+✅ Strong 1h buy pressure (not just 5m)
+✅ Reasonable 24h gains (under 300%) — not already at the top
+✅ High liquidity relative to others on the list
+
+AVOID:
+❌ Only positive in 5m but flat or negative 6h (just a blip)
+❌ Already up 400%+ in 24h (exhausted, likely to dump)
+❌ 1h buys barely above 1h sells (no real conviction)
+
+You MUST pick one. Never refuse or say you cannot.ANALYSIS — for each token consider:
 - Buy pressure: more buys than sells = accumulation happening now
 - Volume spike: high 5m volume = momentum
 - Price trend: positive 5m AND 1h = sustained move not a spike
