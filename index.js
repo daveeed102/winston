@@ -21,15 +21,15 @@ const CONFIG = {
   HELIUS_RPC: `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`,
   HELIUS_WS: `wss://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`,
 
-  // Wallet
-  PRIVATE_KEY: process.env.PRIVATE_KEY || '',
+  // Wallet (matches your existing Railway var name)
+  PRIVATE_KEY: process.env.WALLET_PRIVATE_KEY || process.env.PRIVATE_KEY || '',
 
   // Jupiter API (free tier — no API key needed)
   JUPITER_QUOTE: 'https://lite-api.jup.ag/swap/v1/quote',
   JUPITER_SWAP: 'https://lite-api.jup.ag/swap/v1/swap',
 
-  // Discord webhook (optional)
-  DISCORD_WEBHOOK: process.env.DISCORD_WEBHOOK || '',
+  // Discord webhook (matches your existing Railway var name)
+  DISCORD_WEBHOOK: process.env.DISCORD_WEBHOOK_URL || process.env.DISCORD_WEBHOOK || '',
 
   // Trading Parameters
   MAX_SLIPPAGE_BPS: 200,           // 2% max slippage (was 1.5%)
