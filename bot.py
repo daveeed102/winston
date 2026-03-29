@@ -27,7 +27,7 @@ import aiohttp
 
 TRADE_AMOUNT_SOL     = float(os.getenv("TRADE_AMOUNT_SOL",    "0.012"))   # ~$2 at ~$165/SOL
 MAX_POSITIONS        = int(os.getenv("MAX_POSITIONS",         "5"))
-SCAN_INTERVAL_MINS   = float(os.getenv("SCAN_INTERVAL_MINS",  "15"))      # how often to look for new picks
+SCAN_INTERVAL_MINS   = float(os.getenv("SCAN_INTERVAL_MINS",  "5"))       # how often to look for new picks
 GROK_MIN_SCORE       = int(os.getenv("GROK_MIN_SCORE",        "75"))      # min score to buy
 SLIPPAGE_BPS         = int(os.getenv("SLIPPAGE_BPS",          "1000"))
 MAX_HOLD_MINUTES     = float(os.getenv("MAX_HOLD_MINUTES",    "120"))     # 2h max hold per position
@@ -46,7 +46,7 @@ STALL_MINUTES        = float(os.getenv("STALL_MINUTES",       "12"))      # mins
 DEAD_PRICE_STRIKES   = int(os.getenv("DEAD_PRICE_STRIKES",   "5"))       # 5 identical prices = bail
 
 # Anti-rug
-MAX_TOP_HOLDER_PCT   = float(os.getenv("MAX_TOP_HOLDER_PCT",  "20"))
+MAX_TOP_HOLDER_PCT   = float(os.getenv("MAX_TOP_HOLDER_PCT",  "35"))
 
 # Env — credentials
 DISCORD_WEBHOOK_URL  = os.getenv("DISCORD_WEBHOOK_URL", "")
@@ -357,7 +357,7 @@ Rules:
                              "Content-Type": "application/json"},
                     json={"model": "grok-3",
                           "messages": [{"role": "user", "content": prompt}],
-                          "max_tokens": 2000,
+                          "max_tokens": 4000,
                           "temperature": 0.3},
                     timeout=aiohttp.ClientTimeout(total=45)
                 ) as r:
@@ -413,6 +413,42 @@ Rules:
 
         except json.JSONDecodeError as e:
             log.error(f"Grok JSON parse error: {e}")
+            # Try to salvage partial response — extract complete objects before truncation
+            try:
+                partial = []
+                for line in raw.split("\n"):
+                    line = line.strip()
+                    if not line or line in ("{", "}", "[", "]", ","): continue
+                    # Look for complete score lines we can extract manually
+                import re
+                for m in re.finditer(
+                    r'\{[^{}]*"number"\s*:\s*(\d+)[^{}]*"score"\s*:\s*(\d+)[^{}]*"decision"\s*:\s*"(\w+)"[^{}]*"confidence"\s*:\s*"(\w+)"[^{}]*"reason"\s*:\s*"([^"]{0,300})"[^{}]*\}',
+                    raw, re.DOTALL
+                ):
+                    n      = int(m.group(1)) - 1
+                    score  = int(m.group(2))
+                    dec    = m.group(3)
+                    conf   = m.group(4)
+                    reason = m.group(5)
+                    if 0 <= n < len(candidates):
+                        partial.append({
+                            "mint":       candidates[n]["mint"],
+                            "symbol":     candidates[n]["symbol"],
+                            "name":       candidates[n]["name"],
+                            "score":      score,
+                            "confidence": conf,
+                            "reason":     reason,
+                            "data":       candidates[n],
+                        })
+                if partial:
+                    approved = [x for x in partial if x["score"] >= GROK_MIN_SCORE and
+                                # re-check decision from raw if possible
+                                True]
+                    skipped  = [x for x in partial if x["score"] < GROK_MIN_SCORE]
+                    log.info(f"Partial parse rescued {len(partial)} scores ({len(approved)} buys)")
+                    return approved, skipped
+            except Exception as pe:
+                log.debug(f"Partial parse also failed: {pe}")
         except Exception as e:
             log.error(f"Grok score error: {e}")
         return [], []
@@ -437,6 +473,7 @@ class Jupiter:
         return aiohttp.ClientSession(connector=conn, headers=self._headers())
 
     async def price(self, mint) -> Optional[float]:
+        # Primary: Jupiter Price API
         s = await self._sess()
         try:
             async with s.get(f"{JUP_PRICE}?ids={mint}",
@@ -450,6 +487,24 @@ class Jupiter:
             pass
         finally:
             await s.close()
+
+        # Fallback: Dexscreener
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(
+                    f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as r:
+                    if r.status == 200:
+                        d = await r.json()
+                        pairs = d.get("pairs") or []
+                        if pairs:
+                            p = pairs[0].get("priceUsd")
+                            if p:
+                                return float(p)
+        except:
+            pass
+
         return None
 
     async def sol_usd(self) -> float:
