@@ -237,7 +237,7 @@ async function analyzeRecentSwaps(candidateWallets) {
   log('DISCOVERY', 'Analyzing recent Jupiter swaps...');
 
   try {
-    // Get recent transactions involving Jupiter program
+    // Get recent transactions involving Jupiter program — cast a wide net
     const response = await fetch(CONFIG.HELIUS_RPC, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -247,7 +247,7 @@ async function analyzeRecentSwaps(candidateWallets) {
         method: 'getSignaturesForAddress',
         params: [
           CONFIG.JUPITER_PROGRAM,
-          { limit: 100 }
+          { limit: 500 }
         ]
       })
     });
@@ -258,9 +258,9 @@ async function analyzeRecentSwaps(candidateWallets) {
     // Extract unique signers from these transactions
     const signerCounts = new Map();
 
-    // Process in batches to avoid rate limits
+    // Process in batches — fetch more transactions for wider coverage
     const batchSize = 20;
-    for (let i = 0; i < Math.min(signatures.length, 60); i += batchSize) {
+    for (let i = 0; i < Math.min(signatures.length, 200); i += batchSize) {
       const batch = signatures.slice(i, i + batchSize);
 
       const txPromises = batch.map(sig =>
@@ -288,16 +288,16 @@ async function analyzeRecentSwaps(candidateWallets) {
         }
       }
 
-      await sleep(500); // Gentle rate limiting
+      await sleep(300);
     }
 
-    // Score wallets that appear multiple times (active traders)
+    // Score ANY wallet that appeared — even once is worth checking
+    // The deep scoring will filter out bad ones anyway
     const activeTraders = [...signerCounts.entries()]
-      .filter(([_, count]) => count >= 2)
       .sort((a, b) => b[1] - a[1])
-      .slice(0, 30);
+      .slice(0, 50);  // Evaluate up to 50 candidates
 
-    log('DISCOVERY', `Found ${activeTraders.length} active traders to evaluate`);
+    log('DISCOVERY', `Found ${activeTraders.length} candidate traders to evaluate`);
 
     for (const [addr] of activeTraders) {
       try {
@@ -328,71 +328,100 @@ async function scoreWallet(address) {
   try {
     log('DISCOVERY', `Scoring wallet ${address.slice(0, 8)}... (deep analysis)`);
 
-    // Step 1: Page through transaction history to gather swap data
-    // getSignaturesForAddress returns max 1000 per call, use `before` to paginate
+    // Step 1: Fetch transaction history
+    // Strategy: grab the MOST RECENT 200 signatures and fetch ALL of them
+    // This gives us dense coverage where we can actually match buy+sell pairs
+    // Then grab one old page to check longevity
     const allSwaps = [];
-    let lastSignature = undefined;
     let totalSigsScanned = 0;
-    const MAX_PAGES = 10;     // Up to 10,000 signatures
-    const SIGS_PER_PAGE = 1000;
+    let oldestTimestamp = null;
+    let newestTimestamp = null;
 
-    for (let page = 0; page < MAX_PAGES; page++) {
-      const params = [address, { limit: SIGS_PER_PAGE }];
-      if (lastSignature) params[1].before = lastSignature;
+    // Phase A: Dense fetch of recent transactions (last 200)
+    log('DISCOVERY', `${address.slice(0, 8)}... — fetching recent history...`);
+    const recentRes = await fetch(CONFIG.HELIUS_RPC, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1,
+        method: 'getSignaturesForAddress',
+        params: [address, { limit: 200 }],
+      })
+    });
 
-      const response = await fetch(CONFIG.HELIUS_RPC, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0', id: 1,
-          method: 'getSignaturesForAddress',
-          params,
-        })
-      });
+    const recentData = await recentRes.json();
+    const recentSigs = (recentData?.result || []).filter(s => !s.err);
+    totalSigsScanned += recentSigs.length;
 
-      const data = await response.json();
-      const sigs = data?.result || [];
-      if (sigs.length === 0) break;
+    if (recentSigs.length > 0) {
+      newestTimestamp = recentSigs[0].blockTime;
+      oldestTimestamp = recentSigs[recentSigs.length - 1].blockTime;
+    }
 
-      totalSigsScanned += sigs.length;
-      lastSignature = sigs[sigs.length - 1].signature;
+    // Fetch ALL recent transactions in batches of 10
+    const batchSize = 10;
+    for (let i = 0; i < recentSigs.length; i += batchSize) {
+      const batch = recentSigs.slice(i, i + batchSize);
+      const txPromises = batch.map(sig =>
+        fetch(CONFIG.HELIUS_RPC, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0', id: 1,
+            method: 'getTransaction',
+            params: [sig.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]
+          })
+        }).then(r => r.json()).catch(() => null)
+      );
 
-      // Sample transactions from this page (don't fetch every single one — too expensive)
-      // Take every Nth transaction to get a representative sample across the full history
-      const sampleRate = Math.max(1, Math.floor(sigs.length / 20)); // ~20 samples per page
-      const sampled = sigs.filter((_, i) => i % sampleRate === 0 && !sigs[i].err);
+      const results = await Promise.all(txPromises);
+      for (const res of results) {
+        const tx = res?.result;
+        if (!tx || tx.meta?.err) continue;
+        const swap = parseSwapFromTransaction(tx, address);
+        if (swap) allSwaps.push(swap);
+      }
+      await sleep(200);
+    }
 
-      const batchSize = 10;
-      for (let i = 0; i < sampled.length; i += batchSize) {
-        const batch = sampled.slice(i, i + batchSize);
-        const txPromises = batch.map(sig =>
-          fetch(CONFIG.HELIUS_RPC, {
+    // Phase B: Check how far back their history goes (for longevity)
+    // Jump to their oldest available page
+    let totalEstimatedSigs = recentSigs.length;
+    let oldestKnownTimestamp = oldestTimestamp;
+
+    if (recentSigs.length >= 200) {
+      // They have more history — page deeper to estimate total volume + longevity
+      let lastSig = recentSigs[recentSigs.length - 1].signature;
+      for (let page = 0; page < 5; page++) {
+        try {
+          const pageRes = await fetch(CONFIG.HELIUS_RPC, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               jsonrpc: '2.0', id: 1,
-              method: 'getTransaction',
-              params: [sig.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]
+              method: 'getSignaturesForAddress',
+              params: [address, { limit: 1000, before: lastSig }],
             })
-          }).then(r => r.json()).catch(() => null)
-        );
+          });
+          const pageData = await pageRes.json();
+          const pageSigs = pageData?.result || [];
+          if (pageSigs.length === 0) break;
 
-        const results = await Promise.all(txPromises);
-        for (const res of results) {
-          const tx = res?.result;
-          if (!tx || tx.meta?.err) continue;
-          const swap = parseSwapFromTransaction(tx, address);
-          if (swap) allSwaps.push(swap);
-        }
-        await sleep(300);
+          totalEstimatedSigs += pageSigs.length;
+          lastSig = pageSigs[pageSigs.length - 1].signature;
+          oldestKnownTimestamp = pageSigs[pageSigs.length - 1].blockTime || oldestKnownTimestamp;
+
+          if (pageSigs.length < 1000) break;
+          await sleep(300);
+        } catch (e) { break; }
       }
-
-      // If fewer than SIGS_PER_PAGE returned, we've reached the end
-      if (sigs.length < SIGS_PER_PAGE) break;
-      await sleep(500);
     }
 
-    log('DISCOVERY', `${address.slice(0, 8)}... — scanned ${totalSigsScanned} sigs, parsed ${allSwaps.length} swaps`);
+    totalSigsScanned = totalEstimatedSigs;
+
+    log('DISCOVERY', `${address.slice(0, 8)}... — fetched ${recentSigs.length} recent txs, found ${allSwaps.length} swaps, ~${totalEstimatedSigs} total sigs`);
+
+    // Step 2: Build per-token trade records (pair buys with sells)
 
     // Step 2: Build per-token trade records (pair buys with sells)
     const tokenHistory = new Map();
@@ -485,9 +514,9 @@ async function scoreWallet(address) {
     }
     const largestWinShare = totalPnlSol > 0 ? largestWinSol / totalPnlSol : 1;
 
-    // Step 9: Active months (longevity)
-    const firstTradeTime = completedTrades[0]?.timestamp || 0;
-    const lastTradeTime = completedTrades[completedTrades.length - 1]?.timestamp || 0;
+    // Step 9: Active months (longevity) — use the deep history check, not just sampled trades
+    const firstTradeTime = oldestKnownTimestamp || completedTrades[0]?.timestamp || 0;
+    const lastTradeTime = newestTimestamp || completedTrades[completedTrades.length - 1]?.timestamp || 0;
     const activeMonths = Math.max(0, (lastTradeTime - firstTradeTime) / (30 * 24 * 60 * 60));
 
     // Step 10: Monthly P&L consistency check
@@ -1373,12 +1402,12 @@ async function main() {
 
   if (state.trackedWallets.size === 0 && CONFIG.SEED_WALLETS.length === 0) {
     log('WARN', 'No wallets discovered and no seed wallets provided.');
-    log('WARN', 'Set SEED_WALLETS in .env with comma-separated wallet addresses.');
-    log('WARN', 'Running in discovery-only mode. Will retry in 30 minutes...');
+    log('WARN', 'Set SEED_WALLETS in Railway with comma-separated wallet addresses for best results.');
+    log('WARN', 'Retrying discovery every 2 minutes...');
 
-    // Keep trying to discover wallets
+    // Keep trying aggressively
     while (state.trackedWallets.size === 0 && state.isRunning) {
-      await sleep(30 * 60 * 1000);
+      await sleep(2 * 60 * 1000); // Retry every 2 min
       await discoverTopWallets();
     }
   }
