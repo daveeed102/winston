@@ -37,9 +37,10 @@ import aiohttp
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
 TRADE_AMOUNT_SOL   = float(os.getenv("TRADE_AMOUNT_SOL",   "0.0625"))
-TRAILING_STOP_PCT  = float(os.getenv("TRAILING_STOP_PCT",  "35"))
-MAX_HOLD_MINUTES   = float(os.getenv("MAX_HOLD_MINUTES",   "5"))       # graduation holds
-GROK_HOLD_MINUTES  = float(os.getenv("GROK_HOLD_MINUTES",  "60"))     # grok picks get longer
+TRAILING_STOP_PCT  = float(os.getenv("TRAILING_STOP_PCT",  "35"))      # graduation sniper stop (unused now)
+GROK_STOP_LOSS_PCT = float(os.getenv("GROK_STOP_LOSS_PCT", "60"))      # Grok hold stop — wide, only for catastrophic dumps
+MAX_HOLD_MINUTES   = float(os.getenv("MAX_HOLD_MINUTES",   "5"))       # graduation holds (unused now)
+GROK_HOLD_MINUTES  = float(os.getenv("GROK_HOLD_MINUTES",  "60"))      # grok picks ride the full hour
 SLIPPAGE_BPS       = int(os.getenv("SLIPPAGE_BPS",         "1000"))
 PROFIT_TARGET_1    = float(os.getenv("PROFIT_TARGET_1",    "1.4"))
 PROFIT_TARGET_2    = float(os.getenv("PROFIT_TARGET_2",    "2.0"))
@@ -182,6 +183,10 @@ class Grok:
                             pairs = d.get("pairs") or []
                             if pairs:
                                 p = pairs[0]
+                                base = p.get("baseToken", {})
+                                # Update symbol/name from pairs data (more reliable)
+                                if base.get("symbol"): coin["symbol"] = base["symbol"]
+                                if base.get("name"):   coin["name"]   = base["name"]
                                 coin["price_usd"]    = p.get("priceUsd","?")
                                 coin["volume_5m"]    = p.get("volume",{}).get("m5",0)
                                 coin["volume_1h"]    = p.get("volume",{}).get("h1",0)
@@ -534,12 +539,9 @@ class Discord:
         color     = 0x00FF88 if is_profit else 0xFF4444
         emoji     = "✅ PROFIT" if is_profit else "❌ LOSS"
         pnl_str   = f"+{pnl_sol:.5f} SOL" if is_profit else f"{pnl_sol:.5f} SOL"
-        rmap = {"take_profit_1":"Sold 50% at 1.4x 🎯",
-                "take_profit_2":"Sold rest at 2x 🚀",
-                "trailing_stop":"Stop loss 🛑",
-                "timeout":"Timeout ⏰",
-                "dead_coin":"Dead coin 💀",
-                "price_dead":"No price feed 📡"}
+        rmap = {"timeout":    "60min — full hold complete ⏰",
+                "rug_stop":   "Rug detected — emergency exit 🚨",
+                "price_dead": "No price feed 📡"}
         await self.send({"embeds": [{
             "title": f"{emoji} — {label} ({pct}% sold)",
             "color": color,
@@ -747,7 +749,8 @@ class Bot:
         log.info("=" * 55)
         log.info("  WINSTON v8 — Grok Coin Picker (Grok-only mode)")
         log.info(f"  {TRADE_AMOUNT_SOL} SOL/trade")
-        log.info(f"  Sell 50% @ {PROFIT_TARGET_1}x, rest @ {PROFIT_TARGET_2}x")
+        log.info(f"  Hold: {GROK_HOLD_MINUTES:.0f}min full ride | Rug stop: -{GROK_STOP_LOSS_PCT:.0f}%")
+        log.info(f"  BUY -> HOLD 60min -> SELL | Only early exit: rug (-{GROK_STOP_LOSS_PCT:.0f}%)")
         log.info(f"  Graduation timeout: {MAX_HOLD_MINUTES}min | "
                  f"Grok timeout: {GROK_HOLD_MINUTES}min")
         log.info(f"  Grok picks every: {GROK_INTERVAL_MINS:.0f}min")
@@ -968,6 +971,10 @@ class Bot:
         tokens = out_amt / 1e6
         self.sol_usd = await self.jup.sol_usd()
 
+        # Grok positions use a wide stop — let it ride the full hour.
+        # Only bail on a truly catastrophic dump (default 60% down).
+        # Graduation positions use the tighter trailing stop.
+        stop_pct = GROK_STOP_LOSS_PCT if token.source == "grok" else TRAILING_STOP_PCT
         pos = Position(
             token           = token,
             entry_price     = price,
@@ -975,7 +982,7 @@ class Bot:
             original_tokens = tokens,
             cost_sol        = TRADE_AMOUNT_SOL,
             high_price      = price,
-            stop_price      = price * (1 - TRAILING_STOP_PCT/100),
+            stop_price      = price * (1 - stop_pct/100),
             hold_limit_mins = hold_mins,
         )
         await self.discord.bought(pos, self.sol_usd)
@@ -989,84 +996,53 @@ class Bot:
     # ── WATCH ────────────────────────────────────────────────────────────────
 
     async def _watch(self, pos: Position):
-        log.info(f"WATCHING {pos.token.symbol} — T1={PROFIT_TARGET_1}x "
-                 f"T2={PROFIT_TARGET_2}x stop={TRAILING_STOP_PCT}% "
-                 f"timeout={pos.hold_limit_mins:.0f}min")
-        price_fails = 0
+        """
+        Grok hold strategy — ride the full 60 minutes.
+        Only 3 exits:
+          1. 60-minute timeout — sell everything, ask Grok for next pick
+          2. 60% crash below entry — emergency rug bail
+          3. No price feed for 60s — emergency sell (token probably dead)
+        No stop trailing. No take-profit ladder. Full hold, trust Grok.
+        """
+        stop_price    = pos.entry_price * (1 - GROK_STOP_LOSS_PCT / 100)
+        price_fails   = 0
+        log.info(f"WATCHING {pos.token.symbol} — full {pos.hold_limit_mins:.0f}min hold | "
+                 f"rug stop: ${stop_price:.8f} (-{GROK_STOP_LOSS_PCT:.0f}%)")
 
         while True:
             await asyncio.sleep(1)
             price = await self.jup.price(pos.token.mint)
 
+            # ── NO PRICE ─────────────────────────────────────────────────────
             if not price:
                 price_fails += 1
                 if price_fails % 15 == 1:
-                    log.warning(f"No price ({price_fails}x)")
+                    log.warning(f"No price ({price_fails}x) for {pos.token.symbol}")
                 if price_fails >= 60:
-                    log.error("Price dead — emergency sell")
+                    log.error("Price dead 60s — emergency sell")
                     await self._sell(pos, pos.entry_price, "price_dead", 100)
                     return
                 continue
-
             price_fails = 0
+
             gain_x = price / pos.entry_price if pos.entry_price > 0 else 1.0
+            log.info(f"  {pos.token.symbol:8s} ${price:.8f} "
+                     f"({gain_x:.3f}x) held={pos.hold_mins:.1f}m / {pos.hold_limit_mins:.0f}m")
 
-            # Dead coin detection
-            if price == pos._last_price:
-                pos._same_count += 1
-                if pos._same_count >= DEAD_COIN_STRIKES:
-                    log.warning(f"DEAD COIN — price stuck at ${price:.8f}")
-                    await self._sell(pos, price, "dead_coin", 100)
-                    return
-            else:
-                pos._same_count = 0
-            pos._last_price = price
-
-            log.info(f"  {pos.token.symbol:8s} ${price:.8f} ({gain_x:.3f}x) "
-                     f"stop=${pos.stop_price:.8f} held={pos.hold_mins:.1f}m"
-                     f"{' [HALF OUT]' if pos.took_first else ''}")
-
-            # Timeout
+            # ── EXIT 1: 60-minute timeout — normal exit ───────────────────────
             if pos.timed_out:
-                log.warning(f"TIMEOUT {pos.hold_mins:.1f}min ({gain_x:.2f}x)")
+                log.info(f"TIMEOUT — 60min up, selling at {gain_x:.3f}x")
                 await self._sell(pos, price, "timeout", 100)
                 return
 
-            # T1: sell 50% at 1.4x
-            if gain_x >= PROFIT_TARGET_1 and not pos.took_first:
-                pos.took_first = True
-                log.info(f"T1 HIT {gain_x:.3f}x — selling 50%!")
-                await self._sell(pos, price, "take_profit_1", 50)
-                pos.stop_price = max(pos.stop_price, pos.entry_price * 0.99)
-                log.info(f"Stop moved to entry: ${pos.stop_price:.10f}")
-                continue
-
-            # T2: sell rest at 2x
-            if gain_x >= PROFIT_TARGET_2 and pos.took_first:
-                log.info(f"T2 HIT {gain_x:.3f}x — selling rest!")
-                await self._sell(pos, price, "take_profit_2", 100)
+            # ── EXIT 2: Rug / catastrophic crash ─────────────────────────────
+            if price <= stop_price:
+                log.warning(f"RUG DETECTED — down {(1-gain_x)*100:.0f}% "
+                            f"(${price:.8f} <= ${stop_price:.8f}) — bailing")
+                await self._sell(pos, price, "rug_stop", 100)
                 return
 
-            # Trailing stop update
-            if price > pos.high_price:
-                pos.high_price = price
-                trail = TRAILING_STOP_PCT / 2 if pos.took_first else TRAILING_STOP_PCT
-                pos.stop_price = price * (1 - trail/100)
-                log.info(f"  NEW HIGH ${price:.8f} -> stop ${pos.stop_price:.8f}")
-                pos._below_stop = 0
-
-            # Stop with confirmation
-            if pos.stop_price > 0 and price <= pos.stop_price:
-                pos._below_stop += 1
-                log.warning(f"Below stop {pos._below_stop}/{STOP_CONFIRM_COUNT}: "
-                             f"${price:.8f} ({gain_x:.3f}x)")
-                if pos._below_stop >= STOP_CONFIRM_COUNT:
-                    log.warning("STOP CONFIRMED — selling")
-                    await self._sell(pos, price, "trailing_stop", 100)
-                    return
-            else:
-                pos._below_stop = 0
-
+            # Everything else — ride it out
     # ── SELL ─────────────────────────────────────────────────────────────────
 
     async def _sell(self, pos: Position, price: float, reason: str, pct: int):
