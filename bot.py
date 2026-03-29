@@ -488,13 +488,23 @@ class Detector:
         "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
         "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",
         "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",
-        # Additional Pump.fun program addresses seen in logs
-        "FAdo9NCw1ssek6Z6yeWzWjhLVsr8uiCwcWNUnKgzTnHe",  # Pump AMM
-        "Gz9VPiSLQYbvKyb3jZPjNfyA6n4T4qVFUuAukgL964nL",  # Pump router
-        "FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9",  # Flash program
-        "CxvksNjwhdHDLr3qbCXNKVdeYACW8cs93vFqLqtgyFE5",  # Pump swap
-        "BBRouter1cVunVXvkcqeKkZQcBK7ruan37PPm3xzWaXD",   # BB Router
-        "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",   # pAMM
+        "FAdo9NCw1ssek6Z6yeWzWjhLVsr8uiCwcWNUnKgzTnHe",
+        "Gz9VPiSLQYbvKyb3jZPjNfyA6n4T4qVFUuAukgL964nL",
+        "FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9",
+        "CxvksNjwhdHDLr3qbCXNKVdeYACW8cs93vFqLqtgyFE5",
+        "BBRouter1cVunVXvkcqeKkZQcBK7ruan37PPm3xzWaXD",
+        "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
+        "JUP6LkbZbjS1jKKwapdHNy74LZJfCznEFkigq4CRBXM",   # Jupiter v6 aggregator
+        "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",   # Jupiter v4
+        "AgenTMiC2hvxGebTsgmsD4HHhqxHnLHK4CrZPmCHjBa",   # Agent program (seen in logs)
+        "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",   # Orca whirlpool
+        "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP",  # Orca v2
+        "SSwpkEEPFs5Y8dCTx4BEDsGFszmK4FbTiTGMFGCNjnm",   # Saber
+        "DjVE6JNiYqPL2QXyCUUh8rNjHrbz9hXHNYt99MQ59qw1",  # Orca fee
+        "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",   # Memo
+        "Sysvar1nstructions1111111111111111111111111",     # Sysvar instructions
+        "SysvarRent111111111111111111111111111111111",
+        "SysvarC1ock11111111111111111111111111111111",
     }
     _B58 = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 
@@ -585,15 +595,10 @@ class Bot:
                     self.detector.locked = False
                     continue
 
-                # Step 2: Dual-source price confirmation
-                confirmed, entry_price = await self._confirm_entry(token)
-                if not confirmed:
-                    log.info(f"SKIP {token.mint[:16]} — entry not confirmed")
-                    self.detector.locked = False
-                    continue
-
-                # Step 3: Buy
-                pos = await self._buy(token, entry_price)
+                # Step 2: Buy immediately on graduation — this IS the signal.
+                # Dead coin detection + trailing stop + timeout protect capital.
+                # A 5-second confirmation window misses the pump entirely.
+                pos = await self._buy(token, 0.0)
                 if not pos:
                     log.info(f"BUY FAILED {token.symbol}")
                     self.detector.locked = False
@@ -693,51 +698,6 @@ class Bot:
 
     # ── ENTRY CONFIRMATION ───────────────────────────────────────────────────
 
-    async def _confirm_entry(self, token: Token):
-        """
-        Dual-source price confirmation — check price via TWO independent
-        methods 5 seconds apart. Both must show upward movement.
-        This eliminates stale Jupiter cache returning identical prices.
-        """
-        log.info(f"Entry check: sampling {token.symbol} price (dual source)...")
-
-        # Sample 1: get both price sources at t=0
-        api_t0, quote_t0 = await self.jup.dual_price(token.mint)
-        log.info(f"  t=0  api={api_t0:.10f if api_t0 else 'None'} "
-                 f"quote={quote_t0:.10f if quote_t0 else 'None'}")
-
-        await asyncio.sleep(5)
-
-        # Sample 2: get both price sources at t=5
-        api_t5, quote_t5 = await self.jup.dual_price(token.mint)
-        log.info(f"  t=5s api={api_t5:.10f if api_t5 else 'None'} "
-                 f"quote={quote_t5:.10f if quote_t5 else 'None'}")
-
-        # Need at least the quote price (it bypasses cache)
-        if not quote_t0 or not quote_t5:
-            log.info("  SKIP: no live quote data")
-            return False, 0.0
-
-        # Check quote-based movement (most reliable)
-        quote_move = ((quote_t5 - quote_t0) / quote_t0) * 100
-        log.info(f"  Quote movement: {quote_move:+.2f}%")
-
-        # Also check API if available
-        api_move = None
-        if api_t0 and api_t5 and api_t0 != api_t5:
-            api_move = ((api_t5 - api_t0) / api_t0) * 100
-            log.info(f"  API movement:   {api_move:+.2f}%")
-
-        # Entry condition: quote must be moving UP
-        # If API also available and moving, even better
-        if quote_move <= 0:
-            log.info(f"  SKIP: quote down {quote_move:.2f}% — no upward momentum")
-            return False, 0.0
-
-        # Use quote price as entry price (most accurate)
-        entry_price = quote_t5
-        log.info(f"  CONFIRMED: +{quote_move:.2f}% momentum — BUYING!")
-        return True, entry_price
 
     # ── BUY ──────────────────────────────────────────────────────────────────
 
