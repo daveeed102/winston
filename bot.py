@@ -417,15 +417,25 @@ class Detector:
 
             try:
                 mint = None
-                async with aiohttp.ClientSession() as sess:
-                    for attempt in range(10):
-                        mint = await self._extract_mint(sig, sess)
-                        if mint: break
-                        await asyncio.sleep(2)
 
+                # Strategy 1: Parse mint directly from WebSocket logs — ZERO delay.
+                # Pump.fun token mints always end in "pump" and are present in the
+                # graduation log lines. This gets us in within ~1s of detection.
+                mint = self._mint_from_logs(logs, source)
+                if mint:
+                    log.info(f"Mint via log scan (instant): {mint[:20]}...")
+
+                # Strategy 2: getTransaction fallback — only if log scan missed.
+                # Capped at 5 retries (10s max) instead of 10, since log scan
+                # handles most cases. This covers Raydium pools and edge cases.
                 if not mint:
-                    mint = self._mint_from_logs(logs, source)
-                    if mint: log.info(f"Mint via log scan: {mint[:20]}...")
+                    async with aiohttp.ClientSession() as sess:
+                        for attempt in range(5):
+                            mint = await self._extract_mint(sig, sess)
+                            if mint:
+                                log.info(f"Mint via getTransaction (attempt {attempt+1}): {mint[:20]}...")
+                                break
+                            await asyncio.sleep(2)
 
                 if not mint:
                     log.warning(f"No mint from {sig[:16]}")
