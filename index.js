@@ -32,12 +32,12 @@ const CONFIG = {
   DISCORD_WEBHOOK: process.env.DISCORD_WEBHOOK_URL || process.env.DISCORD_WEBHOOK || '',
 
   // Trading Parameters
-  MAX_SLIPPAGE_BPS: 200,           // 2% max slippage (was 1.5%)
+  MAX_SLIPPAGE_BPS: 200,           // 2% max slippage
   PRIORITY_FEE_LAMPORTS: 100000,   // 0.0001 SOL priority fee
-  POSITION_SIZE_PCT: 0.20,         // 20% of balance per trade (was 25%, allows more positions)
-  MAX_CONCURRENT_POSITIONS: 5,     // 5 positions at once (was 3)
-  MIN_POOL_LIQUIDITY_USD: 50000,   // $50K minimum pool liquidity (was $100K)
-  MIN_TOKEN_AGE_MINUTES: 30,       // Skip tokens younger than 30min (was 60)
+  POSITION_SIZE_PCT: 0.90,         // 90% of balance per trade (go all in, keep dust for fees)
+  MAX_CONCURRENT_POSITIONS: 1,     // ONE position at a time — focus mode
+  MIN_POOL_LIQUIDITY_USD: 50000,   // $50K minimum pool liquidity
+  MIN_TOKEN_AGE_MINUTES: 30,       // Skip tokens younger than 30min
 
   // Exit Strategy
   STOP_LOSS_PCT: -10,              // -10% stop loss
@@ -432,9 +432,9 @@ async function scoreWallet(address) {
     const totalTrades = completedTrades.length;
 
     // Early exit: not enough completed trades
-    // Note: totalSigsScanned gives us an estimate of total activity
-    // We use the sampled completedTrades for quality metrics
-    if (totalTrades < 10) {
+    // Note: we're sampling ~20 txs per 1000 sigs, so seeing even 3 round-trips
+    // from a sample means the wallet likely has dozens of real completed trades
+    if (totalTrades < 3) {
       log('DISCOVERY', `${address.slice(0, 8)}... — only ${totalTrades} completed round-trips, skipping`);
       return null;
     }
@@ -556,71 +556,87 @@ function parseSwapFromTransaction(tx, walletAddress) {
     const message = tx.transaction?.message;
     if (!meta || !message) return null;
 
-    // Check if this involves Jupiter or Raydium
+    // Check if this involves any known DEX program
     const accountKeys = message.accountKeys?.map(k => k.pubkey || k) || [];
     const isJupiter = accountKeys.includes(CONFIG.JUPITER_PROGRAM);
     const isRaydium = accountKeys.includes(CONFIG.RAYDIUM_AMM);
-    if (!isJupiter && !isRaydium) return null;
+
+    // Also detect swaps via log messages (catches more DEXes)
+    const logs = meta.logMessages || [];
+    const hasSwapLog = logs.some(l =>
+      l.includes('Instruction: Swap') ||
+      l.includes('Instruction: Route') ||
+      l.includes('Program JUP') ||
+      l.includes('Program 675kPX')
+    );
+
+    if (!isJupiter && !isRaydium && !hasSwapLog) return null;
 
     // Analyze pre/post token balances to determine what was swapped
     const preBalances = meta.preTokenBalances || [];
     const postBalances = meta.postTokenBalances || [];
 
-    // Find token balance changes for this wallet
+    // Track SOL change (first account is typically the signer/fee payer)
     const walletIndex = accountKeys.indexOf(walletAddress);
-
-    // Track SOL change
-    const preSol = (meta.preBalances?.[0] || 0) / 1e9;
-    const postSol = (meta.postBalances?.[0] || 0) / 1e9;
+    const solIndex = walletIndex >= 0 ? walletIndex : 0;
+    const preSol = (meta.preBalances?.[solIndex] || 0) / 1e9;
+    const postSol = (meta.postBalances?.[solIndex] || 0) / 1e9;
     const solChange = postSol - preSol;
 
-    // Find non-SOL token changes
-    let tokenMint = null;
-    let tokenChange = 0;
+    // Find ALL token balance changes for this wallet
+    // Build a map of mint -> change amount
+    const tokenChanges = new Map();
 
-    for (const post of postBalances) {
-      if (post.owner === walletAddress && post.mint !== CONFIG.SOL_MINT && post.mint !== CONFIG.USDC_MINT) {
-        const pre = preBalances.find(p => p.owner === walletAddress && p.mint === post.mint);
-        const preAmount = parseFloat(pre?.uiTokenAmount?.uiAmount || 0);
-        const postAmount = parseFloat(post.uiTokenAmount?.uiAmount || 0);
-        const change = postAmount - preAmount;
-
-        if (Math.abs(change) > 0) {
-          tokenMint = post.mint;
-          tokenChange = change;
-          break;
-        }
+    // Collect all mints from both pre and post balances
+    const allMints = new Set();
+    for (const b of [...preBalances, ...postBalances]) {
+      if (b.owner === walletAddress && b.mint && b.mint !== CONFIG.SOL_MINT) {
+        allMints.add(b.mint);
       }
     }
 
-    // Also check pre balances for tokens that were fully sold
-    if (!tokenMint) {
-      for (const pre of preBalances) {
-        if (pre.owner === walletAddress && pre.mint !== CONFIG.SOL_MINT && pre.mint !== CONFIG.USDC_MINT) {
-          const post = postBalances.find(p => p.owner === walletAddress && p.mint === pre.mint);
-          const preAmount = parseFloat(pre.uiTokenAmount?.uiAmount || 0);
-          const postAmount = parseFloat(post?.uiTokenAmount?.uiAmount || 0);
-          const change = postAmount - preAmount;
+    for (const mint of allMints) {
+      const pre = preBalances.find(p => p.owner === walletAddress && p.mint === mint);
+      const post = postBalances.find(p => p.owner === walletAddress && p.mint === mint);
+      const preAmount = parseFloat(pre?.uiTokenAmount?.uiAmount || 0);
+      const postAmount = parseFloat(post?.uiTokenAmount?.uiAmount || 0);
+      const change = postAmount - preAmount;
 
-          if (Math.abs(change) > 0) {
-            tokenMint = pre.mint;
-            tokenChange = change;
-            break;
-          }
-        }
+      if (Math.abs(change) > 0.000001) {
+        tokenChanges.set(mint, change);
       }
+    }
+
+    // Find the non-stablecoin token that changed (the one being traded)
+    const STABLES = new Set([CONFIG.USDC_MINT, 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB']); // USDC + USDT
+    let tokenMint = null;
+    let tokenChange = 0;
+
+    for (const [mint, change] of tokenChanges) {
+      if (!STABLES.has(mint)) {
+        tokenMint = mint;
+        tokenChange = change;
+        break;
+      }
+    }
+
+    // Fallback: if no non-stable token found, use any token change
+    if (!tokenMint && tokenChanges.size > 0) {
+      const first = tokenChanges.entries().next().value;
+      tokenMint = first[0];
+      tokenChange = first[1];
     }
 
     if (!tokenMint) return null;
 
-    // Determine direction: if token balance increased = buy, decreased = sell
+    // Determine direction: token balance increased = buy, decreased = sell
     const direction = tokenChange > 0 ? 'buy' : 'sell';
     const solAmount = Math.abs(solChange);
 
     return {
       tokenMint,
       direction,
-      solAmount,
+      solAmount: solAmount > 0 ? solAmount : 0.001, // Fallback for non-SOL pairs
       tokenAmount: Math.abs(tokenChange),
       timestamp: tx.blockTime,
       signature: tx.transaction?.signatures?.[0],
