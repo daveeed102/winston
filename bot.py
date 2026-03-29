@@ -118,29 +118,16 @@ class Grok:
 
     async def _fetch_trending(self) -> list:
         """
-        Fetch ESTABLISHED Solana tokens that are surging RIGHT NOW.
-
-        Hard filters applied before anything goes to Grok:
-        - Token must be at least 24 hours old (no brand new launches)
-        - Must have at least $100K liquidity (can absorb our sell)
-        - Must have at least $50K market cap
-        - Must have positive price movement in last 1 hour
-        - More buys than sells in last 5 minutes
-        - Has had trading volume for multiple hours (not a one-candle pump)
-
-        We search Dexscreener for tokens with real momentum,
-        not the boosted/paid trending list which is full of rugs.
+        Fetch Solana tokens with real momentum. Uses a tiered filter system:
+        - Tier 1: Ideal coins (24h+ old, $100K+ liq, up 1h, more buys than sells)
+        - Tier 2: Relaxed (6h+ old, $50K+ liq, up 1h)
+        - Tier 3: Last resort — established safe coins (SOL, BONK, WIF, JUP) with current price data
+        Always returns something so Grok can always pick.
         """
         import time as _time
 
-        qualified = []
-
-        # Search Dexscreener for trending Solana tokens by volume
-        search_queries = [
-            "https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112",
-        ]
-
-        # Primary: use Dexscreener search for gainers on Solana
+        # Try Dexscreener boosted list
+        mints_to_check = []
         try:
             async with aiohttp.ClientSession() as sess:
                 async with sess.get(
@@ -149,125 +136,106 @@ class Grok:
                 ) as r:
                     if r.status == 200:
                         items = await r.json()
-                        mints = [i.get("tokenAddress","") for i in (items or [])
-                                 if i.get("chainId") == "solana"
-                                 and i.get("tokenAddress","")][:30]
-                        log.info(f"Dexscreener boost list: {len(mints)} Solana tokens")
-
-                        # Fetch full data for each and apply filters
-                        for mint in mints:
-                            if not mint or len(mint) < 32: continue
-                            try:
-                                async with sess.get(
-                                    f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                                    timeout=aiohttp.ClientTimeout(total=6)
-                                ) as r2:
-                                    if r2.status != 200: continue
-                                    d = await r2.json()
-
-                                pairs = d.get("pairs") or []
-                                if not pairs: continue
-                                p = pairs[0]
-
-                                base        = p.get("baseToken", {})
-                                symbol      = base.get("symbol", "?")
-                                name        = base.get("name", "?")
-                                liquidity   = p.get("liquidity", {}).get("usd", 0) or 0
-                                mcap        = p.get("marketCap", 0) or 0
-                                volume_h1   = p.get("volume", {}).get("h1", 0) or 0
-                                volume_h6   = p.get("volume", {}).get("h6", 0) or 0
-                                volume_5m   = p.get("volume", {}).get("m5", 0) or 0
-                                chg_5m      = p.get("priceChange", {}).get("m5", 0) or 0
-                                chg_1h      = p.get("priceChange", {}).get("h1", 0) or 0
-                                chg_6h      = p.get("priceChange", {}).get("h6", 0) or 0
-                                chg_24h     = p.get("priceChange", {}).get("h24", 0) or 0
-                                buys_5m     = p.get("txns", {}).get("m5", {}).get("buys", 0) or 0
-                                sells_5m    = p.get("txns", {}).get("m5", {}).get("sells", 0) or 0
-                                buys_1h     = p.get("txns", {}).get("h1", {}).get("buys", 0) or 0
-                                sells_1h    = p.get("txns", {}).get("h1", {}).get("sells", 0) or 0
-                                created_at  = p.get("pairCreatedAt", 0) or 0  # ms timestamp
-                                price_usd   = p.get("priceUsd", "0") or "0"
-
-                                # ── HARD FILTERS ─────────────────────────────
-                                # Skip if created less than 24 hours ago
-                                if created_at > 0:
-                                    age_hours = (_time.time() - created_at/1000) / 3600
-                                    if age_hours < 24:
-                                        log.debug(f"SKIP {symbol}: only {age_hours:.1f}h old")
-                                        continue
-                                else:
-                                    # No creation date = unknown age, skip it
-                                    log.debug(f"SKIP {symbol}: no creation date")
-                                    continue
-
-                                # Need real liquidity
-                                if liquidity < 100_000:
-                                    log.debug(f"SKIP {symbol}: liquidity ${liquidity:,.0f} < $100K")
-                                    continue
-
-                                # Need real market cap
-                                if mcap < 50_000:
-                                    log.debug(f"SKIP {symbol}: mcap ${mcap:,.0f} < $50K")
-                                    continue
-
-                                # Must have volume across multiple hours (not a one-candle pump)
-                                if volume_h6 < 10_000:
-                                    log.debug(f"SKIP {symbol}: 6h vol ${volume_h6:,.0f} too low")
-                                    continue
-
-                                # Must be going UP in the last hour
-                                if chg_1h <= 0:
-                                    log.debug(f"SKIP {symbol}: 1h change {chg_1h:.1f}% not positive")
-                                    continue
-
-                                # More buyers than sellers right now
-                                if buys_5m <= sells_5m:
-                                    log.debug(f"SKIP {symbol}: {buys_5m}B/{sells_5m}S — more sellers")
-                                    continue
-
-                                # Don't chase coins already up 500%+ in 24h (probably near top)
-                                if chg_24h > 500:
-                                    log.debug(f"SKIP {symbol}: already up {chg_24h:.0f}% in 24h")
-                                    continue
-
-                                age_str = f"{age_hours:.0f}h old"
-                                log.info(f"QUALIFIED: {symbol} | age={age_str} | "
-                                         f"liq=${liquidity:,.0f} | 1h={chg_1h:+.1f}% | "
-                                         f"buys={buys_5m}/{sells_5m}")
-
-                                qualified.append({
-                                    "mint":           mint,
-                                    "symbol":         symbol,
-                                    "name":           name,
-                                    "price_usd":      price_usd,
-                                    "volume_5m":      volume_5m,
-                                    "volume_1h":      volume_h1,
-                                    "volume_6h":      volume_h6,
-                                    "price_chg_5m":   chg_5m,
-                                    "price_chg_1h":   chg_1h,
-                                    "price_chg_6h":   chg_6h,
-                                    "price_chg_24h":  chg_24h,
-                                    "mcap":           mcap,
-                                    "liquidity":      liquidity,
-                                    "txns_5m_buys":   buys_5m,
-                                    "txns_5m_sells":  sells_5m,
-                                    "txns_1h_buys":   buys_1h,
-                                    "txns_1h_sells":  sells_1h,
-                                    "age_hours":      age_hours,
-                                })
-
-                                if len(qualified) >= 15:
-                                    break
-
-                            except Exception as e:
-                                log.debug(f"Token fetch err {mint[:16]}: {e}")
-                                continue
-
+                        mints_to_check = [
+                            i.get("tokenAddress","") for i in (items or [])
+                            if i.get("chainId") == "solana" and i.get("tokenAddress","")
+                        ][:40]
         except Exception as e:
-            log.error(f"Dexscreener fetch error: {e}")
+            log.error(f"Dexscreener boost fetch: {e}")
 
-        log.info(f"Dexscreener: {len(qualified)} qualified coins (age>24h, liq>$100K, 1h>0%)")
-        return qualified
+        # Also always include established blue-chip Solana tokens
+        # These are safe fallbacks — real liquidity, real community
+        SAFE_MINTS = [
+            "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
+            "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",  # WIF
+            "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",   # JUP
+            "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",  # ETH (Wormhole)
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC (skip — stable)
+            "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",  # mSOL
+            "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",  # JitoSOL
+            "MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5",   # MEW
+            "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",  # PYTH
+            "nosXBVoaCTtYdLvKY6Csb4AC8JCdQKKAaWYtx2ZMoo7",  # NOS
+        ]
+        for m in SAFE_MINTS:
+            if m not in mints_to_check:
+                mints_to_check.append(m)
+
+        log.info(f"Checking {len(mints_to_check)} tokens (boosted + safe coins)...")
+
+        tier1, tier2, tier3 = [], [], []
+
+        async with aiohttp.ClientSession() as sess:
+            for mint in mints_to_check:
+                if not mint or len(mint) < 32: continue
+                try:
+                    async with sess.get(
+                        f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+                        timeout=aiohttp.ClientTimeout(total=6)
+                    ) as r2:
+                        if r2.status != 200: continue
+                        d = await r2.json()
+                    pairs = d.get("pairs") or []
+                    if not pairs: continue
+                    p = pairs[0]
+
+                    base        = p.get("baseToken", {})
+                    symbol      = base.get("symbol", "?")
+                    name        = base.get("name", "?")
+                    liquidity   = p.get("liquidity", {}).get("usd", 0) or 0
+                    mcap        = p.get("marketCap", 0) or 0
+                    volume_5m   = p.get("volume", {}).get("m5", 0) or 0
+                    volume_h1   = p.get("volume", {}).get("h1", 0) or 0
+                    volume_h6   = p.get("volume", {}).get("h6", 0) or 0
+                    chg_5m      = p.get("priceChange", {}).get("m5", 0) or 0
+                    chg_1h      = p.get("priceChange", {}).get("h1", 0) or 0
+                    chg_6h      = p.get("priceChange", {}).get("h6", 0) or 0
+                    chg_24h     = p.get("priceChange", {}).get("h24", 0) or 0
+                    buys_5m     = p.get("txns", {}).get("m5", {}).get("buys", 0) or 0
+                    sells_5m    = p.get("txns", {}).get("m5", {}).get("sells", 0) or 0
+                    buys_1h     = p.get("txns", {}).get("h1", {}).get("buys", 0) or 0
+                    sells_1h    = p.get("txns", {}).get("h1", {}).get("sells", 0) or 0
+                    created_at  = p.get("pairCreatedAt", 0) or 0
+                    price_usd   = p.get("priceUsd", "0") or "0"
+                    age_hours   = (_time.time() - created_at/1000) / 3600 if created_at > 0 else 9999
+
+                    coin = {
+                        "mint": mint, "symbol": symbol, "name": name,
+                        "price_usd": price_usd,
+                        "volume_5m": volume_5m, "volume_1h": volume_h1, "volume_6h": volume_h6,
+                        "price_chg_5m": chg_5m, "price_chg_1h": chg_1h,
+                        "price_chg_6h": chg_6h, "price_chg_24h": chg_24h,
+                        "mcap": mcap, "liquidity": liquidity,
+                        "txns_5m_buys": buys_5m, "txns_5m_sells": sells_5m,
+                        "txns_1h_buys": buys_1h, "txns_1h_sells": sells_1h,
+                        "age_hours": age_hours,
+                    }
+
+                    # Tier 1: ideal
+                    if (age_hours >= 24 and liquidity >= 100_000 and
+                            chg_1h > 0 and buys_5m > sells_5m and chg_24h <= 500):
+                        tier1.append(coin)
+                    # Tier 2: relaxed
+                    elif (age_hours >= 6 and liquidity >= 50_000 and chg_1h > 0):
+                        tier2.append(coin)
+                    # Tier 3: any established coin with data
+                    elif (mint in SAFE_MINTS and liquidity >= 10_000):
+                        tier3.append(coin)
+
+                except Exception as e:
+                    log.debug(f"Token {mint[:16]}: {e}")
+                    continue
+
+        # Return best available tier
+        if tier1:
+            log.info(f"Tier 1 coins ({len(tier1)} qualified — age>24h, liq>$100K, up 1h)")
+            return sorted(tier1, key=lambda x: x["price_chg_1h"], reverse=True)[:15]
+        elif tier2:
+            log.info(f"Tier 1 empty — using Tier 2 ({len(tier2)} coins, age>6h, liq>$50K)")
+            return sorted(tier2, key=lambda x: x["price_chg_1h"], reverse=True)[:15]
+        else:
+            log.info(f"Using Tier 3 fallback — {len(tier3)} established safe coins")
+            return sorted(tier3, key=lambda x: x["price_chg_1h"], reverse=True)[:15]
 
 
     async def pick_coin(self) -> Optional[dict]:
@@ -284,8 +252,16 @@ class Grok:
         trending = await self._fetch_trending()
 
         if not trending:
-            log.warning("No Dexscreener data available — cannot pick")
-            return None
+            log.warning("No Dexscreener data — asking Grok to pick a safe Solana coin from knowledge")
+            # Fallback: ask Grok to pick from known safe Solana coins directly
+            trending = [
+                {"mint":"DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263","symbol":"BONK","name":"Bonk","price_chg_5m":0,"price_chg_1h":0,"price_chg_6h":0,"price_chg_24h":0,"volume_5m":0,"volume_1h":0,"volume_6h":0,"mcap":0,"liquidity":0,"txns_5m_buys":0,"txns_5m_sells":0,"txns_1h_buys":0,"txns_1h_sells":0,"age_hours":9999},
+                {"mint":"EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm","symbol":"WIF","name":"dogwifhat","price_chg_5m":0,"price_chg_1h":0,"price_chg_6h":0,"price_chg_24h":0,"volume_5m":0,"volume_1h":0,"volume_6h":0,"mcap":0,"liquidity":0,"txns_5m_buys":0,"txns_5m_sells":0,"txns_1h_buys":0,"txns_1h_sells":0,"age_hours":9999},
+                {"mint":"JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN","symbol":"JUP","name":"Jupiter","price_chg_5m":0,"price_chg_1h":0,"price_chg_6h":0,"price_chg_24h":0,"volume_5m":0,"volume_1h":0,"volume_6h":0,"mcap":0,"liquidity":0,"txns_5m_buys":0,"txns_5m_sells":0,"txns_1h_buys":0,"txns_1h_sells":0,"age_hours":9999},
+                {"mint":"MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5","symbol":"MEW","name":"cat in a dogs world","price_chg_5m":0,"price_chg_1h":0,"price_chg_6h":0,"price_chg_24h":0,"volume_5m":0,"volume_1h":0,"volume_6h":0,"mcap":0,"liquidity":0,"txns_5m_buys":0,"txns_5m_sells":0,"txns_1h_buys":0,"txns_1h_sells":0,"age_hours":9999},
+                {"mint":"HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3","symbol":"PYTH","name":"Pyth Network","price_chg_5m":0,"price_chg_1h":0,"price_chg_6h":0,"price_chg_24h":0,"volume_5m":0,"volume_1h":0,"volume_6h":0,"mcap":0,"liquidity":0,"txns_5m_buys":0,"txns_5m_sells":0,"txns_1h_buys":0,"txns_1h_sells":0,"age_hours":9999},
+            ]
+            log.info("Using hardcoded safe coin fallback list for Grok")
 
         log.info(f"Fed {len(trending)} real coins to Grok")
 
