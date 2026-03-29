@@ -1,24 +1,17 @@
 """
-WINSTON v3 — Pure Momentum Sniper
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-No Grok. No AI. Just math.
+DEGEN SNIPER v7 — One At A Time, +25% Or Out
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Strategy:
+  1. Scan for a fresh token
+  2. Buy it — LOCK IN, ignore all other tokens until resolved
+  3. Sell 100% when ANY of these trigger:
+       a) Price hits 1.25x entry (+25% profit target) ← primary goal
+       b) 2-minute timer expires (cut losses, move on)
+       c) Trailing stop hit (protect capital on fast dumps)
+  4. Repeat
 
-Every 60 seconds:
-  - Pull brand new Solana tokens from Dexscreener (< 2h old)
-  - Filter for ones with strong upward momentum RIGHT NOW
-  - Buy anything that passes — fast
-  - Sell at +8% profit or -7% stop loss
-  - 5min stall exit if it flatlines
-
-Filters (no Grok needed):
-  - Age: < 2 hours old
-  - 5m price change: > +3% (moving UP right now)
-  - 5m buys > sells (accumulation not distribution)
-  - 5m volume: > $500 (actual activity)
-  - Liquidity: $10K - $500K (tradeable range)
-  - Not already up > 400% in 24h (not a dead cat)
-  - Top holder < 40% (basic rug check)
-  - Has a buy route on Jupiter (actually tradeable)
+No partial sells. No ladder. Clean in, clean out.
+One coin at a time — full focus, full position.
 """
 
 import asyncio
@@ -34,36 +27,25 @@ import aiohttp
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
-TRADE_AMOUNT_SOL   = float(os.getenv("TRADE_AMOUNT_SOL",  "0.012"))  # ~$2
-MAX_POSITIONS      = int(os.getenv("MAX_POSITIONS",       "5"))
-SCAN_INTERVAL_SECS = int(os.getenv("SCAN_INTERVAL_SECS",  "60"))     # scan every 60s
+TRADE_AMOUNT_SOL  = float(os.getenv("TRADE_AMOUNT_SOL",   "0.006"))   # ~$1 at ~$165/SOL
+TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT",  "10"))      # tighter stop for fast flips
+MAX_HOLD_MINUTES  = float(os.getenv("MAX_HOLD_MINUTES",   "1"))       # 1 min hard timeout — cash out fast
+SLIPPAGE_BPS      = int(os.getenv("SLIPPAGE_BPS",         "500"))
+PROFIT_TARGET_X   = float(os.getenv("PROFIT_TARGET_X",    "1.15"))    # sell ALL at +15%
+MIN_MOMENTUM_PCT  = float(os.getenv("MIN_MOMENTUM_PCT",   "5"))
+MAX_POSITIONS     = int(os.getenv("MAX_POSITIONS",        "3"))        # up to 3 active at once
 
-# Entry filters
-MIN_PRICE_CHG_5M   = float(os.getenv("MIN_PRICE_CHG_5M",  "3.0"))   # must be up >3% in 5m
-MIN_VOL_5M         = float(os.getenv("MIN_VOL_5M",        "500"))    # $500 min 5m volume
-MIN_LIQUIDITY      = float(os.getenv("MIN_LIQUIDITY",     "10000"))  # $10K min liquidity
-MAX_LIQUIDITY      = float(os.getenv("MAX_LIQUIDITY",     "500000")) # $500K max (find small caps)
-MAX_AGE_HOURS      = float(os.getenv("MAX_AGE_HOURS",     "2.0"))    # under 2h old only
-MAX_GAIN_24H       = float(os.getenv("MAX_GAIN_24H",      "400"))    # skip if already 4x
-MAX_TOP_HOLDER_PCT = float(os.getenv("MAX_TOP_HOLDER_PCT","40"))
-
-# Exit
-TP_PCT             = float(os.getenv("TP_PCT",            "8"))      # +8% → sell all, dip
-STOP_LOSS_PCT      = float(os.getenv("STOP_LOSS_PCT",     "7"))      # -7% → cut loss
-STALL_MINUTES      = float(os.getenv("STALL_MINUTES",     "5"))      # 5min flat → dip
-MAX_HOLD_MINUTES   = float(os.getenv("MAX_HOLD_MINUTES",  "20"))     # 20min hard timeout
-MIN_HOLD_SECS      = float(os.getenv("MIN_HOLD_SECS",     "90"))     # 1.5min before profit exit
-DEAD_STRIKES       = int(os.getenv("DEAD_STRIKES",        "20"))     # ~40s frozen = dead
-
-SLIPPAGE_BPS       = int(os.getenv("SLIPPAGE_BPS",        "1000"))
-
-# Credentials
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 SOLANA_RPC_URL      = os.getenv("SOLANA_RPC_URL",      "")
 WALLET_PRIVATE_KEY  = os.getenv("WALLET_PRIVATE_KEY",  "")
 JUPITER_API_KEY     = os.getenv("JUPITER_API_KEY",     "")
+MAX_TOP_HOLDER_PCT  = float(os.getenv("MAX_TOP_HOLDER_PCT", "50"))
+BUY_DELAY_SECONDS   = float(os.getenv("BUY_DELAY_SECONDS",  "0"))
 
+PUMPFUN     = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+RAYDIUM_AMM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 WSOL        = "So11111111111111111111111111111111111111112"
+
 JUP_ORDER   = "https://api.jup.ag/swap/v2/order"
 JUP_EXECUTE = "https://api.jup.ag/swap/v2/execute"
 JUP_PRICE   = "https://api.jup.ag/price/v2"
@@ -73,216 +55,43 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-7s | %(message)s",
     datefmt="%H:%M:%S"
 )
-log = logging.getLogger("winston")
+log = logging.getLogger("sniper")
 
 # ─── MODELS ──────────────────────────────────────────────────────────────────
 
 @dataclass
 class Token:
-    mint:   str
+    mint: str
     symbol: str = "???"
-    name:   str = ""
+    name: str = "Unknown"
+    source: str = ""
 
 @dataclass
 class Position:
-    token:        Token
-    entry_price:  float = 0.0
-    tokens_held:  float = 0.0
-    cost_sol:     float = 0.0
-    opened_ts:    float = 0.0
-    score:        float = 0.0   # momentum score at entry
-    entry_data:   str   = ""    # snapshot of entry conditions
-
-    _last_price:      float = 0.0
-    _same_count:      int   = 0
-    _stall_start:     float = 0.0
-    _last_move_price: float = 0.0
+    token: Token
+    entry_price: float = 0.0
+    tokens_held: float = 0.0
+    cost_sol: float = 0.0
+    high_price: float = 0.0
+    stop_price: float = 0.0
+    opened_ts: float = 0.0
 
     def __post_init__(self):
-        if not self.opened_ts:
-            self.opened_ts = time.time()
+        if not self.opened_ts: self.opened_ts = time.time()
 
     @property
     def hold_secs(self): return time.time() - self.opened_ts
     @property
     def hold_mins(self):  return self.hold_secs / 60
     @property
-    def timed_out(self):  return self.hold_mins >= MAX_HOLD_MINUTES
-
-# ─── SCANNER ─────────────────────────────────────────────────────────────────
-
-class Scanner:
-    """
-    Pulls brand new Solana tokens from Dexscreener.
-    No AI. Pure momentum math.
-    """
-
-    def __init__(self):
-        self.seen_mints: set = set()  # don't re-buy same token this session
-
-    async def _fetch_new_pairs(self) -> list:
-        """Pull fresh Solana pairs from multiple Dexscreener endpoints."""
-        pairs = []
-
-        async def _get(url):
-            try:
-                async with aiohttp.ClientSession() as s:
-                    async with s.get(url, timeout=aiohttp.ClientTimeout(total=12)) as r:
-                        if r.status == 200:
-                            return await r.json()
-            except Exception as e:
-                log.debug(f"Fetch {url[:60]}: {e}")
-            return None
-
-        # 1. Latest boosts — tokens getting promoted = have buyers
-        data = await _get("https://api.dexscreener.com/token-boosts/latest/v1")
-        if data:
-            for item in (data if isinstance(data, list) else []):
-                if item.get("chainId") == "solana":
-                    pairs.append(item.get("tokenAddress", ""))
-
-        # 2. Top boosts
-        data = await _get("https://api.dexscreener.com/token-boosts/top/v1")
-        if data:
-            for item in (data if isinstance(data, list) else []):
-                if item.get("chainId") == "solana":
-                    pairs.append(item.get("tokenAddress", ""))
-
-        # 3. Search for active pump.fun tokens
-        data = await _get("https://api.dexscreener.com/latest/dex/search/?q=pump")
-        if data:
-            for p in (data.get("pairs") or [])[:40]:
-                if p.get("chainId") == "solana":
-                    pairs.append(p.get("baseToken", {}).get("address", ""))
-
-        # 4. Raydium new listings
-        data = await _get("https://api.dexscreener.com/latest/dex/search/?q=raydium")
-        if data:
-            for p in (data.get("pairs") or [])[:30]:
-                if p.get("chainId") == "solana":
-                    pairs.append(p.get("baseToken", {}).get("address", ""))
-
-        # Deduplicate
-        seen = set()
-        unique = []
-        for m in pairs:
-            if m and len(m) >= 32 and m not in seen:
-                seen.add(m)
-                unique.append(m)
-        return unique[:80]
-
-    async def find_momentum_tokens(self, exclude_mints: set) -> list:
-        """
-        Returns list of tokens passing ALL momentum filters, sorted by score.
-        Score = weighted combination of 5m price change, buy ratio, volume velocity.
-        """
-        import time as _t
-
-        mints = await self._fetch_new_pairs()
-        mints = [m for m in mints if m not in exclude_mints and m not in self.seen_mints]
-
-        log.info(f"Scanning {len(mints)} mints for momentum...")
-        qualified = []
-
-        async with aiohttp.ClientSession() as sess:
-            for mint in mints:
-                try:
-                    async with sess.get(
-                        f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                        timeout=aiohttp.ClientTimeout(total=6)
-                    ) as r:
-                        if r.status != 200:
-                            continue
-                        d = await r.json()
-
-                    pairs = d.get("pairs") or []
-                    if not pairs:
-                        continue
-                    p = pairs[0]
-
-                    # ── Extract data ──────────────────────────────────────────
-                    base       = p.get("baseToken", {})
-                    symbol     = base.get("symbol", "???")
-                    name       = base.get("name", "")
-                    liquidity  = (p.get("liquidity") or {}).get("usd", 0) or 0
-                    v5m        = (p.get("volume") or {}).get("m5", 0) or 0
-                    v1h        = (p.get("volume") or {}).get("h1", 0) or 0
-                    chg5m      = (p.get("priceChange") or {}).get("m5", 0) or 0
-                    chg1h      = (p.get("priceChange") or {}).get("h1", 0) or 0
-                    chg24h     = (p.get("priceChange") or {}).get("h24", 0) or 0
-                    buys5m     = (p.get("txns") or {}).get("m5", {}).get("buys", 0) or 0
-                    sells5m    = (p.get("txns") or {}).get("m5", {}).get("sells", 0) or 0
-                    buys1h     = (p.get("txns") or {}).get("h1", {}).get("buys", 0) or 0
-                    sells1h    = (p.get("txns") or {}).get("h1", {}).get("sells", 0) or 0
-                    created_at = p.get("pairCreatedAt", 0) or 0
-                    price_usd  = float(p.get("priceUsd", "0") or "0")
-                    age_h      = (_t.time() - created_at / 1000) / 3600 if created_at > 0 else 9999
-
-                    # ── Hard filters — FAIL ANY = skip ────────────────────────
-                    if age_h > MAX_AGE_HOURS:
-                        continue          # too old
-                    if chg5m < MIN_PRICE_CHG_5M:
-                        continue          # not moving up right now
-                    if v5m < MIN_VOL_5M:
-                        continue          # nobody trading it
-                    if liquidity < MIN_LIQUIDITY or liquidity > MAX_LIQUIDITY:
-                        continue          # too small or too large
-                    if chg24h > MAX_GAIN_24H:
-                        continue          # already pumped out
-                    if buys5m <= sells5m:
-                        continue          # more sellers than buyers right now
-                    if price_usd <= 0:
-                        continue
-
-                    # ── Momentum score ────────────────────────────────────────
-                    # Higher = stronger signal
-                    buy_ratio    = buys5m / max(sells5m, 1)
-                    vol_velocity = v5m / max(v1h / 12, 1)  # 5m vol vs expected per 5m slice of 1h
-                    score = (
-                        min(chg5m, 50)     * 1.5 +   # 5m price change (capped at 50%)
-                        min(buy_ratio, 5)  * 8   +   # buy/sell ratio
-                        min(vol_velocity, 3) * 5      # volume acceleration
-                    )
-
-                    qualified.append({
-                        "mint":      mint,
-                        "symbol":    symbol,
-                        "name":      name,
-                        "price_usd": price_usd,
-                        "score":     round(score, 1),
-                        "age_h":     round(age_h, 2),
-                        "chg5m":     chg5m,
-                        "chg1h":     chg1h,
-                        "v5m":       v5m,
-                        "liquidity": liquidity,
-                        "buys5m":    buys5m,
-                        "sells5m":   sells5m,
-                        "buys1h":    buys1h,
-                        "sells1h":   sells1h,
-                    })
-
-                except Exception as e:
-                    log.debug(f"{mint[:16]}: {e}")
-                    continue
-
-        # Sort by momentum score — highest first
-        qualified.sort(key=lambda x: x["score"], reverse=True)
-        log.info(f"Momentum filter: {len(qualified)} tokens passed out of {len(mints)} scanned")
-        for q in qualified[:10]:
-            log.info(
-                f"  ✅ {q['symbol']:10s} score:{q['score']:5.1f} | "
-                f"5m:{q['chg5m']:+.1f}% | {q['buys5m']}B/{q['sells5m']}S | "
-                f"vol5m:${q['v5m']:,.0f} | liq:${q['liquidity']:,.0f} | age:{q['age_h']:.2f}h"
-            )
-        return qualified
+    def timed_out(self):  return self.hold_secs >= MAX_HOLD_MINUTES * 60
 
 # ─── JUPITER ─────────────────────────────────────────────────────────────────
 
 class Jupiter:
     def _headers(self):
         h = {"Content-Type": "application/json"}
-        if JUPITER_API_KEY:
-            h["x-api-key"] = JUPITER_API_KEY
+        if JUPITER_API_KEY: h["x-api-key"] = JUPITER_API_KEY
         return h
 
     async def _sess(self):
@@ -290,13 +99,14 @@ class Jupiter:
             from aiohttp.resolver import AsyncResolver
             conn = aiohttp.TCPConnector(
                 resolver=AsyncResolver(nameservers=["8.8.8.8", "1.1.1.1"]),
-                ssl=False, limit=20)
+                ssl=False, limit=10
+            )
         except:
-            conn = aiohttp.TCPConnector(ssl=False, limit=20)
+            conn = aiohttp.TCPConnector(ssl=False, limit=10)
         return aiohttp.ClientSession(connector=conn, headers=self._headers())
 
-    async def price(self, mint) -> Optional[float]:
-        # Jupiter first
+    async def price(self, mint):
+        # Try price API first
         s = await self._sess()
         try:
             async with s.get(f"{JUP_PRICE}?ids={mint}",
@@ -304,61 +114,85 @@ class Jupiter:
                 if r.status == 200:
                     d = await r.json()
                     p = d.get("data", {}).get(mint, {}).get("price")
-                    if p:
-                        return float(p)
-        except:
-            pass
-        finally:
-            await s.close()
-        # Dexscreener fallback
-        try:
-            async with aiohttp.ClientSession() as sess:
-                async with sess.get(
-                    f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                    timeout=aiohttp.ClientTimeout(total=5)
-                ) as r:
-                    if r.status == 200:
-                        d = await r.json()
-                        pairs = d.get("pairs") or []
-                        if pairs:
-                            p = pairs[0].get("priceUsd")
-                            if p:
-                                return float(p)
-        except:
-            pass
-        return None
+                    if p: return float(p)
+        except: pass
+        finally: await s.close()
 
-    async def sol_usd(self) -> float:
-        s = await self._sess()
+        # Quote-based fallback (works on brand new tokens)
+        s2 = await self._sess()
         try:
-            async with s.get(f"{JUP_PRICE}?ids={WSOL}",
-                             timeout=aiohttp.ClientTimeout(total=5)) as r:
+            params = {"inputMint": mint, "outputMint": WSOL, "amount": str(int(10000 * 1e6))}
+            async with s2.get(JUP_ORDER, params=params,
+                              timeout=aiohttp.ClientTimeout(total=6)) as r:
                 if r.status == 200:
                     d = await r.json()
-                    p = d.get("data", {}).get(WSOL, {}).get("price")
-                    if p:
-                        return float(p)
-        except:
-            pass
+                    out_sol = int(d.get("outAmount", "0")) / 1e9
+                    if out_sol > 0: return out_sol / 10000
+        except: pass
+        finally: await s2.close()
+        return None
+
+    async def quote_price(self, mint):
+        """
+        LIVE quote-based price — bypasses the Jupiter price API cache entirely.
+        Used for momentum checks where stale cached prices return 0.0% movement.
+        Asks the AMM directly: how much SOL for 10k tokens right now?
+        Returns price per token in SOL, or None if no route.
+        """
+        s = await self._sess()
+        try:
+            # Use a meaningful amount — 1M tokens to get a stable quote
+            params = {
+                "inputMint": mint,
+                "outputMint": WSOL,
+                "amount": str(int(1_000_000 * 1e6))
+            }
+            async with s.get(JUP_ORDER, params=params,
+                             timeout=aiohttp.ClientTimeout(total=6)) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    out_sol = int(d.get("outAmount", "0")) / 1e9
+                    if out_sol > 0:
+                        return out_sol / 1_000_000
+                    # outAmount was 0 — try smaller amount (low liquidity)
+                else:
+                    log.debug(f"quote_price {r.status} for {mint[:16]}")
+        except Exception as e:
+            log.debug(f"quote_price err: {e}")
         finally:
             await s.close()
-        return 165.0
+
+        # Fallback: try with 10k tokens
+        s2 = await self._sess()
+        try:
+            params = {"inputMint": mint, "outputMint": WSOL,
+                      "amount": str(int(10_000 * 1e6))}
+            async with s2.get(JUP_ORDER, params=params,
+                              timeout=aiohttp.ClientTimeout(total=6)) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    out_sol = int(d.get("outAmount", "0")) / 1e9
+                    if out_sol > 0:
+                        return out_sol / 10_000
+        except: pass
+        finally:
+            await s2.close()
+        return None
 
     async def order(self, inp, out, amount, taker):
         s = await self._sess()
         try:
-            async with s.get(JUP_ORDER,
-                params={"inputMint": inp, "outputMint": out,
-                        "amount": str(amount), "taker": taker,
-                        "slippageBps": str(SLIPPAGE_BPS)},
-                timeout=aiohttp.ClientTimeout(total=12)) as r:
-                if r.status == 200:
-                    return await r.json()
+            params = {
+                "inputMint": inp, "outputMint": out,
+                "amount": str(amount), "taker": taker,
+                "slippageBps": str(SLIPPAGE_BPS)
+            }
+            async with s.get(JUP_ORDER, params=params,
+                             timeout=aiohttp.ClientTimeout(total=12)) as r:
+                if r.status == 200: return await r.json()
                 log.error(f"Jup order {r.status}: {(await r.text())[:200]}")
-        except Exception as e:
-            log.error(f"Jup order: {e}")
-        finally:
-            await s.close()
+        except Exception as e: log.error(f"Jup order: {e}")
+        finally: await s.close()
         return None
 
     async def execute(self, req_id, signed_b64):
@@ -367,115 +201,73 @@ class Jupiter:
             async with s.post(JUP_EXECUTE,
                 json={"signedTransaction": signed_b64, "requestId": req_id},
                 timeout=aiohttp.ClientTimeout(total=30)) as r:
-                if r.status == 200:
-                    return await r.json()
+                if r.status == 200: return await r.json()
                 log.error(f"Jup exec {r.status}: {(await r.text())[:200]}")
-        except Exception as e:
-            log.error(f"Jup exec: {e}")
-        finally:
-            await s.close()
+        except Exception as e: log.error(f"Jup exec: {e}")
+        finally: await s.close()
         return None
 
 # ─── SOLANA ──────────────────────────────────────────────────────────────────
 
 class Solana:
     def __init__(self, rpc, pk):
-        self.rpc     = rpc
+        self.rpc = rpc
+        self.ws  = rpc.replace("https://", "wss://").replace("http://", "ws://")
         self.keypair = self.pubkey = None
         if pk:
             try:
-                from solders.keypair import Keypair
-                import base58
+                from solders.keypair import Keypair; import base58
                 self.keypair = Keypair.from_bytes(base58.b58decode(pk))
                 self.pubkey  = str(self.keypair.pubkey())
                 log.info(f"Wallet: {self.pubkey[:8]}...{self.pubkey[-4:]}")
-            except Exception as e:
-                log.error(f"Wallet: {e}")
+            except Exception as e: log.error(f"Wallet load: {e}")
 
-    async def balance(self) -> float:
-        if not self.pubkey:
-            return 0.0
+    async def balance(self, sess):
+        if not self.pubkey: return 0.0
         try:
-            async with aiohttp.ClientSession() as s:
-                async with s.post(self.rpc,
-                    json={"jsonrpc": "2.0", "id": 1, "method": "getBalance",
-                          "params": [self.pubkey]},
-                    timeout=aiohttp.ClientTimeout(total=10)) as r:
-                    d = await r.json()
-                    return d.get("result", {}).get("value", 0) / 1e9
-        except:
-            return 0.0
-
-    async def token_balance(self, mint) -> tuple:
-        if not self.pubkey:
-            return 0, 6
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.post(self.rpc,
-                    json={"jsonrpc": "2.0", "id": 1,
-                          "method": "getTokenAccountsByOwner",
-                          "params": [self.pubkey, {"mint": mint},
-                                     {"encoding": "jsonParsed"}]},
-                    timeout=aiohttp.ClientTimeout(total=10)) as r:
-                    data = await r.json()
-            for acct in data.get("result", {}).get("value", []):
-                info = (acct.get("account", {}).get("data", {})
-                            .get("parsed", {}).get("info", {}))
-                ta  = info.get("tokenAmount", {})
-                raw = int(ta.get("amount", 0))
-                dec = int(ta.get("decimals", 6))
-                if raw > 0:
-                    return raw, dec
-        except Exception as e:
-            log.error(f"token_balance: {e}")
-        return 0, 6
-
-    async def top_holder_pct(self, mint) -> float:
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.post(self.rpc,
-                    json={"jsonrpc": "2.0", "id": 1,
-                          "method": "getTokenLargestAccounts",
-                          "params": [mint]},
-                    timeout=aiohttp.ClientTimeout(total=8)) as r:
-                    h_data = await r.json()
-                async with s.post(self.rpc,
-                    json={"jsonrpc": "2.0", "id": 2,
-                          "method": "getTokenSupply",
-                          "params": [mint]},
-                    timeout=aiohttp.ClientTimeout(total=8)) as r:
-                    s_data = await r.json()
-            holders = h_data.get("result", {}).get("value", [])
-            total   = float(s_data.get("result", {}).get("value", {}).get("amount", "0"))
-            if total > 0 and holders:
-                top = float(holders[0].get("amount", "0"))
-                return (top / total) * 100
-        except:
-            pass
-        return 0.0
+            async with sess.post(self.rpc,
+                json={"jsonrpc": "2.0", "id": 1, "method": "getBalance",
+                      "params": [self.pubkey]},
+                timeout=aiohttp.ClientTimeout(total=10)) as r:
+                d = await r.json()
+                return d.get("result", {}).get("value", 0) / 1e9
+        except: return 0.0
 
     def sign(self, tx_b64):
-        if not self.keypair:
-            return None
+        if not self.keypair: return None
         try:
             from solders.transaction import VersionedTransaction
             raw    = b64.b64decode(tx_b64)
             txn    = VersionedTransaction.from_bytes(raw)
             signed = VersionedTransaction(txn.message, [self.keypair])
             return b64.b64encode(bytes(signed)).decode()
-        except Exception as e:
-            log.error(f"Sign: {e}")
-            return None
+        except Exception as e: log.error(f"Sign: {e}"); return None
 
 # ─── DISCORD ─────────────────────────────────────────────────────────────────
 
 class Discord:
     def __init__(self, url):
         self.url = url
+        self._sol_price = 165.0
+
+    async def _fetch_sol_price(self):
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"{JUP_PRICE}?ids={WSOL}",
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as r:
+                    if r.status == 200:
+                        d = await r.json()
+                        p = d.get("data", {}).get(WSOL, {}).get("price")
+                        if p:
+                            self._sol_price = float(p)
+        except:
+            pass
+        return self._sol_price
 
     async def send(self, payload):
-        if not self.url:
-            return
+        if not self.url: return
         for attempt in range(3):
             try:
                 async with aiohttp.ClientSession() as s:
@@ -485,96 +277,269 @@ class Discord:
                     return
             except Exception as e:
                 if attempt == 2:
-                    log.debug(f"Discord: {e}")
+                    log.debug(f"Discord send failed: {e}")
                 await asyncio.sleep(1)
 
-    async def startup(self, bal: float, sol_usd: float):
-        await self.send({"embeds": [{
-            "title": "⚡ WINSTON v3 — MOMENTUM SNIPER ONLINE",
-            "color": 0x00FF88,
-            "description": (
-                f"Balance: **{bal:.4f} SOL** (${bal*sol_usd:.2f})\n"
-                f"Mode: **Pure momentum — no AI, just math**\n"
-                f"Entry: age <{MAX_AGE_HOURS:.0f}h | 5m >{MIN_PRICE_CHG_5M:.0f}% | buys>sells | vol5m >${MIN_VOL_5M:,.0f}\n"
-                f"Exit: +{TP_PCT:.0f}% profit | -{STOP_LOSS_PCT:.0f}% stop | {STALL_MINUTES:.0f}min stall | {MAX_HOLD_MINUTES:.0f}min max\n"
-                f"Size: **{TRADE_AMOUNT_SOL} SOL** (~${TRADE_AMOUNT_SOL*sol_usd:.2f}) | Max **{MAX_POSITIONS}** positions"
-            )
-        }]})
+    def _label(self, p: "Position") -> str:
+        if p.token.symbol and p.token.symbol != "???":
+            return p.token.symbol
+        if p.token.name and p.token.name not in ("Unknown", ""):
+            return p.token.name[:12]
+        return p.token.mint[:8] + "..."
 
-    async def scan_result(self, found: list, total_scanned: int):
-        if not found:
-            return  # silent — no spam when nothing found
-        lines = []
-        for t in found[:8]:
-            lines.append(
-                f"✅ **{t['symbol']}** score:{t['score']} | "
-                f"5m:{t['chg5m']:+.1f}% | {t['buys5m']}B/{t['sells5m']}S | "
-                f"vol:${t['v5m']:,.0f} | liq:${t['liquidity']:,.0f} | {t['age_h']:.2f}h old"
-            )
+    async def bought(self, p: "Position"):
+        sol_usd = await self._fetch_sol_price()
+        label   = self._label(p)
+        spent   = p.cost_sol * sol_usd
+        target  = spent * PROFIT_TARGET_X
         await self.send({"embeds": [{
-            "title": f"📡 Scan — {len(found)} launching | {total_scanned} checked",
-            "color": 0x8800FF,
-            "description": "\n".join(lines)
-        }]})
-
-    async def bought(self, pos: Position, sol_usd: float):
-        label = pos.token.symbol
-        await self.send({"embeds": [{
-            "title": f"🚀 IN — {label}",
+            "title": f"🟢 BUY — {label}",
             "color": 0x00AAFF,
             "description": (
-                f"{pos.entry_data}\n\n"
-                f"Entry: **${pos.entry_price:.8f}** | **{pos.cost_sol:.4f} SOL** (${pos.cost_sol*sol_usd:.2f})\n"
-                f"Target: **+{TP_PCT:.0f}%** → ${pos.entry_price*(1+TP_PCT/100):.8f}\n"
-                f"Stop:   **-{STOP_LOSS_PCT:.0f}%** → ${pos.entry_price*(1-STOP_LOSS_PCT/100):.8f}"
+                f"In: **${spent:.2f}** ({p.cost_sol:.4f} SOL)\n"
+                f"Target: **+{(PROFIT_TARGET_X-1)*100:.0f}%** → ${target:.2f}\n"
+                f"Auto-sell: **{MAX_HOLD_MINUTES:.0f} min** | Stop: {TRAILING_STOP_PCT}%"
             ),
             "fields": [{"name": "Chart",
-                        "value": f"[Dex](https://dexscreener.com/solana/{pos.token.mint}) | "
-                                 f"[Solscan](https://solscan.io/token/{pos.token.mint})",
+                        "value": f"[Dex](https://dexscreener.com/solana/{p.token.mint}) | "
+                                 f"[Solscan](https://solscan.io/token/{p.token.mint})",
                         "inline": False}]
         }]})
 
-    async def sold(self, pos: Position, reason: str, gain_pct: float,
-                   pnl_sol: float, sol_usd: float):
-        label     = pos.token.symbol
-        is_profit = pnl_sol >= 0
+    async def sold(self, p: "Position", reason: str, gain_x: float, pnl_sol: float):
+        sol_usd   = await self._fetch_sol_price()
+        label     = self._label(p)
+        gain_pct  = (gain_x - 1) * 100
+        pnl_usd   = pnl_sol * sol_usd
+        is_profit = pnl_usd >= 0
         color     = 0x00FF88 if is_profit else 0xFF4444
         emoji     = "✅" if is_profit else "❌"
-        pnl_str   = f"+{pnl_sol:.5f} SOL (+${abs(pnl_sol)*sol_usd:.2f})" if is_profit \
-                    else f"{pnl_sol:.5f} SOL (-${abs(pnl_sol)*sol_usd:.2f})"
+        pnl_str   = f"+${pnl_usd:.2f}" if is_profit else f"-${abs(pnl_usd):.2f}"
         reason_map = {
-            "tp":         f"🎯 +{TP_PCT:.0f}% hit",
-            "stop_loss":  f"🛑 Stop -{STOP_LOSS_PCT:.0f}%",
-            "stall":      f"😴 Stalled {STALL_MINUTES:.0f}min",
-            "timeout":    f"⏰ {MAX_HOLD_MINUTES:.0f}min timeout",
-            "price_dead": "📡 Price dead",
+            "timeout_2min":  f"⏰ {MAX_HOLD_MINUTES:.0f}min timeout",
+            "trailing_stop": "🛑 Stop loss",
+            "price_dead":    "💀 No price",
         }
+        reason_clean = reason_map.get(reason, f"🎯 {reason}")
         await self.send({"embeds": [{
-            "title": f"{emoji} OUT — {label} [{gain_pct:+.1f}%]",
+            "title": f"{emoji} SELL — {label}  {gain_pct:+.1f}%",
             "color": color,
             "description": (
-                f"**{pnl_str}**\n"
-                f"{reason_map.get(reason, reason)} | held {pos.hold_secs:.0f}s"
+                f"**{pnl_str}** ({gain_x:.3f}x) in {p.hold_mins:.1f}min\n"
+                f"{reason_clean}"
             )
         }]})
 
-    async def heartbeat(self, positions: list, wins: int, losses: int,
-                        total_pnl: float, bal: float, sol_usd: float, uptime_mins: float):
-        pnl_usd = total_pnl * sol_usd
-        pnl_str = f"+${pnl_usd:.2f}" if pnl_usd >= 0 else f"-${abs(pnl_usd):.2f}"
-        pos_lines = []
-        for p in positions:
-            cached_price = p.entry_price  # approximate
-            gain = ((cached_price / p.entry_price) - 1) * 100 if p.entry_price else 0
-            pos_lines.append(f"• **{p.token.symbol}** {p.hold_secs:.0f}s")
-        desc = (
-            f"**{wins}W / {losses}L** | Net: **{pnl_str}** | Bal: {bal:.4f} SOL\n"
-            f"Positions: **{len(positions)}/{MAX_POSITIONS}** | Up: {uptime_mins:.0f}min\n"
-        )
-        if pos_lines:
-            desc += "\n".join(pos_lines)
-        await self.send({"embeds": [{"title": "💓 Winston v3", "color": 0x333333,
-                                     "description": desc}]})
+# ─── DETECTOR ────────────────────────────────────────────────────────────────
+
+class Detector:
+    """
+    Listens to Pump.fun + Raydium WebSocket logs.
+    Queues new tokens for buying. Bot can hold up to MAX_POSITIONS at once.
+    """
+    def __init__(self, sol):
+        self.sol    = sol
+        self.seen   = set()
+        self.count  = 0
+        self.queue  = asyncio.Queue()
+        self._held_mints: set = set()  # mints currently in a position
+
+    @property
+    def locked(self):
+        return len(self._held_mints) >= MAX_POSITIONS
+
+    def add_position(self, mint: str):
+        self._held_mints.add(mint)
+
+    def remove_position(self, mint: str):
+        self._held_mints.discard(mint)
+
+    async def listen(self):
+        while True:
+            try:
+                log.info("Connecting WS...")
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.ws_connect(self.sol.ws, heartbeat=30) as ws:
+                        log.info("WebSocket connected — scanning for pools")
+                        await ws.send_json({
+                            "jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
+                            "params": [{"mentions": [PUMPFUN]}, {"commitment": "confirmed"}]
+                        })
+                        await ws.send_json({
+                            "jsonrpc": "2.0", "id": 2, "method": "logsSubscribe",
+                            "params": [{"mentions": [RAYDIUM_AMM]}, {"commitment": "confirmed"}]
+                        })
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                # Do NOT use create_task here — that runs handlers
+                                # in parallel so multiple events all see locked=False
+                                # and queue multiple tokens. Handle sequentially.
+                                await self._handle(msg.data)
+                            elif msg.type in (aiohttp.WSMsgType.ERROR,
+                                             aiohttp.WSMsgType.CLOSED):
+                                break
+            except Exception as e:
+                log.error(f"WS error: {e}")
+            log.info("WS disconnected — reconnecting in 5s")
+            await asyncio.sleep(5)
+
+    async def _handle(self, raw):
+        # Drop immediately if all slots full
+        if self.locked:
+            return
+
+        try:
+            data = json.loads(raw)
+            if "params" not in data: return
+            value = data["params"]["result"].get("value", {})
+            logs  = value.get("logs", [])
+            sig   = value.get("signature", "")
+            if not logs or not sig: return
+            if sig in self.seen: return
+
+            log_text = " ".join(logs)
+
+            if PUMPFUN not in log_text: return
+
+            is_graduation = (
+                PUMPFUN in log_text and
+                ("Withdraw" in log_text or "migrate" in log_text.lower())
+            )
+            is_raydium_pool = (
+                RAYDIUM_AMM in log_text and
+                ("initialize2" in log_text or "InitializeInstruction2" in log_text)
+            )
+
+            if not is_graduation and not is_raydium_pool:
+                return
+
+            self.seen.add(sig)
+            source = "pumpfun" if is_graduation else "raydium"
+            log.info(f"GRADUATION detected ({source}) — tx {sig[:20]}...")
+
+            mint = None
+            async with aiohttp.ClientSession() as sess:
+                for attempt in range(10):
+                    mint = await self._extract_mint(sig, sess)
+                    if mint:
+                        log.info(f"Mint via getTransaction (attempt {attempt+1}): {mint[:20]}...")
+                        break
+                    await asyncio.sleep(2)
+
+            if not mint:
+                mint = self._mint_from_logs(logs, source)
+                if mint:
+                    log.info(f"Mint via log scan: {mint[:20]}...")
+
+            if not mint:
+                log.warning(f"No mint from {sig[:16]} — skipping")
+                return
+
+            if mint in self.seen or mint in self._held_mints:
+                return
+            self.seen.add(mint)
+
+            self.count += 1
+            token = Token(mint=mint, source=source)
+            log.info(f"DETECTED {source.upper()} -> {mint[:24]}...")
+
+            if not self.locked:
+                await self.queue.put(token)
+
+        except Exception as e:
+            log.warning(f"Handle err: {e}")
+
+    async def _extract_mint(self, sig: str, sess: aiohttp.ClientSession) -> Optional[str]:
+        """
+        Fetch the transaction and pull the token mint from postTokenBalances.
+        Returns None if the RPC hasn't indexed the tx yet (result is null).
+        """
+        try:
+            payload = {
+                "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
+                "params": [sig, {"encoding": "jsonParsed",
+                                 "maxSupportedTransactionVersion": 0}]
+            }
+            async with sess.post(self.sol.rpc, json=payload,
+                                 timeout=aiohttp.ClientTimeout(total=8)) as r:
+                data = await r.json()
+
+            tx = data.get("result")
+            if not tx:
+                return None  # Not indexed yet — caller will retry
+
+            meta = tx.get("meta", {})
+            if not meta or meta.get("err"):
+                return None
+
+            skip = {WSOL,
+                    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"}
+
+            for bal in meta.get("postTokenBalances", []):
+                m = bal.get("mint", "")
+                if m and m not in skip:
+                    return m
+
+            for bal in meta.get("preTokenBalances", []):
+                m = bal.get("mint", "")
+                if m and m not in skip:
+                    return m
+
+        except Exception as e:
+            log.debug(f"extract_mint err: {e}")
+        return None
+
+    # Known Solana program/system addresses — never valid token mints
+    _KNOWN_PROGRAMS = {
+        WSOL,
+        PUMPFUN,
+        RAYDIUM_AMM,
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+        "11111111111111111111111111111111",                # System
+        "ComputeBudget111111111111111111111111111111",     # Compute budget
+        "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL", # Associated token
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  # Token program
+        "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",  # Token-2022
+        "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",  # Pump fee
+        "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  # Pump.fun (dup)
+        "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",  # Metaplex
+        "SysvarRent111111111111111111111111111111111",    # Sysvar
+        "SysvarC1ock11111111111111111111111111111111",    # Sysvar clock
+    }
+
+    def _mint_from_logs(self, logs: list, source: str) -> Optional[str]:
+        """
+        Fallback: extract mint directly from WebSocket log strings.
+        Only used when getTransaction hasn't indexed yet.
+
+        Pump.fun token mints ALWAYS end with 'pump' — this is a protocol
+        invariant, not a coincidence. No Solana program address ends in 'pump'.
+        So for pumpfun source we can scan specifically for that pattern.
+        """
+        import re
+
+        # For Pump.fun graduations: mint always ends in "pump"
+        if source == "pumpfun":
+            pump_re = re.compile(r'([1-9A-HJ-NP-Za-km-z]{32,44}pump)')
+            for line in logs:
+                for m in pump_re.finditer(line):
+                    addr = m.group(1)
+                    if addr not in self._KNOWN_PROGRAMS:
+                        return addr
+
+        # For Raydium: scan for 43-44 char base58 addresses not in known programs
+        b58 = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+        addr_re = re.compile(r'([1-9A-HJ-NP-Za-km-z]{43,44})')
+        for line in logs:
+            for m in addr_re.finditer(line):
+                addr = m.group(1)
+                if (addr not in self._KNOWN_PROGRAMS and
+                        all(c in b58 for c in addr)):
+                    return addr
+
+        return None
 
 # ─── BOT ─────────────────────────────────────────────────────────────────────
 
@@ -582,285 +547,349 @@ class Bot:
     def __init__(self):
         self.sol      = Solana(SOLANA_RPC_URL, WALLET_PRIVATE_KEY)
         self.jup      = Jupiter()
-        self.scanner  = Scanner()
         self.discord  = Discord(DISCORD_WEBHOOK_URL)
-
-        self.positions: list[Position] = []
-        self.held_mints: set = set()
-
-        self.start_ts  = time.time()
-        self.sol_usd   = 165.0
-        self.wins      = 0
-        self.losses    = 0
-        self.total_pnl = 0.0
-        self._price_cache: dict = {}
+        self.detector = Detector(self.sol)
+        self.start    = time.time()
+        self.trades_won  = 0
+        self.trades_lost = 0
+        self.total_pnl   = 0.0
 
     async def run(self):
         log.info("=" * 55)
-        log.info("  WINSTON v3 — Pure Momentum Sniper")
-        log.info(f"  {TRADE_AMOUNT_SOL} SOL/trade | max {MAX_POSITIONS} positions")
-        log.info(f"  Entry: age <{MAX_AGE_HOURS}h | 5m >{MIN_PRICE_CHG_5M}% | vol >${MIN_VOL_5M}")
-        log.info(f"  Exit: +{TP_PCT}% profit | -{STOP_LOSS_PCT}% stop | {STALL_MINUTES}min stall")
-        log.info(f"  Scan every {SCAN_INTERVAL_SECS}s")
+        log.info("  WINSTON v7-mod — Multi-Position Graduation Sniper")
+        log.info(f"  {TRADE_AMOUNT_SOL} SOL/trade (~$1) | max {MAX_POSITIONS} positions")
+        log.info(f"  Target: {PROFIT_TARGET_X}x (+{(PROFIT_TARGET_X-1)*100:.0f}%) | "
+                 f"Timeout: {MAX_HOLD_MINUTES}min | Stop: {TRAILING_STOP_PCT}%")
+        log.info(f"  Jupiter key: {'SET' if JUPITER_API_KEY else 'MISSING'}")
         log.info("=" * 55)
 
-        self.sol_usd = await self.jup.sol_usd()
-        bal = await self.sol.balance()
-        log.info(f"Balance: {bal:.4f} SOL (${bal*self.sol_usd:.2f})")
-
-        await self.discord.startup(bal, self.sol_usd)
+        async with aiohttp.ClientSession() as s:
+            if self.sol.pubkey:
+                bal = await self.sol.balance(s)
+                log.info(f"Starting balance: {bal:.4f} SOL")
 
         await asyncio.gather(
-            self._scan_loop(),
-            self._watch_loop(),
-            self._heartbeat_loop(),
+            self.detector.listen(),
+            self._trade_loop(),
+            self._heartbeat(),
         )
 
-    # ─── SCAN LOOP ───────────────────────────────────────────────────────────
+    # ── MAIN TRADE LOOP ──────────────────────────────────────────────────────
 
-    async def _scan_loop(self):
-        await asyncio.sleep(5)  # brief warmup
+    async def _trade_loop(self):
+        """
+        Picks tokens off the queue and opens positions concurrently.
+        Up to MAX_POSITIONS trades running at the same time.
+        Each position manages its own watch/exit in a separate task.
+        """
+        log.info("Trade loop ready — waiting for graduations")
         while True:
-            try:
-                await self._do_scan()
-            except Exception as e:
-                log.error(f"Scan error: {e}")
-                import traceback; traceback.print_exc()
-            await asyncio.sleep(SCAN_INTERVAL_SECS)
+            token = await self.detector.queue.get()
 
-    async def _do_scan(self):
-        open_slots = MAX_POSITIONS - len(self.positions)
-        if open_slots <= 0:
-            log.info(f"All {MAX_POSITIONS} slots full")
-            return
-
-        candidates = await self.scanner.find_momentum_tokens(self.held_mints)
-
-        await self.discord.scan_result(candidates, len(candidates))
-
-        bought = 0
-        for token_data in candidates:
-            if bought >= open_slots:
-                break
-            if len(self.positions) >= MAX_POSITIONS:
-                break
-            if token_data["mint"] in self.held_mints:
+            # Double-check slot available (queue could have backed up)
+            if self.detector.locked:
+                log.info(f"All {MAX_POSITIONS} slots full — dropping {token.mint[:16]}")
                 continue
 
-            success = await self._open_position(token_data)
-            if success:
-                bought += 1
-                # Mark as seen so we don't re-buy same token this session
-                self.scanner.seen_mints.add(token_data["mint"])
-                await asyncio.sleep(1)
+            # Fire and forget — each position runs independently
+            asyncio.create_task(self._handle_token(token))
 
-        if bought:
-            log.info(f"Scan complete — opened {bought} positions | {len(self.positions)}/{MAX_POSITIONS}")
+    async def _handle_token(self, token: Token):
+        """Full lifecycle for one token: filter → buy → watch → sell."""
+        try:
+            passed = await self._filter(token)
+            if not passed:
+                log.info(f"SKIP {token.mint[:16]} — failed filters")
+                return
 
-    # ─── OPEN POSITION ───────────────────────────────────────────────────────
+            pos = await self._buy(token)
+            if not pos:
+                log.info(f"BUY FAILED for {token.symbol} — slot freed")
+                return
 
-    async def _open_position(self, data: dict) -> bool:
-        mint   = data["mint"]
-        symbol = data["symbol"]
+            self.detector.add_position(token.mint)
+            try:
+                await self._watch(pos)
+            finally:
+                self.detector.remove_position(token.mint)
+                log.info(f"Slot freed | active: {len(self.detector._held_mints)}/{MAX_POSITIONS} | "
+                         f"Stats: {self.trades_won}W/{self.trades_lost}L | "
+                         f"Net {self.total_pnl:+.5f} SOL")
 
-        # Balance check
-        bal = await self.sol.balance()
+        except Exception as e:
+            log.error(f"Handle token error: {e}")
+            import traceback; traceback.print_exc()
+            self.detector.remove_position(token.mint)
+
+    # ── FILTER ───────────────────────────────────────────────────────────────
+
+    async def _filter(self, token: Token) -> bool:
+        """Quick parallel filter — holder count, freeze, liquidity."""
+        async with aiohttp.ClientSession() as sess:
+            try:
+                holder_task = asyncio.create_task(
+                    self._rpc(sess, "getTokenLargestAccounts", [token.mint])
+                )
+                acct_task = asyncio.create_task(
+                    self._rpc(sess, "getAccountInfo",
+                              [token.mint, {"encoding": "jsonParsed"}])
+                )
+                liq_task = asyncio.create_task(
+                    self.jup.order(WSOL, token.mint,
+                                   int(0.005 * 1e9), self.sol.pubkey)
+                )
+
+                holders_res, acct_res, liq_order = await asyncio.gather(
+                    holder_task, acct_task, liq_task, return_exceptions=True
+                )
+
+                # Holder count
+                if isinstance(holders_res, Exception) or not holders_res:
+                    log.info(f"SKIP {token.mint[:16]}: holder RPC failed")
+                    return False
+                holders = holders_res.get("result", {}).get("value", [])
+                if len(holders) < 5:
+                    log.info(f"SKIP {token.mint[:16]}: only {len(holders)} holders")
+                    return False
+
+                # Top holder concentration
+                supply_res = await self._rpc(sess, "getTokenSupply", [token.mint])
+                total = float(supply_res.get("result", {})
+                                        .get("value", {})
+                                        .get("amount", "0"))
+                if total > 0 and holders:
+                    top     = float(holders[0].get("amount", "0"))
+                    top_pct = (top / total) * 100
+                    if top_pct > MAX_TOP_HOLDER_PCT:
+                        log.info(f"SKIP {token.mint[:16]}: top holder {top_pct:.0f}%")
+                        return False
+
+                # Freeze authority + grab name/symbol
+                if not isinstance(acct_res, Exception) and acct_res:
+                    acct = acct_res.get("result", {}).get("value", {})
+                    if acct:
+                        parsed = (acct.get("data", {})
+                                      .get("parsed", {})
+                                      .get("info", {}))
+                        if parsed.get("freezeAuthority"):
+                            log.info(f"SKIP {token.mint[:16]}: freeze authority")
+                            return False
+                        if parsed.get("symbol"): token.symbol = parsed["symbol"]
+                        if parsed.get("name"):   token.name   = parsed["name"]
+
+                # Liquidity check
+                if (isinstance(liq_order, Exception) or not liq_order
+                        or not liq_order.get("outAmount")):
+                    log.info(f"SKIP {token.mint[:16]}: no liquidity")
+                    return False
+
+                # Fetch metadata from Pump.fun — always try, not just when ???
+                try:
+                    async with sess.get(
+                        f"https://frontend-api.pump.fun/coins/{token.mint}",
+                        timeout=aiohttp.ClientTimeout(total=4)
+                    ) as r:
+                        if r.status == 200:
+                            meta = await r.json()
+                            if meta.get("symbol"): token.symbol = meta["symbol"]
+                            if meta.get("name"):   token.name   = meta["name"]
+                except: pass
+
+                label = token.symbol if token.symbol != "???" else (token.name[:10] if token.name != "Unknown" else token.mint[:8])
+                log.info(f"PASS {label} ({token.mint[:16]}) — {len(holders)} holders")
+                return True
+
+            except Exception as e:
+                log.warning(f"Filter error: {e}")
+                return False
+
+    # ── BUY ──────────────────────────────────────────────────────────────────
+
+    async def _buy(self, token: Token) -> Optional[Position]:
+        if not self.sol.pubkey:
+            log.error("No wallet pubkey"); return None
+
+        async with aiohttp.ClientSession() as sess:
+            bal = await self.sol.balance(sess)
+
         if bal < TRADE_AMOUNT_SOL + 0.005:
-            log.error(f"Low balance: {bal:.4f} SOL")
-            return False
+            log.error(f"Low balance: {bal:.4f} SOL — need {TRADE_AMOUNT_SOL + 0.005:.4f}")
+            return None
 
-        # Top holder check
-        top_pct = await self.sol.top_holder_pct(mint)
-        if top_pct > MAX_TOP_HOLDER_PCT:
-            log.warning(f"SKIP {symbol}: top holder {top_pct:.0f}%")
-            return False
+        if BUY_DELAY_SECONDS > 0:
+            await asyncio.sleep(BUY_DELAY_SECONDS)
 
-        # Get current price
-        price = data.get("price_usd", 0.0)
-        if not price:
-            price = await self.jup.price(mint)
-        if not price or price <= 0:
-            log.warning(f"SKIP {symbol}: no price")
-            return False
-
-        # Build buy order
         lamports = int(TRADE_AMOUNT_SOL * 1e9)
-        order    = await self.jup.order(WSOL, mint, lamports, self.sol.pubkey)
+        order    = await self.jup.order(WSOL, token.mint, lamports, self.sol.pubkey)
         if not order:
-            log.warning(f"SKIP {symbol}: no Jupiter route")
-            return False
+            log.error(f"No buy route for {token.mint[:16]}"); return None
 
         tx_b64  = order.get("transaction", "")
         req_id  = order.get("requestId", "")
         out_amt = int(order.get("outAmount", "0"))
+
         if not tx_b64 or not req_id:
-            return False
+            log.error("Bad Jupiter order response"); return None
 
         signed = self.sol.sign(tx_b64)
-        if not signed:
-            return False
+        if not signed: return None
 
         result = await self.jup.execute(req_id, signed)
-        if not result or result.get("status") == "Failed":
-            log.error(f"Buy failed {symbol}: {result.get('error','?') if result else 'no result'}")
-            return False
+        if not result:
+            log.error("Execute returned nothing"); return None
+        if result.get("status") == "Failed":
+            log.error(f"Buy swap failed: {result.get('error', '?')}"); return None
 
-        log.info(f"BUY TX: {result.get('signature','?')[:40]}...")
+        sig = result.get("signature", "?")
+        log.info(f"BUY TX: {sig[:35]}...")
+
+        # Wait for chain then get real price
         await asyncio.sleep(2)
+        async with aiohttp.ClientSession() as sess:
+            bal_after = await self.sol.balance(sess)
 
-        final_price = await self.jup.price(mint) or price
-        tokens      = out_amt / 1e6 if out_amt > 0 else TRADE_AMOUNT_SOL / final_price
+        tokens = out_amt / 1e6
+        price  = await self.jup.price(token.mint)
+        if not price:
+            price = TRADE_AMOUNT_SOL / tokens if tokens > 0 else 0.0
 
-        self.sol_usd = await self.jup.sol_usd()
-
-        entry_data = (
-            f"score:{data['score']} | 5m:{data['chg5m']:+.1f}% | "
-            f"{data['buys5m']}B/{data['sells5m']}S | "
-            f"vol5m:${data['v5m']:,.0f} | liq:${data['liquidity']:,.0f} | "
-            f"age:{data['age_h']:.2f}h"
-        )
+        gas = max(0.0, (bal - bal_after) - TRADE_AMOUNT_SOL)
 
         pos = Position(
-            token        = Token(mint=mint, symbol=symbol, name=data.get("name", "")),
-            entry_price  = final_price,
-            tokens_held  = tokens,
-            cost_sol     = TRADE_AMOUNT_SOL,
-            score        = data["score"],
-            entry_data   = entry_data,
+            token       = token,
+            entry_price = price,
+            tokens_held = tokens,
+            cost_sol    = TRADE_AMOUNT_SOL,
+            high_price  = price,
+            stop_price  = price * (1 - TRAILING_STOP_PCT / 100),
         )
-        pos._last_move_price = final_price
-        pos._stall_start     = time.time()
+        await self.discord.bought(pos)
+        log.info(f"BOUGHT {tokens:.0f} {token.symbol} @ ${price:.10f}")
+        log.info(f"  Target: ${price * PROFIT_TARGET_X:.10f} | "
+                 f"Stop: ${pos.stop_price:.10f} | Gas: {gas:.5f} SOL")
+        return pos
 
-        self.positions.append(pos)
-        self.held_mints.add(mint)
+    # ── WATCH + EXIT ──────────────────────────────────────────────────────────
 
-        log.info(
-            f"IN: {symbol} @ ${final_price:.10f} | {entry_data}\n"
-            f"    target +{TP_PCT:.0f}% → ${final_price*(1+TP_PCT/100):.10f} | "
-            f"stop -{STOP_LOSS_PCT:.0f}% → ${final_price*(1-STOP_LOSS_PCT/100):.10f}"
-        )
-        await self.discord.bought(pos, self.sol_usd)
-        return True
+    async def _watch(self, pos: Position):
+        """
+        Poll price every 1s.
+        Exit on: 1.25x target hit | 2-min timeout | trailing stop.
+        """
+        log.info(f"WATCHING {pos.token.symbol} — target {PROFIT_TARGET_X}x "
+                 f"in {MAX_HOLD_MINUTES}min or stop out")
+        price_fails = 0
 
-    # ─── WATCH LOOP ──────────────────────────────────────────────────────────
-
-    async def _watch_loop(self):
         while True:
-            for pos in list(self.positions):
-                try:
-                    await self._check_position(pos)
-                except Exception as e:
-                    log.error(f"Watch {pos.token.symbol}: {e}")
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
 
-    async def _check_position(self, pos: Position):
-        price = await self.jup.price(pos.token.mint)
-        label = pos.token.symbol
+            price = await self.jup.price(pos.token.mint)
 
-        # ── NO PRICE ─────────────────────────────────────────────────────────
-        if not price:
-            if not hasattr(pos, '_price_fail_count'):
-                pos._price_fail_count = 0
-            pos._price_fail_count += 1
-            if pos._price_fail_count >= 30:
-                log.error(f"{label}: no price 60s — emergency sell")
-                await self._close(pos, pos.entry_price, "price_dead")
-            return
-        pos._price_fail_count = 0
+            if not price:
+                price_fails += 1
+                if price_fails % 15 == 1:
+                    log.warning(f"No price for {pos.token.symbol} ({price_fails}x)")
+                # If price totally dead for 1 min, emergency sell
+                if price_fails >= 60:
+                    log.error(f"Price dead 60s — emergency sell {pos.token.symbol}")
+                    await self._sell(pos, pos.entry_price, "price_dead")
+                    return
+                continue
 
-        gain_pct = ((price / pos.entry_price) - 1) * 100 if pos.entry_price > 0 else 0
+            price_fails = 0
+            gain_x = price / pos.entry_price if pos.entry_price > 0 else 1.0
 
-        log.info(
-            f"  {label:8s} ${price:.8f} ({gain_pct:+.1f}%) | "
-            f"{pos.hold_secs:.0f}s | score:{pos.score}"
-        )
+            log.info(f"  {pos.token.symbol:8s} ${price:.8f} "
+                     f"({gain_x:.3f}x) stop=${pos.stop_price:.8f} "
+                     f"held={pos.hold_mins:.1f}m")
 
-        # ── DEAD COIN ────────────────────────────────────────────────────────
-        if price == pos._last_price:
-            pos._same_count += 1
-            if pos._same_count >= DEAD_STRIKES:
-                log.warning(f"{label}: price frozen {DEAD_STRIKES} polls — dead")
-                await self._close(pos, price, "price_dead")
-                return
-        else:
-            pos._same_count = 0
-        pos._last_price = price
-
-        # ── STOP LOSS — fires immediately, no min hold ────────────────────────
-        if gain_pct <= -STOP_LOSS_PCT:
-            log.warning(f"{label}: STOP {gain_pct:.1f}% — OUT")
-            await self._close(pos, price, "stop_loss")
-            return
-
-        # ── MIN HOLD GUARD — no profit exits before 90s ───────────────────────
-        if pos.hold_secs < MIN_HOLD_SECS:
-            return
-
-        # ── TAKE PROFIT ───────────────────────────────────────────────────────
-        if gain_pct >= TP_PCT:
-            log.info(f"{label}: +{gain_pct:.1f}% TARGET HIT — taking profit")
-            await self._close(pos, price, "tp")
-            return
-
-        # ── TIMEOUT ───────────────────────────────────────────────────────────
-        if pos.timed_out:
-            log.info(f"{label}: {MAX_HOLD_MINUTES:.0f}min timeout")
-            await self._close(pos, price, "timeout")
-            return
-
-        # ── STALL — no movement for STALL_MINUTES, free up the slot ──────────
-        if abs(price - pos._last_move_price) / max(pos._last_move_price, 1e-12) > 0.003:
-            pos._last_move_price = price
-            pos._stall_start = time.time()
-        else:
-            stall_mins = (time.time() - pos._stall_start) / 60
-            if stall_mins >= STALL_MINUTES:
-                log.warning(f"{label}: stalled {stall_mins:.1f}min — freeing slot")
-                await self._close(pos, price, "stall")
+            # ── EXIT 1: Profit target hit ─────────────────────────────────
+            if gain_x >= PROFIT_TARGET_X:
+                log.info(f"TARGET HIT {gain_x:.3f}x — selling all {pos.token.symbol}!")
+                await self._sell(pos, price, f"profit_{gain_x:.2f}x")
                 return
 
-    # ─── CLOSE ───────────────────────────────────────────────────────────────
+            # ── EXIT 2: 2-minute timeout ──────────────────────────────────
+            if pos.timed_out:
+                log.warning(f"TIMEOUT {pos.hold_mins:.1f}min — selling {pos.token.symbol} ({gain_x:.2f}x)")
+                await self._sell(pos, price, "timeout_2min")
+                return
 
-    async def _close(self, pos: Position, price: float, reason: str):
-        label = pos.token.symbol
+            # ── UPDATE trailing stop ──────────────────────────────────────
+            if price > pos.high_price:
+                pos.high_price = price
+                pos.stop_price = price * (1 - TRAILING_STOP_PCT / 100)
+                log.info(f"  NEW HIGH ${price:.8f} -> stop ${pos.stop_price:.8f}")
 
-        raw_amount, _ = await self.sol.token_balance(pos.token.mint)
+            # ── EXIT 3: Trailing stop ─────────────────────────────────────
+            if pos.stop_price > 0 and price <= pos.stop_price:
+                log.warning(f"STOP HIT ${price:.8f} ({gain_x:.2f}x) — "
+                            f"selling {pos.token.symbol}")
+                await self._sell(pos, price, "trailing_stop")
+                return
+
+    # ── SELL ─────────────────────────────────────────────────────────────────
+
+    async def _get_real_token_balance(self, mint: str) -> tuple:
+        """
+        Fetch actual on-chain token balance from wallet.
+        Returns (raw_amount, decimals) — the ground truth, not an estimate.
+        """
+        async with aiohttp.ClientSession() as sess:
+            try:
+                async with sess.post(
+                    self.sol.rpc,
+                    json={"jsonrpc": "2.0", "id": 1,
+                          "method": "getTokenAccountsByOwner",
+                          "params": [self.sol.pubkey,
+                                     {"mint": mint},
+                                     {"encoding": "jsonParsed"}]},
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as r:
+                    data = await r.json()
+                accounts = data.get("result", {}).get("value", [])
+                for acct in accounts:
+                    info = (acct.get("account", {})
+                                .get("data", {})
+                                .get("parsed", {})
+                                .get("info", {}))
+                    ta = info.get("tokenAmount", {})
+                    raw = int(ta.get("amount", 0))
+                    dec = int(ta.get("decimals", 6))
+                    if raw > 0:
+                        log.info(f"Real balance: {raw} raw ({raw / 10**dec:.4f} tokens, {dec} decimals)")
+                        return raw, dec
+            except Exception as e:
+                log.error(f"Balance fetch error: {e}")
+        return 0, 6
+
+    async def _sell(self, pos: Position, price: float, reason: str):
+        gain_x  = price / pos.entry_price if pos.entry_price > 0 else 1.0
+        pnl_sol = (price * pos.tokens_held) - pos.cost_sol
+        log.info(f"SELLING 100% of {pos.token.symbol} — {reason} "
+                 f"({gain_x:.3f}x, {pnl_sol:+.5f} SOL)")
+
+        # Always fetch REAL on-chain balance — never trust the estimate
+        # This is the fix for partial sells
+        raw_amount, decimals = await self._get_real_token_balance(pos.token.mint)
+
         if raw_amount <= 0:
-            raw_amount = int(pos.tokens_held * 1e6)
+            # Fallback to estimate if RPC fails
+            raw_amount = int(pos.tokens_held * (10 ** 6))
+            log.warning(f"Could not fetch real balance — using estimate: {raw_amount}")
 
         if raw_amount <= 0:
-            log.warning(f"No tokens to sell for {label}")
-            self._remove(pos)
-            return
+            log.error(f"Sell amount is 0 for {pos.token.symbol} — cannot sell"); return
 
-        success = await self._execute_sell(pos.token.mint, raw_amount)
-        if not success:
-            log.error(f"Sell failed for {label}")
-            return
+        log.info(f"Selling raw amount: {raw_amount} (decimals: {decimals})")
 
-        gain_pct = ((price / pos.entry_price) - 1) * 100 if pos.entry_price else 0
-        pnl_sol  = pos.cost_sol * (gain_pct / 100)
+        sell_succeeded = False
 
-        if pnl_sol >= 0:
-            self.wins += 1
-        else:
-            self.losses += 1
-        self.total_pnl += pnl_sol
-
-        self.sol_usd = await self.jup.sol_usd()
-        await self.discord.sold(pos, reason, gain_pct, pnl_sol, self.sol_usd)
-        log.info(f"OUT {label}: {gain_pct:+.1f}% | {pnl_sol:+.5f} SOL | {reason} | held {pos.hold_secs:.0f}s")
-
-        self._remove(pos)
-
-    def _remove(self, pos: Position):
-        if pos in self.positions:
-            self.positions.remove(pos)
-        self.held_mints.discard(pos.token.mint)
-
-    async def _execute_sell(self, mint: str, raw_amount: int) -> bool:
+        # Up to 5 attempts — keep trying until it goes through
         for attempt in range(1, 6):
-            order = await self.jup.order(mint, WSOL, raw_amount, self.sol.pubkey)
+            order = await self.jup.order(
+                pos.token.mint, WSOL, raw_amount, self.sol.pubkey
+            )
             if order and order.get("transaction"):
                 signed = self.sol.sign(order["transaction"])
                 if signed:
@@ -868,41 +897,70 @@ class Bot:
                     if result:
                         if result.get("status") == "Failed":
                             err = result.get("error", "?")
-                            log.error(f"Sell attempt {attempt}/5: {err}")
-                            if "insufficient" in str(err).lower():
-                                raw_amount = int(raw_amount * 0.97)
+                            log.error(f"Sell attempt {attempt} failed: {err}")
+                            log.error(f"Full: {json.dumps(result)[:300]}")
+                            # If "insufficient funds" try with 98% of balance
+                            if "insufficient" in str(err).lower() or attempt == 3:
+                                raw_amount = int(raw_amount * 0.98)
+                                log.warning(f"Retrying with 98% amount: {raw_amount}")
                         else:
-                            log.info(f"SELL TX: {result.get('signature','?')[:40]}...")
-                            return True
+                            sig = result.get("signature", "?")
+                            log.info(f"SELL TX: {sig[:35]}...")
+                            sell_succeeded = True
+                            break
             else:
-                log.warning(f"No sell route attempt {attempt}/5")
-            if attempt < 5:
-                await asyncio.sleep(min(attempt * 2, 6))
-        return False
+                log.warning(f"No sell route attempt {attempt}/5 — "
+                            f"mint={pos.token.mint[:20]} amount={raw_amount}")
 
-    # ─── HEARTBEAT ───────────────────────────────────────────────────────────
+            if not sell_succeeded and attempt < 5:
+                wait = min(attempt * 2, 6)
+                log.info(f"Retrying sell in {wait}s...")
+                await asyncio.sleep(wait)
 
-    async def _heartbeat_loop(self):
+        if not sell_succeeded:
+            log.error(f"SELL FAILED after 5 attempts — {pos.token.symbol}")
+            log.error(f"  mint={pos.token.mint}")
+            log.error(f"  raw_amount={raw_amount}")
+            return
+
+        # Update session stats
+        if pnl_sol >= 0:
+            self.trades_won += 1
+        else:
+            self.trades_lost += 1
+        self.total_pnl += pnl_sol
+
+        await self.discord.sold(pos, reason, gain_x, pnl_sol)
+        log.info(f"CLOSED {pos.token.symbol}: {gain_x:.3f}x | {pnl_sol:+.5f} SOL")
+
+    # ── HELPERS ──────────────────────────────────────────────────────────────
+
+    async def _rpc(self, sess, method, params):
+        try:
+            async with sess.post(
+                self.sol.rpc,
+                json={"jsonrpc": "2.0", "id": 1,
+                      "method": method, "params": params},
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as r:
+                return await r.json()
+        except:
+            return {}
+
+    async def _heartbeat(self):
         while True:
-            await asyncio.sleep(3600)
-            try:
-                bal = await self.sol.balance()
-                self.sol_usd = await self.jup.sol_usd()
-                uptime_mins = (time.time() - self.start_ts) / 60
-                pnl_usd = self.total_pnl * self.sol_usd
-                pnl_str = f"+${pnl_usd:.2f}" if pnl_usd >= 0 else f"-${abs(pnl_usd):.2f}"
-                log.info(
-                    f"HEARTBEAT | up {uptime_mins:.0f}m | "
-                    f"{self.wins}W/{self.losses}L | net {self.total_pnl:+.5f} SOL ({pnl_str}) | "
-                    f"bal {bal:.4f} SOL | {len(self.positions)}/{MAX_POSITIONS} pos"
-                )
-                await self.discord.heartbeat(
-                    self.positions, self.wins, self.losses,
-                    self.total_pnl, bal, self.sol_usd, uptime_mins
-                )
-            except Exception as e:
-                log.error(f"Heartbeat: {e}")
-
+            await asyncio.sleep(60)
+            uptime  = (time.time() - self.start) / 60
+            active  = len(self.detector._held_mints)
+            sol_usd = await self.discord._fetch_sol_price()
+            pnl_usd = self.total_pnl * sol_usd
+            log.info(
+                f"HEARTBEAT | up {uptime:.0f}m | "
+                f"{active}/{MAX_POSITIONS} active | "
+                f"{self.detector.count} seen | "
+                f"{self.trades_won}W {self.trades_lost}L | "
+                f"net {self.total_pnl:+.5f} SOL (${pnl_usd:+.2f})"
+            )
 
 if __name__ == "__main__":
     try:
