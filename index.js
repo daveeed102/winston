@@ -25,18 +25,18 @@ const CONFIG = {
   // Sizing — his ~$1818 vs our ~$25
   TARGET_VALUE_USD: 1818,
   OUR_VALUE_USD: 25,
-  PROPORTIONAL_BOOST: 1.5,
-  MIN_TRADE_SOL: 0.015,    // Min trade ~$2 (don't waste gas on dust)
-  MAX_TRADE_PCT: 0.40,     // Max 40% of balance per trade
-  MAX_POSITIONS: 3,         // Only hold 3 tokens at once — focus!
+  PROPORTIONAL_BOOST: 2.5,
+  MIN_TRADE_SOL: 0.02,     // Min trade ~$2.50
+  MAX_TRADE_PCT: 0.50,     // Max 50% of balance per trade
+  MAX_POSITIONS: 5,         // Hold up to 5 at once
 
   // Fees — LOWERED
   MAX_SLIPPAGE_BPS: 200,
   PRIORITY_FEE_LAMPORTS: 50000,  // 0.00005 SOL (was 0.0002 — cut 4x)
 
   // Stale position auto-sell: if we hold something for 10min and target sold it, dump it
-  STALE_CHECK_INTERVAL_MS: 60000,  // Check stale positions every 1min
-  MAX_HOLD_MINUTES: 10,            // Auto-sell anything held > 10min that target no longer holds
+  STALE_CHECK_INTERVAL_MS: 15000,  // Check stale positions every 15s
+  MAX_HOLD_MINUTES: 2,            // Auto-sell anything held > 2min
 
   POLL_INTERVAL_MS: 2000,
   HEALTH_LOG_INTERVAL_MS: 120000,
