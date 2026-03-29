@@ -46,20 +46,88 @@ const CONFIG = {
   RAYDIUM_AMM: '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',
 
   // Top wallets from Dune: https://dune.com/couldbebasic/top-traders
+  // Curated: 100%+ ROI, 50%+ WR, 5+ SOL balance, wallet age > 5 days
+  // Red flags removed: brand new wallets, low WR, 0% median ROI
   TRACKED_WALLETS: [
-    'FRhgF9TXCXyGfUiQ5WsdCGxHUmBXPseenTdnEA4UmUGi',  // 675% ROI 73% WR
-    'CPQHDdLszLoagjM6MbM4S7DCiT3p4XC2zoe6CHJETanB',  // 651% ROI 100% WR
-    '7z8hbNzmgYvRMNVk27TQm8xW3yXgAkwQVhA6Nht5WEkU',  // 420% ROI 90% WR
-    'AnWgJ1csbod2tWS2mZNEyhxo1XWndhNVvzbchh81zZ8k',  // 404% ROI 57% WR
-    'CsKnRER9Sjpau8Mk9WTZkoBytB2uFnqdmLYR5GTGtaKz',  // 324% ROI 71% WR
-    'AjKCctQtCnCj48tR3YaGm1ZrQtURoodjfg6YKLy97Uub',  // 286% ROI 95% WR
-    'FEXornKkXE2u51WfCGVdEBsmrvquu9UvGPpM9gd986se',  // 242% ROI 100% WR
-    '61MQSdRgpe98pxMn6gcLH4M4MAFr8mAKuoTDFMwbpn6Y',  // 466% ROI 100% WR
-    '4ScXhkEPVkxhzcJdp89oybDH5LA4iCocxAn1u3oLmvbK',  // 496% ROI 60% WR
-    'ATFRUwvyMh61w2Ab6AZxUyxsAfiiuG1RqL6iv3Vi9q2B',  // 208% ROI 100% WR
-    'GJvBxoj79TqhvyafMpTPyu5CP5rEq2V9LnbfxtDqgYhS',  // 215% ROI 81% WR
-    'F7HXUvhmCjkHM1ePFCSRReXXbnCAKdiJMDFNfH8u8khG',  // 215% ROI 86% WR
-    '9jYMojHaJxyXsvVMN2foih8knXb5AXYkMmUnxjQT5BoJ',  // 202% ROI 77% WR
+    // === PAGE 1 — Elite (200%+ ROI) ===
+    'FRhgF9TXCXyGfUiQ5WsdCGxHUmBXPseenTdnEA4UmUGi',  // 675% ROI, 73% WR, 150d old
+    '7z8hbNzmgYvRMNVk27TQm8xW3yXgAkwQVhA6Nht5WEkU',  // 420% ROI, 90% WR, 299d old
+    '61MQSdRgpe98pxMn6gcLH4M4MAFr8mAKuoTDFMwbpn6Y',  // 466% ROI, 100% WR, 113d old
+    'AjKCctQtCnCj48tR3YaGm1ZrQtURoodjfg6YKLy97Uub',  // 286% ROI, 95% WR, 11d old
+    'FEXornKkXE2u51WfCGVdEBsmrvquu9UvGPpM9gd986se',  // 242% ROI, 100% WR, 99d old
+    'CsKnRER9Sjpau8Mk9WTZkoBytB2uFnqdmLYR5GTGtaKz',  // 324% ROI, 71% WR
+    'ATFRUwvyMh61w2Ab6AZxUyxsAfiiuG1RqL6iv3Vi9q2B',  // 208% ROI, 100% WR, 450d old
+    'GJvBxoj79TqhvyafMpTPyu5CP5rEq2V9LnbfxtDqgYhS',  // 215% ROI, 81% WR, 56d old
+    'F7HXUvhmCjkHM1ePFCSRReXXbnCAKdiJMDFNfH8u8khG',  // 215% ROI, 86% WR, 135d old
+    '9jYMojHaJxyXsvVMN2foih8knXb5AXYkMmUnxjQT5BoJ',  // 202% ROI, 77% WR, 11d old
+    '8gDRLa498xXCdch3DvtvjCJ7C1joJ1BpftTDVZztxigv',  // 396% ROI, 50% WR, 16d old
+    '6wLkK9AKTcCLiB5mW7pyp9Fq9wchydyatk8XtxKdVHgn',  // 345% ROI, 60% WR, 297d old
+    '2M4Ka8W5i7eK9Z3zMpzbeYRsAVM4HtpwhtTnbmPDdiMn',  // 324% ROI, 60% WR
+    '8DqpugHmWXVcSAYaZs9W2jXnCE4Cx1XbNMsZYC8EU1JV',  // 237% ROI, 60% WR
+    '9p7PFT2HYhVKXDsvCZd43d8GRm1jQcWBH7tmawe96b6X',  // 237% ROI, 67% WR
+    'AnWgJ1csbod2tWS2mZNEyhxo1XWndhNVvzbchh81zZ8k',  // 404% ROI, 57% WR
+    'H5G1btoS96YZ6fcaDDhAo99A9p4RkenV9XKLw2aPCeaF',  // 228% ROI, 50% WR
+    'FYfSEsc5DxwKH2LbxNpWE9KiGvajN8bYVHSe1mk4oSDy',  // 204% ROI, 60% WR, 45d old
+
+    // === PAGE 1 — Strong (150-199% ROI) ===
+    '5VXyg5nXWtpjsNQvt6EXQPQ5ziZBnxhoXDYaz9ZBbXao',  // 199% ROI, 100% WR, 529d old
+    '683qAwQbpkiWpSfUsi49BKUcP4XqdJaxGaiBMK4etRvv',  // 186% ROI, 100% WR
+    's69tyCAuNtaXUFT6AXoTMPQnHbsSG4nW34qu8oRK9vG',   // 185% ROI, 50% WR, 210d old
+    'HfY4gNZUhicrjt8FHrHPhx41HtavVVYGmgpmPvaMDx6n',  // 181% ROI, 75% WR
+    '5vXih4GeYcfQv88R59B5sZaRYEwJzorKpCGhqjAmqTqu',  // 177% ROI, 83% WR, 503d old
+    '3P8JV5CSTvngRZv84v82ASD5mo8kBVxKMbk9Yx3TbosU',  // 177% ROI, 75% WR
+    'HWWaEmQCcVFaYweovWdPB2db44Kk7w5P1vMDLkoX8kFP',  // 176% ROI, 50% WR
+    'Gc2WT9QnTCLffWc88nKXwtqKVWh7djZeMy9yqZYXevi1',  // 174% ROI, 86% WR
+    '66svXsZH7NEEsSG6w8RZKmLCDX2csR5y9XFuYQSgszE8',  // 174% ROI, 70% WR
+    'AZZcxmxS89iv4bbu2t15i1xTaRafpDcAXGBfdTizS4AN',  // 173% ROI, 71% WR
+    'BpZB8BhLwCn8SG2cHieUCoK6Lq8f9hrohj1c5yGtGnZe',  // 171% ROI, 56% WR
+    'FvYsGPiQoG5A7aQsbQM7bR3VdjY2TKeG8xLwhBQMNQWY',  // 168% ROI, 100% WR, 237d old
+    'EY8kS2GvTL4vQmQFi6nN2dnGJSFQhwmEMdktYpyLRvtP',  // 167% ROI, 85% WR
+    'HXhnm8S1pd1KYjoYKrTFLAHnw6ED7nkrp3SmGGddtoLD',  // 167% ROI, 60% WR, 137d old
+    'BPHQrgjM2rBzxNMebMJsPCLki36X2tiNFLU2c1W8pD7q',  // 165% ROI, 50% WR
+    'GeSVoLkL3DQSxcw2zwTq8GrZ6HEGfqWH8BVcChj4UZcQ',  // 164% ROI, 67% WR
+    'BZWzvFQrqbT5Tb1T4F73SWKhM5auiPMDo9agb456HLTC',  // 156% ROI, 100% WR
+    '6WLquntFTiEh84JvH3R6fA1k5PQLSUouY7CmEMQwaj34',  // 153% ROI, 55% WR, 71d old
+    'EoC9UDaX4PgMPS49gnLkFJVjX4eoBWPi6iXAUZGwdTPj',  // 153% ROI, 58% WR
+    '4i88267TQpasJoL3Zv5C9Szq9XctMSHExmmQMWgBbFeB',  // 152% ROI, 60% WR, 90d old
+
+    // === PAGE 2 — Solid (120-149% ROI) ===
+    '4tzVuWHootaHdbY8DoguYpMe1RaNYd8xNiYYjWF8ZYit',  // 135% ROI, 75% WR
+    '55oiTxTRNAKP72hc1yuKd5LiMSkjp4drmPHnsmJvdE3c',  // 132% ROI, 50% WR
+    '7rtqMoobKfNKz7DyKTEdPQAQ9xk7Kpk75VZQQX8c6FxM',  // 132% ROI, 57% WR
+    'GvAyrpEM88uMYLp8QLUf7SRfqfsLNBEFhLctj2Hn8y9P',  // 131% ROI, 100% WR, 91d old
+    'tsZNG3Xo5kKJn8xmTAcCqeskarTQsrPnBFW4736jtWu',  // 128% ROI, 74% WR
+    '12KuEro7Cr7WjjxKTQ56TPdmUfVSuP6z7otP9KnNHWhK',  // 126% ROI, 60% WR, 200d old
+    '82hYg8UYV6VjEczaWT2Rrh3miMjHL2vfBwKApT9hV59u',  // 124% ROI, 56% WR
+    '9WTsj8VvY3QBLY69Z153upbLSS1thEqCeE5AK28GRG8X',  // 122% ROI, 75% WR
+    'DJGm2u3ZRJJaaobyPPDQB9dvpaKTutUo5y4CdxoywRBJ',  // 121% ROI, 100% WR, 303d old
+    '2FzChsNvEqRvX36jy4Gvpu9Xjv1pk6TBJct7pPVyeTJL',  // 119% ROI, 77% WR, 674d old
+    '8XjdJLcw5G7qzhh1tAUaHEsPHjyoU6Yr6QRD1kT43zKJ',  // 118% ROI, 57% WR
+    'AqpY5YrdXqsYyhCrXkSwqD6G8Umi1PL8hz4MJkjizrA7w',  // 118% ROI, 73% WR, 58d old
+    'ARchqCp5pSjGd6Bt6HAY1YF1dNMgCbZ91mVygBC6LdWT',  // 117% ROI, 67% WR
+    '85Aq4c1xQUDcHbb7z521pKysZVpf1YTXiZodkK9nPhov',  // 116% ROI, 56% WR, 133d old
+    'FWir4vJBJrDsKMmTLy9cPorrgtUhKRcr1n5CRCvciyFZ',  // 115% ROI, 60% WR
+    'ATHGRiHxar9FB7hTF2awkjzQjxKAUSNGPTAixqEUjX9M',  // 115% ROI, 77% WR
+    'FPp4xGY1pnCnGx1zDgiykUW9sssaY8kgkQBZrLCi1drD',  // 115% ROI, 57% WR, 680d old
+    '4ypxvwdjg7wDvEFLkhKBqCioRmDtKzu1z55C1Sah12Xv',  // 151% ROI, 100% WR, 482d old
+
+    // === PAGE 3 — Consistent (100-119% ROI) ===
+    'D9Eoby4puakYU3QX8aLGmQ3vqotWYk7V6YD7WtrKDfxw',  // 107% ROI, 56% WR, 126d old
+    'G9hxBRpp4iDtzrbYuMibM4UQZyTmmhJY9ci2i2mPdTw2',  // 106% ROI, 100% WR
+    '6i1UngrDzzdXur2kfXengdeDFRQRRz2KDCSkn5QAQMTP',  // 106% ROI, 60% WR
+    'EJEWyg2ZLmCq1uyKeWZz9L7z6FQWJCyP5pNR3smD6RXu',  // 105% ROI, 58% WR, 763d old
+    'HbA7fZnpvFKS1ye3d6NFkkSfFghJJK6touZXHPJysAPq',  // 104% ROI, 86% WR
+    '6JXxsX1e1jxn4sSAU1X3HKpBDZfwFTBx4ZcrdqsFWiEw',  // 103% ROI, 67% WR
+    'AEwdbcEaLpp5vdfBFYaxgKQyLoDrAGJu5cMGNn6S6jGA',  // 102% ROI, 91% WR
+    '5PiqYRfJDhS8sMjRyBXW3eyTtfh7GgAuYWFtqaRdDH9T',  // 102% ROI, 67% WR, 290d old
+    'ArAh8V2UwkgGP12j2wpNMJHCVm4ZEoCHtKd2fXCKKi1K',  // 102% ROI, 80% WR, 202d old
+
+    // === PAGE 4-5 — Active High WR (80%+ ROI, high frequency) ===
+    'BQqG1qRkhqkidYAgYh7T9RcL7AEmhfG9Sd8esaZWw51P',  // 89% ROI, 62% WR, 490d old
+    '4MdtaDSqc6G6g6N9Pt79A2Zj9wUC9wJcnf62YP6bssfu',  // 88% ROI, 57% WR
+    '6LZs9rk7nKQWYgeb6XnUvLp8XaMyQdaog2VU87dsPuSj',  // 87% ROI, 100% WR
+    'HCFg8YVKJJycWjnnu4GJoHjsrpwffHvwNhXVHUezVyyM',  // 85% ROI, 80% WR
+    '2xdqw5qvFovVwUJgAUJzcKNvy3qXgAhPSZHVu6hcFyZM',  // 82% ROI, 91% WR, 131d old
   ],
 };
 
