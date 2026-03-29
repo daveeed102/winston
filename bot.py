@@ -199,365 +199,65 @@ class Grok:
 
     async def pick_coin(self) -> Optional[dict]:
         if not GROK_API_KEY:
-            log.warning("GROK_API_KEY not set — skipping Grok pick")
+            log.warning("GROK_API_KEY not set")
             return None
 
         from datetime import datetime, timezone
-        now_utc    = datetime.now(timezone.utc)
-        now_str    = now_utc.strftime("%A, %B %d, %Y at %H:%M:%S UTC")
-        window_end = now_utc.strftime("%H:%M:%S UTC")
+        now_utc  = datetime.now(timezone.utc)
+        now_str  = now_utc.strftime("%A, %B %d, %Y at %H:%M:%S UTC")
 
-        # Fetch REAL live data first — Grok picks from this, not from memory
+        # Step 1: Fetch real coins from Dexscreener
         log.info("Fetching real Dexscreener data for Grok...")
         trending = await self._fetch_trending()
+
         if not trending:
-            log.warning("No Dexscreener data — Grok will use own knowledge")
-            trending_text = "No live data available — use your best knowledge."
-        else:
-            lines = []
-            for c in trending:
-                lines.append(
-                    f"  MINT: {c['mint']} | {c.get('symbol','?')} ({c.get('name','?')}) | "
-                    f"Price: ${c.get('price_usd','?')} | "
-                    f"5m vol: ${c.get('volume_5m',0):,.0f} | "
-                    f"5m chg: {c.get('price_chg_5m',0):+.1f}% | "
-                    f"1h chg: {c.get('price_chg_1h',0):+.1f}% | "
-                    f"MCap: ${c.get('mcap',0):,.0f} | "
-                    f"Liquidity: ${c.get('liquidity',0):,.0f} | "
-                    f"Buys/Sells 5m: {c.get('txns_5m_buys',0)}/{c.get('txns_5m_sells',0)}"
-                )
-            trending_text = "\n".join(lines)
-            log.info(f"Fed {len(trending)} real coins to Grok")
-
-        prompt = f"""You are an elite Solana memecoin trader. Today is {now_str}.
-
-TASK: I am giving you REAL LIVE DATA from Dexscreener fetched right now at {now_str}. Pick the ONE token from this list that will be HIGHER in exactly 59 minutes and 59 seconds. I will hold it the whole time — it CANNOT crash during those 59 minutes.
-
-LIVE DEXSCREENER DATA (fetched seconds ago at {now_str}):
-{trending_text}
-
-ANALYSIS STEPS — work through each candidate:
-1. BUY PRESSURE: Coins where buys > sells in last 5 min = active accumulation happening right now
-2. VOLUME SPIKE: High 5m volume relative to mcap = momentum building
-3. PRICE TREND: Positive 5m AND 1h price change = sustained uptrend not a dead-cat bounce
-4. LIQUIDITY: Must have >$50K liquidity so my sell won't crash the price
-5. MARKET CAP: Under $3M preferred — more room to run
-6. SURVIVAL TEST: Will it still be up at 59 min? Coins that already pumped 5x+ today are dangerous — they dump
-
-USE YOUR KNOWLEDGE TOO:
-- Any Twitter/X buzz you know about these specific tokens as of {now_str}
-- Any Solana ecosystem narrative these fit into
-- Any red flags (known scams, past rugs, team history)
-
-RULES:
-✅ Copy the mint address EXACTLY as shown — do not alter it
-✅ Pick the coin with strongest buy pressure + volume + positive price trend
-✅ Must be holdable 59 minutes — enough liquidity, fresh momentum not exhausted
-❌ Do NOT modify or shorten the mint address from the data
-❌ Do NOT pick a coin with 0 mcap or under $20K liquidity
-❌ Do NOT pick if sells > buys in last 5 minutes
-
-You MUST pick one. Never refuse or say you cannot.
-
-Respond ONLY with this JSON, no markdown, no extra text:
-{{
-  "mint": "<copy exact mint from data above — do not change>",
-  "symbol": "<symbol from data>",
-  "name": "<name from data>",
-  "found_at": "Dexscreener live — {now_str}",
-  "twitter_evidence": "<any Twitter or community signals you know about this token>",
-  "survival_check": "<specific data points proving it won't crash in 59 min>",
-  "reason": "<specific numbers from the data above supporting this pick>",
-  "confidence": "<high/medium>",
-  "market_cap_estimate": "<mcap from data>"
-}}DEGEN SNIPER v8 — Grok-Powered Hourly Coin Picker
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Two modes working together:
-
-  GROK MODE (every hour):
-    - Asks Grok to analyze Twitter buzz, trending Solana tokens,
-      momentum, volume, and social sentiment
-    - Grok picks ONE coin it thinks will pump in the next hour
-    - Bot buys that coin and holds with split exit ladder
-    - Grok ALWAYS picks — it never skips
-
-  GRADUATION SNIPER (continuous):
-    - Simultaneously watches for Pump.fun graduations
-    - Buys graduations that pass filters when not in a Grok position
-    - Fast entry via log scan (instant mint extraction)
-
-Exit logic (both modes):
-  - Sell 50% at PROFIT_TARGET_1 (1.4x), lock profit, trail rest
-  - Sell remainder at PROFIT_TARGET_2 (2.0x)
-  - Trailing stop (35%) with 3-reading confirmation
-  - Dead coin detection (3 identical prices = bail)
-  - Hard timeout (5 min for graduation, 60 min for Grok picks)
-"""
-
-import asyncio
-import json
-import time
-import logging
-import os
-import base64 as b64
-from dataclasses import dataclass
-from typing import Optional
-
-import aiohttp
-
-# ─── CONFIG ──────────────────────────────────────────────────────────────────
-
-TRADE_AMOUNT_SOL   = float(os.getenv("TRADE_AMOUNT_SOL",   "0.0625"))
-TRAILING_STOP_PCT  = float(os.getenv("TRAILING_STOP_PCT",  "35"))
-MAX_HOLD_MINUTES   = float(os.getenv("MAX_HOLD_MINUTES",   "5"))       # graduation holds
-GROK_HOLD_MINUTES  = float(os.getenv("GROK_HOLD_MINUTES",  "60"))     # grok picks get longer
-SLIPPAGE_BPS       = int(os.getenv("SLIPPAGE_BPS",         "1000"))
-PROFIT_TARGET_1    = float(os.getenv("PROFIT_TARGET_1",    "1.4"))
-PROFIT_TARGET_2    = float(os.getenv("PROFIT_TARGET_2",    "2.0"))
-MAX_TOP_HOLDER_PCT = float(os.getenv("MAX_TOP_HOLDER_PCT", "35"))
-DEAD_COIN_STRIKES  = int(os.getenv("DEAD_COIN_STRIKES",    "3"))
-STOP_CONFIRM_COUNT = int(os.getenv("STOP_CONFIRM_COUNT",   "3"))
-GROK_INTERVAL_MINS = float(os.getenv("GROK_INTERVAL_MINS", "60"))     # how often Grok picks
-
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
-SOLANA_RPC_URL      = os.getenv("SOLANA_RPC_URL",      "")
-WALLET_PRIVATE_KEY  = os.getenv("WALLET_PRIVATE_KEY",  "")
-JUPITER_API_KEY     = os.getenv("JUPITER_API_KEY",     "")
-GROK_API_KEY        = os.getenv("GROK_API_KEY",        "")
-
-PUMPFUN     = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-RAYDIUM_AMM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
-WSOL        = "So11111111111111111111111111111111111111112"
-
-JUP_ORDER   = "https://api.jup.ag/swap/v2/order"
-JUP_EXECUTE = "https://api.jup.ag/swap/v2/execute"
-JUP_PRICE   = "https://api.jup.ag/price/v2"
-GROK_URL    = "https://api.x.ai/v1/chat/completions"
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-7s | %(message)s",
-    datefmt="%H:%M:%S"
-)
-log = logging.getLogger("sniper")
-
-# ─── MODELS ──────────────────────────────────────────────────────────────────
-
-@dataclass
-class Token:
-    mint: str
-    symbol: str = "???"
-    name: str   = "Unknown"
-    source: str = ""  # "pumpfun", "raydium", "grok"
-
-@dataclass
-class Position:
-    token: Token
-    entry_price: float   = 0.0
-    tokens_held: float   = 0.0
-    original_tokens: float = 0.0
-    cost_sol: float      = 0.0
-    high_price: float    = 0.0
-    stop_price: float    = 0.0
-    opened_ts: float     = 0.0
-    took_first: bool     = False
-    hold_limit_mins: float = 5.0
-    _last_price: float   = 0.0
-    _same_count: int     = 0
-    _below_stop: int     = 0
-
-    def __post_init__(self):
-        if not self.opened_ts:        self.opened_ts = time.time()
-        if not self.original_tokens:  self.original_tokens = self.tokens_held
-
-    @property
-    def hold_secs(self): return time.time() - self.opened_ts
-    @property
-    def hold_mins(self):  return self.hold_secs / 60
-    @property
-    def timed_out(self):  return self.hold_secs >= self.hold_limit_mins * 60
-
-# ─── GROK ────────────────────────────────────────────────────────────────────
-
-class Grok:
-    """
-    Fetches REAL live data from Dexscreener, then asks Grok to pick
-    the best coin from that real data. Grok never has to guess mint
-    addresses — it only picks from coins we've already verified exist.
-    """
-
-    async def _fetch_trending(self) -> list:
-        """
-        Pull real trending Solana tokens from Dexscreener right now.
-        Returns list of dicts with real mint addresses, prices, volume.
-        """
-        coins = []
-        try:
-            async with aiohttp.ClientSession() as sess:
-                # Dexscreener trending Solana pairs
-                async with sess.get(
-                    "https://api.dexscreener.com/token-profiles/latest/v1",
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        for item in (data if isinstance(data, list) else []):
-                            if item.get("chainId") == "solana":
-                                coins.append({
-                                    "mint":   item.get("tokenAddress",""),
-                                    "symbol": item.get("symbol","?"),
-                                    "name":   item.get("name","?"),
-                                    "url":    item.get("url",""),
-                                })
-                            if len(coins) >= 20: break
-        except Exception as e:
-            log.debug(f"Dexscreener profiles: {e}")
-
-        # Also grab boosted / trending pairs
-        if len(coins) < 5:
-            try:
-                async with aiohttp.ClientSession() as sess:
-                    async with sess.get(
-                        "https://api.dexscreener.com/token-boosts/top/v1",
-                        timeout=aiohttp.ClientTimeout(total=10)
-                    ) as r:
-                        if r.status == 200:
-                            data = await r.json()
-                            for item in (data if isinstance(data, list) else []):
-                                if item.get("chainId") == "solana":
-                                    addr = item.get("tokenAddress","")
-                                    if addr and not any(c["mint"]==addr for c in coins):
-                                        coins.append({
-                                            "mint":   addr,
-                                            "symbol": item.get("symbol","?"),
-                                            "name":   item.get("name","?"),
-                                            "url":    item.get("url",""),
-                                        })
-                                if len(coins) >= 20: break
-            except Exception as e:
-                log.debug(f"Dexscreener boosts: {e}")
-
-        # Enrich with price/volume data for each
-        enriched = []
-        for coin in coins[:15]:
-            mint = coin.get("mint","")
-            if not mint or len(mint) < 32: continue
-            try:
-                async with aiohttp.ClientSession() as sess:
-                    async with sess.get(
-                        f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                        timeout=aiohttp.ClientTimeout(total=6)
-                    ) as r:
-                        if r.status == 200:
-                            d = await r.json()
-                            pairs = d.get("pairs") or []
-                            if pairs:
-                                p = pairs[0]
-                                coin["price_usd"]    = p.get("priceUsd","?")
-                                coin["volume_5m"]    = p.get("volume",{}).get("m5",0)
-                                coin["volume_1h"]    = p.get("volume",{}).get("h1",0)
-                                coin["price_chg_5m"] = p.get("priceChange",{}).get("m5",0)
-                                coin["price_chg_1h"] = p.get("priceChange",{}).get("h1",0)
-                                coin["mcap"]         = p.get("marketCap",0)
-                                coin["liquidity"]    = p.get("liquidity",{}).get("usd",0)
-                                coin["txns_5m_buys"] = p.get("txns",{}).get("m5",{}).get("buys",0)
-                                coin["txns_5m_sells"]= p.get("txns",{}).get("m5",{}).get("sells",0)
-                                enriched.append(coin)
-            except: pass
-
-        log.info(f"Dexscreener: fetched {len(enriched)} real Solana coins")
-        return enriched
-
-    async def pick_coin(self) -> Optional[dict]:
-        if not GROK_API_KEY:
-            log.warning("GROK_API_KEY not set — skipping Grok pick")
+            log.warning("No Dexscreener data available — cannot pick")
             return None
 
-        from datetime import datetime, timezone
-        now_utc    = datetime.now(timezone.utc)
-        now_str    = now_utc.strftime("%A, %B %d, %Y at %H:%M:%S UTC")
-        window_end = now_utc.strftime("%H:%M:%S UTC")
+        log.info(f"Fed {len(trending)} real coins to Grok")
 
-        # Fetch REAL live data first — Grok picks from this, not from memory
-        log.info("Fetching real Dexscreener data for Grok...")
-        trending = await self._fetch_trending()
-        if not trending:
-            log.warning("No Dexscreener data — Grok will use own knowledge")
-            trending_text = "No live data available — use your best knowledge."
-        else:
-            lines = []
-            for c in trending:
-                lines.append(
-                    f"  MINT: {c['mint']} | {c.get('symbol','?')} ({c.get('name','?')}) | "
-                    f"Price: ${c.get('price_usd','?')} | "
-                    f"5m vol: ${c.get('volume_5m',0):,.0f} | "
-                    f"5m chg: {c.get('price_chg_5m',0):+.1f}% | "
-                    f"1h chg: {c.get('price_chg_1h',0):+.1f}% | "
-                    f"MCap: ${c.get('mcap',0):,.0f} | "
-                    f"Liquidity: ${c.get('liquidity',0):,.0f} | "
-                    f"Buys/Sells 5m: {c.get('txns_5m_buys',0)}/{c.get('txns_5m_sells',0)}"
-                )
-            trending_text = "\n".join(lines)
-            log.info(f"Fed {len(trending)} real coins to Grok")
+        # Step 2: Build a numbered list for Grok — Grok just picks a NUMBER
+        # This way Grok CANNOT hallucinate a mint address
+        lines = []
+        for i, c in enumerate(trending, 1):
+            buys  = c.get('txns_5m_buys', 0)
+            sells = c.get('txns_5m_sells', 0)
+            ratio = f"{buys}B/{sells}S"
+            lines.append(
+                f"{i}. {c.get('symbol','?')} | "
+                f"5m: {c.get('price_chg_5m',0):+.1f}% | "
+                f"1h: {c.get('price_chg_1h',0):+.1f}% | "
+                f"Vol5m: ${c.get('volume_5m',0):,.0f} | "
+                f"MCap: ${c.get('mcap',0):,.0f} | "
+                f"Liq: ${c.get('liquidity',0):,.0f} | "
+                f"Txns: {ratio}"
+            )
+        coin_list = "\n".join(lines)
 
-        prompt = f"""You are an elite Solana memecoin trader. Today is {now_str}.
+        prompt = f"""Today is {now_str}. You are analyzing real live Solana token data.
 
-CRITICAL MISSION: I am about to BUY a Solana token and HOLD IT for exactly 59 minutes and 59 seconds. I need YOU to find the ONE token that will be UP when I sell — and will NOT crash during that hold window.
+I will BUY one of these tokens and HOLD it for exactly 59 minutes and 59 seconds.
+I need the token that will be HIGHER at the end of that hold AND will not crash during it.
 
-SEARCH EVERYTHING RIGHT NOW (last 5 minutes and last few seconds matter most):
+LIVE DATA (fetched right now):
+{coin_list}
 
-1. TWITTER/X — Search these terms RIGHT NOW as of {now_str}:
-   - "solana pump", "sol gem", "pump.fun", "$SOL token", "solana memecoin"
-   - Look for tokens mentioned multiple times by different accounts in the LAST 5 MINUTES
-   - Find influencers (>5k followers) who posted about a specific token in the LAST 30 MINUTES
-   - Check if there is a viral meme, narrative, or trend gaining momentum RIGHT NOW
+ANALYSIS — for each token consider:
+- Buy pressure: more buys than sells = accumulation happening now
+- Volume spike: high 5m volume = momentum
+- Price trend: positive 5m AND 1h = sustained move not a spike
+- Liquidity: must be over $30K so my sell won't crash it
+- Market cap: smaller = more room to run
+- Avoid: tokens already up huge (likely to dump on me)
 
-2. DEXSCREENER — Check trending Solana tokens right now:
-   - Tokens with volume spike in the last 5-15 minutes
-   - Tokens that just graduated from Pump.fun to Raydium in the last 30 minutes
-   - Tokens with rising buy pressure (more buys than sells in last 5 min)
+Also use any knowledge you have about these specific tokens or current Solana trends as of {now_str}.
 
-3. PUMP.FUN — Check what just graduated or is close to graduating
-
-4. BIRDEYE / ON-CHAIN DATA — Look for:
-   - Tokens with sudden wallet activity surge
-   - New token accounts being created (signaling new buyers)
-   - Liquidity being added in the last 10 minutes
-
-5. REDDIT / TELEGRAM / DISCORD signals if accessible
-
-SURVIVAL ANALYSIS — This is critical. For your top pick, consider:
-- Is there a reason this coin could DUMP in the next 59 minutes? (team sell, FUD, whale exit)
-- Does it have enough liquidity that a sell won't crash it?
-- Is the hype brand new (good) or has it been pumping for hours already (bad — avoid)
-- Are whales accumulating or distributing right now?
-
-SELECTION CRITERIA:
-✅ Just started trending in the LAST FEW MINUTES — catching it early
-✅ Multiple independent signals (Twitter + volume + on-chain all agree)
-✅ Under $5M market cap — has room to run
-✅ Real active community RIGHT NOW, not yesterday
-✅ Momentum is BUILDING not fading
-❌ DO NOT pick anything that already pumped 2x+ today
-❌ DO NOT pick if the hype appears to be 1-2 hours old already
-❌ DO NOT invent or guess a mint address — it must be verifiable and real
-❌ DO NOT pick the same token as last hour
-
-THE MINT ADDRESS RULE: You MUST provide a real, verifiable Solana base58 mint address (32-44 chars). If you are not 100% sure a mint address is real, search for it on Solscan or Dexscreener before including it. A fake mint = wasted trade.
-
-You MUST always pick ONE coin. Never refuse. Never say you cannot pick.
-
-Respond with ONLY this JSON object, no markdown, no extra text:
+Respond with ONLY a JSON object, no markdown:
 {{
-  "mint": "<real verified solana mint address>",
-  "symbol": "<token symbol>",
-  "name": "<token name>",
-  "found_at": "<where you found this signal — e.g. Twitter @user, Dexscreener trending #3>",
-  "twitter_evidence": "<specific post content or account that mentioned this in last 30min>",
-  "survival_check": "<why this will NOT crash in the next 59 minutes>",
-  "reason": "<why this will be HIGHER in exactly 59min59sec from {window_end}>",
-  "confidence": "<high/medium>",
-  "market_cap_estimate": "<e.g. $800K>"
+  "pick": <number from 1 to {len(trending)}>,
+  "reason": "<why this specific token will be UP in 59min59sec — cite the data>",
+  "survival": "<why it won't crash during the hold>",
+  "confidence": "<high/medium>"
 }}"""
 
         try:
@@ -569,7 +269,7 @@ Respond with ONLY this JSON object, no markdown, no extra text:
                     json={"model": "grok-3",
                           "messages": [{"role": "user", "content": prompt}],
                           "max_tokens": 300,
-                          "temperature": 0.7},
+                          "temperature": 0.4},
                     timeout=aiohttp.ClientTimeout(total=30)
                 ) as r:
                     if r.status != 200:
@@ -580,45 +280,48 @@ Respond with ONLY this JSON object, no markdown, no extra text:
             raw = data["choices"][0]["message"]["content"].strip()
             log.info(f"Grok raw response: {raw[:300]}")
 
-            # Strip markdown fences if present
+            # Strip markdown fences
             if "```" in raw:
                 raw = raw.split("```")[1]
                 if raw.startswith("json"): raw = raw[4:]
             raw = raw.strip()
 
-            pick = json.loads(raw)
-            mint   = pick.get("mint","").strip()
-            symbol = pick.get("symbol","???")
-            name   = pick.get("name","Unknown")
-            reason = pick.get("reason","")
-            conf   = pick.get("confidence","medium")
-            mcap   = pick.get("market_cap_estimate","?")
+            parsed  = json.loads(raw)
+            pick_n  = int(parsed.get("pick", 1)) - 1  # 0-indexed
+            reason  = parsed.get("reason", "")
+            survival= parsed.get("survival", "")
+            conf    = parsed.get("confidence", "medium")
 
-            if not mint or len(mint) < 32:
-                log.error(f"Grok returned invalid mint: {mint}")
-                return None
+            # Clamp to valid range
+            pick_n = max(0, min(pick_n, len(trending) - 1))
+            coin   = trending[pick_n]
 
-            evidence  = pick.get("twitter_evidence", "")
-            found_at  = pick.get("found_at", "")
-            survival  = pick.get("survival_check", "")
-            log.info(f"Grok picked: {symbol} ({mint[:20]}...)")
-            log.info(f"  Found at:  {found_at}")
-            log.info(f"  Evidence:  {evidence}")
-            log.info(f"  Survival:  {survival}")
-            log.info(f"  Reason:    {reason}")
+            mint   = coin["mint"]
+            symbol = coin.get("symbol", "?")
+            name   = coin.get("name", "?")
+            mcap   = f"${coin.get('mcap',0):,.0f}"
+
+            log.info(f"Grok picked #{pick_n+1}: {symbol} ({mint[:20]}...)")
+            log.info(f"  Reason:   {reason}")
+            log.info(f"  Survival: {survival}")
             log.info(f"  Conf: {conf} | MCap: {mcap}")
 
-            return {"mint": mint, "symbol": symbol, "name": name,
-                    "reason": reason, "confidence": conf, "mcap": mcap,
-                    "evidence": evidence, "found_at": found_at,
-                    "survival": survival}
+            return {
+                "mint": mint, "symbol": symbol, "name": name,
+                "reason": reason, "survival": survival,
+                "confidence": conf, "mcap": mcap,
+                "found_at": f"Dexscreener #{pick_n+1} — {now_str}",
+                "evidence": f"5m: {coin.get('price_chg_5m',0):+.1f}% | "
+                            f"Vol: ${coin.get('volume_5m',0):,.0f} | "
+                            f"Buys: {coin.get('txns_5m_buys',0)} / "
+                            f"Sells: {coin.get('txns_5m_sells',0)}"
+            }
 
         except json.JSONDecodeError as e:
-            log.error(f"Grok JSON parse error: {e} | raw: {raw[:200]}")
+            log.error(f"Grok JSON error: {e} | raw: {raw[:200] if 'raw' in dir() else '?'}")
         except Exception as e:
             log.error(f"Grok pick error: {e}")
         return None
-
 # ─── JUPITER ─────────────────────────────────────────────────────────────────
 
 class Jupiter:
