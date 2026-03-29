@@ -49,7 +49,7 @@ const CONFIG = {
   TOP_WALLETS_COUNT: 15,                        // Track 15 wallets (was 10)
   MIN_WIN_RATE: 0.60,              // 60% win rate minimum (was 70%)
   MIN_TRADES_REQUIRED: 100,        // Minimum 100 trades to qualify (was 500)
-  MIN_TRADES_FOR_SCORING: 20,      // Need 30+ to start scoring (was 200)
+  MIN_TRADES_FOR_SCORING: 25,      // Need 30+ to start scoring (was 200)
   MAX_DRAWDOWN_PCT: 35,            // Max 35% drawdown from peak (was 25%)
   MIN_ACTIVE_MONTHS: 1,            // Must be active for 1+ month (was 3)
   // Red flag thresholds (keeping these tight — these are the important ones)
