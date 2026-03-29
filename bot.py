@@ -488,20 +488,49 @@ class Detector:
         "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
         "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",
         "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",
+        # Additional Pump.fun program addresses seen in logs
+        "FAdo9NCw1ssek6Z6yeWzWjhLVsr8uiCwcWNUnKgzTnHe",  # Pump AMM
+        "Gz9VPiSLQYbvKyb3jZPjNfyA6n4T4qVFUuAukgL964nL",  # Pump router
+        "FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9",  # Flash program
+        "CxvksNjwhdHDLr3qbCXNKVdeYACW8cs93vFqLqtgyFE5",  # Pump swap
+        "BBRouter1cVunVXvkcqeKkZQcBK7ruan37PPm3xzWaXD",   # BB Router
+        "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",   # pAMM
     }
     _B58 = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 
+    def _is_valid_mint(self, addr: str) -> bool:
+        """
+        Validate that an address looks like a real token mint:
+        - Not in known programs list
+        - Only base58 characters
+        - 32-44 chars
+        - No repeating patterns (AAAA, 1111 etc — these are program addresses)
+        - Not all the same character
+        """
+        if addr in self._KNOWN_PROGRAMS: return False
+        if not all(c in self._B58 for c in addr): return False
+        if len(addr) < 32 or len(addr) > 44: return False
+        # Reject addresses with long runs of same char (program addresses like 11111...)
+        for c in self._B58:
+            if c * 8 in addr: return False
+        return True
+
     def _mint_from_logs(self, logs, source):
         import re
+        # For Pump.fun: token mints end in "pump" — very specific
         if source == "pumpfun":
             for line in logs:
                 for m in re.finditer(r'([1-9A-HJ-NP-Za-km-z]{32,44}pump)', line):
                     addr = m.group(1)
-                    if addr not in self._KNOWN_PROGRAMS: return addr
+                    if self._is_valid_mint(addr):
+                        log.debug(f"Pump mint from logs: {addr[:20]}")
+                        return addr
+        # For Raydium: scan for valid 43-44 char addresses
         for line in logs:
             for m in re.finditer(r'([1-9A-HJ-NP-Za-km-z]{43,44})', line):
                 addr = m.group(1)
-                if addr not in self._KNOWN_PROGRAMS and all(c in self._B58 for c in addr):
+                if self._is_valid_mint(addr):
+                    log.debug(f"Raydium mint from logs: {addr[:20]}")
                     return addr
         return None
 
