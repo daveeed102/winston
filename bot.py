@@ -680,8 +680,7 @@ class Discord:
                 f"Trade size: **{TRADE_AMOUNT_SOL} SOL** (~${TRADE_AMOUNT_SOL*sol_usd:.2f}) | "
                 f"Max: **{MAX_POSITIONS} positions** | "
                 f"Scan every **{SCAN_INTERVAL_MINS:.0f} min**\n"
-                f"Exit: +{TP1_PCT:.0f}% 50% → +{TP2_PCT:.0f}% 25% → +{TP3_PCT:.0f}% 25% | "
-                f"Stop: **-{STOP_LOSS_PCT:.0f}%** | Max hold: {MAX_HOLD_MINUTES:.0f}min"
+                f"Exit: +{TP1_PCT:.0f}% full exit | Stop: -{STOP_LOSS_PCT:.0f}% | Stall: {STALL_MINUTES:.0f}min | Max hold: {MAX_HOLD_MINUTES:.0f}min"
             )
         }]})
 
@@ -854,8 +853,7 @@ class Bot:
         log.info(f"  Max positions: {MAX_POSITIONS}")
         log.info(f"  Grok min score: {GROK_MIN_SCORE}/100")
         log.info(f"  Scan every: {SCAN_INTERVAL_MINS} min")
-        log.info(f"  TP1 +{TP1_PCT}% 50% | TP2 +{TP2_PCT}% 25% | TP3 +{TP3_PCT}% 25%")
-        log.info(f"  Stop: -{STOP_LOSS_PCT}% | Max hold: {MAX_HOLD_MINUTES}min")
+        log.info(f"  Target: +{TP1_PCT}% full exit | Stop: -{STOP_LOSS_PCT}% | Stall: {STALL_MINUTES}min | Max hold: {MAX_HOLD_MINUTES}min")
         log.info(f"  Grok: {'✅ ENABLED' if GROK_API_KEY else '❌ NOT SET'}")
         log.info("=" * 60)
 
