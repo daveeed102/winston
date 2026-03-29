@@ -30,20 +30,20 @@ MAX_POSITIONS        = int(os.getenv("MAX_POSITIONS",         "5"))
 SCAN_INTERVAL_MINS   = float(os.getenv("SCAN_INTERVAL_MINS",  "5"))       # how often to look for new picks
 GROK_MIN_SCORE       = int(os.getenv("GROK_MIN_SCORE",        "75"))      # min score to buy
 SLIPPAGE_BPS         = int(os.getenv("SLIPPAGE_BPS",          "1000"))
-MAX_HOLD_MINUTES     = float(os.getenv("MAX_HOLD_MINUTES",    "120"))     # 2h max hold per position
+MAX_HOLD_MINUTES     = float(os.getenv("MAX_HOLD_MINUTES",    "30"))      # bail after 30min if nothing happens
 
-# Exit ladder — multipliers from entry
-TP1_PCT              = float(os.getenv("TP1_PCT",             "15"))      # +15% → sell 50%
-TP2_PCT              = float(os.getenv("TP2_PCT",             "25"))      # +25% → sell 25%
-TP3_PCT              = float(os.getenv("TP3_PCT",             "40"))      # +40% → sell 25% (rest)
-STOP_LOSS_PCT        = float(os.getenv("STOP_LOSS_PCT",       "7"))       # -7% → sell 100%
+# Quick-flip exit — take small profit fast and dip
+TP1_PCT              = float(os.getenv("TP1_PCT",             "8"))       # +8%  → sell 100% and dip
+STOP_LOSS_PCT        = float(os.getenv("STOP_LOSS_PCT",       "7"))       # -7%  → sell 100% immediately
 
-# Volume dry-up exit
-VOLUME_DROPOFF_PCT   = float(os.getenv("VOLUME_DROPOFF_PCT",  "30"))      # % volume drop to trigger early exit
-STALL_MINUTES        = float(os.getenv("STALL_MINUTES",       "12"))      # mins of no price movement = exit
+# Minimum hold before ANY exit (stop loss always active)
+MIN_HOLD_SECS        = float(os.getenv("MIN_HOLD_SECS",       "90"))      # 1.5 min minimum
+
+# Momentum exit — if rocket stalls after entry, don't wait around
+STALL_MINUTES        = float(os.getenv("STALL_MINUTES",       "5"))       # 5min flat after entry = dip
 
 # Dead coin
-DEAD_PRICE_STRIKES   = int(os.getenv("DEAD_PRICE_STRIKES",   "5"))       # 5 identical prices = bail
+DEAD_PRICE_STRIKES   = int(os.getenv("DEAD_PRICE_STRIKES",   "5"))
 
 # Anti-rug
 MAX_TOP_HOLDER_PCT   = float(os.getenv("MAX_TOP_HOLDER_PCT",  "35"))
@@ -90,21 +90,16 @@ class Position:
     cost_sol:        float = 0.0
     high_price:      float = 0.0
     opened_ts:       float = 0.0
-    took_tp1:        bool  = False
-    took_tp2:        bool  = False
     grok_score:      int   = 0
     grok_reason:     str   = ""
 
     # Dead coin detection
-    _last_price:     float = 0.0
-    _same_count:     int   = 0
+    _last_price:      float = 0.0
+    _same_count:      int   = 0
 
     # Stall detection
-    _stall_start:    float = 0.0
+    _stall_start:     float = 0.0
     _last_move_price: float = 0.0
-
-    # Volume tracking
-    _entry_volume:   float = 0.0
 
     def __post_init__(self):
         if not self.opened_ts:
@@ -295,39 +290,40 @@ class Grok:
 
         slots_free = MAX_POSITIONS - current_positions
 
-        prompt = f"""Today is {now_str}. You are an aggressive Solana momentum trader. Your goal is to FIND trades, not avoid them.
+        prompt = f"""Today is {now_str}. You are a Solana scalper hunting tokens that are LAUNCHING RIGHT NOW.
 
-I have {slots_free} open position slots. I want to fill them.
+Strategy: Buy the rocket on the way up, take +{TP1_PCT:.0f}% profit, dip. In and out fast.
+Stop loss: -{STOP_LOSS_PCT:.0f}%. Stall exit: {STALL_MINUTES:.0f}min flat. Max hold: {MAX_HOLD_MINUTES:.0f}min.
 
-LIVE DEXSCREENER DATA ({len(candidates)} tokens):
+I have {slots_free} open slots.
+
+LIVE DATA ({len(candidates)} tokens):
 {coin_list}
 
-MY EXIT STRATEGY:
-- +15% → sell 50% (quick profit lock)
-- +25% → sell 25% more
-- +40% → sell remainder
-- -7% → full stop loss
-- Max hold: 2 hours
+━━━ WHAT I'M HUNTING ━━━
 
-SCORE EACH TOKEN 1-100 for short-term pump potential in the next 1-2 hours.
+🎯 PERFECT SETUP (score 85-100):
+- Token is skyrocketing RIGHT NOW — 5m price up big (+5% to +30%)
+- Volume in 5m is HIGH relative to market cap (token is actively being bought)
+- Buys crushing sells in 5m (3:1 or better ratio)
+- Less than 24h old preferred — fresh launches have the most explosive moves
+- Not already up 300%+ in 24h (don't chase exhausted pumps)
 
-HIGH SCORE (75+) means: ANY of these are true:
-- Active buy pressure right now (buys > sells in 5m or 1h)
-- Price moving UP in 5m and/or 1h
-- High volume relative to market cap (volume velocity)
-- New token with early momentum (can 2-5x fast)
-- Token you have positive knowledge about from Twitter/news
+✅ GOOD SETUP (score 75-84):
+- 5m price positive (+2% to +5%)
+- Buys > sells in 5m
+- Some volume activity
 
-LOW SCORE (under 50) means:
-- More sells than buys consistently
-- Already dumped 24h and no recovery
-- Zero volume, dead
+❌ DO NOT BUY — score these below 70:
+- 5m price is flat or negative (momentum is gone or reversing)
+- Sells > buys in 5m (distribution, not accumulation)
+- Zero 5m volume (nobody is trading it right now)
+- Already pumped huge and now showing weakness
 
-MODERATE (50-74): Has something going for it but not a clear signal
-
-BE AGGRESSIVE: If a token has ANY positive momentum signal, score it 70+.
-Only score below 50 if it's clearly dead or dumping.
-You SHOULD be approving multiple tokens per scan — I want to be in trades.
+━━━ SCORING RULE ━━━
+A token MUST show positive 5m price movement to score >= {GROK_MIN_SCORE}.
+If 5m price is 0% or negative → max score is 65, no exceptions.
+I'd rather miss a trade than buy something already turning.
 
 RETURN ONLY valid JSON, no markdown:
 {{
@@ -338,16 +334,12 @@ RETURN ONLY valid JSON, no markdown:
       "score": <1-100>,
       "decision": "BUY" or "SKIP",
       "confidence": "high" or "medium" or "low",
-      "reason": "<cite specific data: volume, price change, buy/sell ratio>"
+      "reason": "<5m%: X, buys/sells: X/X, vol5m: $X — is it launching or stalling?>"
     }}
   ]
 }}
 
-Rules:
-- score >= {GROK_MIN_SCORE} → "BUY"
-- score < {GROK_MIN_SCORE} → "SKIP"
-- Score ALL {len(candidates)} tokens
-- Aim to approve at least {max(1, slots_free // 2)} tokens if the data supports it"""
+Score ALL {len(candidates)} tokens. Approve any that show active launch momentum."""
 
         try:
             async with aiohttp.ClientSession() as sess:
@@ -728,16 +720,14 @@ class Discord:
     async def bought(self, pos: "Position", sol_usd: float):
         label = pos.token.symbol if pos.token.symbol != "???" else pos.token.mint[:8]
         await self.send({"embeds": [{
-            "title": f"💸 BOUGHT — {label}",
+            "title": f"🚀 IN — {label} [{pos.grok_score}/100]",
             "color": 0x00AAFF,
             "description": (
-                f"Grok score: **{pos.grok_score}/100**\n"
                 f"_{pos.grok_reason[:200]}_\n\n"
-                f"Entry: **${pos.entry_price:.8f}** | Cost: **{pos.cost_sol:.4f} SOL** (${pos.cost_sol*sol_usd:.2f})\n"
-                f"TP1 +{TP1_PCT:.0f}%: ${pos.entry_price*1.15:.8f} → sell 50%\n"
-                f"TP2 +{TP2_PCT:.0f}%: ${pos.entry_price*1.25:.8f} → sell 25%\n"
-                f"TP3 +{TP3_PCT:.0f}%: ${pos.entry_price*1.40:.8f} → sell 25%\n"
-                f"Stop: ${pos.entry_price*(1-STOP_LOSS_PCT/100):.8f} (-{STOP_LOSS_PCT:.0f}%)"
+                f"Entry: **${pos.entry_price:.8f}** | **{pos.cost_sol:.4f} SOL** (${pos.cost_sol*sol_usd:.2f})\n"
+                f"Target: +{TP1_PCT:.0f}% → **${pos.entry_price*(1+TP1_PCT/100):.8f}** (full exit)\n"
+                f"Stop: -{STOP_LOSS_PCT:.0f}% → **${pos.entry_price*(1-STOP_LOSS_PCT/100):.8f}**\n"
+                f"Stall exit: {STALL_MINUTES:.0f}min flat | Timeout: {MAX_HOLD_MINUTES:.0f}min"
             ),
             "fields": [{
                 "name": "Chart",
@@ -756,23 +746,20 @@ class Discord:
                     else f"{pnl_sol:.5f} SOL (-${abs(pnl_sol)*sol_usd:.2f})"
 
         reason_map = {
-            "tp1":        f"TP1 hit +{TP1_PCT:.0f}% 🎯",
-            "tp2":        f"TP2 hit +{TP2_PCT:.0f}% 🎯🎯",
-            "tp3":        f"TP3 hit +{TP3_PCT:.0f}% 🎯🎯🎯",
-            "stop_loss":  f"Stop Loss -{STOP_LOSS_PCT:.0f}% 🛑",
-            "timeout":    f"Max hold {MAX_HOLD_MINUTES:.0f}min ⏰",
-            "stall":      "Price stalled 😴",
-            "price_dead": "No price feed 📡",
+            "tp1":        f"🎯 +{TP1_PCT:.0f}% target hit — profit taken",
+            "stop_loss":  f"🛑 Stop loss -{STOP_LOSS_PCT:.0f}%",
+            "timeout":    f"⏰ {MAX_HOLD_MINUTES:.0f}min timeout",
+            "stall":      f"😴 Stalled {STALL_MINUTES:.0f}min — no move",
+            "price_dead": "📡 No price feed",
         }
 
         await self.send({"embeds": [{
-            "title": f"{emoji} SOLD {pct_sold}% — {label} [{gain_pct:+.1f}%]",
+            "title": f"{emoji} OUT — {label} [{gain_pct:+.1f}%]",
             "color": color,
             "description": (
                 f"**{pnl_str}**\n"
-                f"Reason: {reason_map.get(reason, reason)} | "
-                f"Hold: {pos.hold_mins:.1f}min | "
-                f"Score was: {pos.grok_score}/100"
+                f"{reason_map.get(reason, reason)} | "
+                f"held {pos.hold_secs:.0f}s | score: {pos.grok_score}/100"
             )
         }]})
 
@@ -1019,17 +1006,12 @@ class Bot:
         pos._last_move_price = final_price
         pos._stall_start     = time.time()
 
-        # Get entry volume for dry-up detection
-        d = grok_item.get("data", {})
-        pos._entry_volume = d.get("volume_5m", 0)
-
         self.positions.append(pos)
         self.held_mints.add(mint)
 
-        log.info(f"POSITION OPENED: {symbol} @ ${final_price:.10f} | Score: {score}/100")
-        log.info(f"  Tokens: {tokens:.2f} | Cost: {TRADE_AMOUNT_SOL} SOL")
-        log.info(f"  TP1: ${final_price*1.15:.10f} | TP2: ${final_price*1.25:.10f} | TP3: ${final_price*1.40:.10f}")
-        log.info(f"  Stop: ${final_price*(1-STOP_LOSS_PCT/100):.10f}")
+        log.info(f"IN: {symbol} @ ${final_price:.10f} | Score: {score}/100 | "
+                 f"target +{TP1_PCT:.0f}% → ${final_price*(1+TP1_PCT/100):.10f} | "
+                 f"stop -{STOP_LOSS_PCT:.0f}% → ${final_price*(1-STOP_LOSS_PCT/100):.10f}")
 
         await self.discord.bought(pos, self.sol_usd)
         return True
@@ -1056,126 +1038,71 @@ class Bot:
 
         # ── NO PRICE ─────────────────────────────────────────────────────────
         if not price:
-            # Track consecutive failures
             if not hasattr(pos, '_price_fail_count'):
                 pos._price_fail_count = 0
-            pos._price_fail_count = getattr(pos, '_price_fail_count', 0) + 1
-            if pos._price_fail_count >= 30:  # 30 * 2s = 60s with no price
-                log.error(f"{label}: no price for 60s — emergency sell")
-                await self._close_position(pos, price or pos.entry_price, "price_dead", 100)
+            pos._price_fail_count += 1
+            if pos._price_fail_count >= 30:  # 60s with no price
+                log.error(f"{label}: no price 60s — emergency sell")
+                await self._close_position(pos, pos.entry_price, "price_dead", 100)
             return
-        if hasattr(pos, '_price_fail_count'):
-            pos._price_fail_count = 0
+        pos._price_fail_count = 0
 
         gain_pct = ((price / pos.entry_price) - 1) * 100 if pos.entry_price > 0 else 0
 
         log.info(
             f"  {label:8s} ${price:.8f} ({gain_pct:+.1f}%) | "
-            f"{pos.hold_mins:.1f}min | score:{pos.grok_score} | "
-            f"tp1:{pos.took_tp1} tp2:{pos.took_tp2}"
+            f"{pos.hold_secs:.0f}s | score:{pos.grok_score}"
         )
 
         # ── DEAD COIN ────────────────────────────────────────────────────────
         if price == pos._last_price:
             pos._same_count += 1
             if pos._same_count >= DEAD_PRICE_STRIKES:
-                log.warning(f"{label}: price frozen {pos._same_count}x — dead coin")
+                log.warning(f"{label}: price frozen — dead")
                 await self._close_position(pos, price, "price_dead", 100)
                 return
         else:
             pos._same_count = 0
         pos._last_price = price
 
-        # ── UPDATE HIGH ──────────────────────────────────────────────────────
         if price > pos.high_price:
             pos.high_price = price
 
-        # ── STOP LOSS ────────────────────────────────────────────────────────
+        # ── STOP LOSS — always active, no minimum hold ────────────────────────
         stop_price = pos.entry_price * (1 - STOP_LOSS_PCT / 100)
         if price <= stop_price:
-            log.warning(f"{label}: STOP LOSS hit at ${price:.8f} ({gain_pct:.1f}%)")
+            log.warning(f"{label}: STOP -{STOP_LOSS_PCT:.0f}% hit ({gain_pct:.1f}%) — OUT")
             await self._close_position(pos, price, "stop_loss", 100)
             return
 
-        # ── STALL DETECTION ──────────────────────────────────────────────────
-        if abs(price - pos._last_move_price) / pos._last_move_price > 0.002:
-            # Price moved >0.2% — reset stall timer
+        # ── MINIMUM HOLD GUARD (1.5 min) — no profit exits before this ───────
+        if pos.hold_secs < MIN_HOLD_SECS:
+            return
+
+        # ── TAKE PROFIT — hit +8%, sell everything and dip ───────────────────
+        if gain_pct >= TP1_PCT:
+            log.info(f"{label}: +{gain_pct:.1f}% — TAKING PROFIT, dipping")
+            await self._close_position(pos, price, "tp1", 100)
+            return
+
+        # ── TIMEOUT — 30min and nothing happened, move on ────────────────────
+        if pos.timed_out:
+            log.info(f"{label}: {MAX_HOLD_MINUTES:.0f}min timeout — closing")
+            await self._close_position(pos, price, "timeout", 100)
+            return
+
+        # ── STALL — rocket didn't launch, stop wasting the slot ──────────────
+        if abs(price - pos._last_move_price) / max(pos._last_move_price, 1e-12) > 0.003:
             pos._last_move_price = price
             pos._stall_start = time.time()
         else:
             stall_mins = (time.time() - pos._stall_start) / 60
-            if stall_mins >= STALL_MINUTES and not pos.took_tp1:
-                # Only exit on stall if we haven't taken any profit yet
-                log.warning(f"{label}: price stalled {stall_mins:.0f}min — exiting")
+            if stall_mins >= STALL_MINUTES:
+                log.warning(f"{label}: stalled {stall_mins:.1f}min with no move — dipping")
                 await self._close_position(pos, price, "stall", 100)
                 return
 
-        # ── TIMEOUT ──────────────────────────────────────────────────────────
-        if pos.timed_out:
-            log.info(f"{label}: max hold {MAX_HOLD_MINUTES:.0f}min reached — closing")
-            await self._close_position(pos, price, "timeout", 100)
-            return
-
-        # ── TAKE PROFIT LADDER ───────────────────────────────────────────────
-        # TP1: +15% → sell 50%
-        if not pos.took_tp1 and gain_pct >= TP1_PCT:
-            log.info(f"{label}: TP1 hit at {gain_pct:.1f}% — selling 50%")
-            sold = await self._partial_sell(pos, price, "tp1", 50)
-            if sold:
-                pos.took_tp1 = True
-            return
-
-        # TP2: +25% → sell 25% of ORIGINAL
-        if pos.took_tp1 and not pos.took_tp2 and gain_pct >= TP2_PCT:
-            log.info(f"{label}: TP2 hit at {gain_pct:.1f}% — selling 25%")
-            # We have ~50% left. Sell half of that = 25% original
-            sold = await self._partial_sell(pos, price, "tp2", 50)
-            if sold:
-                pos.took_tp2 = True
-            return
-
-        # TP3: +40% → sell rest (25% of original)
-        if pos.took_tp2 and gain_pct >= TP3_PCT:
-            log.info(f"{label}: TP3 hit at {gain_pct:.1f}% — selling remainder")
-            await self._close_position(pos, price, "tp3", 100)
-            return
-
     # ─── SELL HELPERS ────────────────────────────────────────────────────────
-
-    async def _partial_sell(self, pos: Position, price: float,
-                             reason: str, pct: int) -> bool:
-        """Sell pct% of current holdings. Returns True on success."""
-        label = pos.token.symbol if pos.token.symbol != "???" else pos.token.mint[:8]
-
-        raw_amount, decimals = await self.sol.token_balance(pos.token.mint)
-        if raw_amount <= 0:
-            # Estimate
-            raw_amount = int(pos.tokens_held * (10 ** 6))
-        sell_amount = int(raw_amount * (pct / 100))
-        if sell_amount <= 0:
-            return False
-
-        success = await self._execute_sell(pos.token.mint, sell_amount)
-        if not success:
-            return False
-
-        sold_tokens = pos.tokens_held * (pct / 100)
-        pnl_sol = (price * sold_tokens) - (pos.cost_sol * pct / 100)
-        gain_pct = ((price / pos.entry_price) - 1) * 100
-
-        pos.tokens_held -= sold_tokens
-        pos.cost_sol    -= pos.cost_sol * (pct / 100)
-
-        if pnl_sol >= 0:
-            self.wins    += 1
-        else:
-            self.losses  += 1
-        self.total_pnl  += pnl_sol
-
-        self.sol_usd = await self.jup.sol_usd()
-        await self.discord.sold(pos, reason, gain_pct, pnl_sol, pct, self.sol_usd, price)
-        log.info(f"PARTIAL SELL {pct}% {label}: {gain_pct:+.1f}% | {pnl_sol:+.5f} SOL")
-        return True
 
     async def _close_position(self, pos: Position, price: float,
                                reason: str, pct: int):
