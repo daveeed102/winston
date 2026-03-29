@@ -155,14 +155,13 @@ async function parseWithHelius(signatures) {
   }
 }
 
-function extractSwapFromEnhanced(tx, walletAddr) {
-  // Helius returns type: 'SWAP' for any DEX swap
-  if (tx.type !== 'SWAP') return null;
+function extractTradeFromEnhanced(tx, walletAddr) {
+  // Process ANY transaction type that involves token movement
   if (tx.transactionError) return null;
 
-  // Extract token transfers from the swap
   const transfers = tx.tokenTransfers || [];
   const nativeTransfers = tx.nativeTransfers || [];
+  const txType = tx.type || 'UNKNOWN';
 
   let solSpent = 0;
   let solReceived = 0;
@@ -181,18 +180,17 @@ function extractSwapFromEnhanced(tx, walletAddr) {
     if (STABLES.has(t.mint) || t.mint === CONFIG.SOL_MINT) continue;
 
     if (t.toUserAccount === walletAddr && t.tokenAmount > 0) {
-      // Received tokens = BUY
       tokenMint = t.mint;
       tokenAmount = t.tokenAmount;
       direction = 'buy';
     } else if (t.fromUserAccount === walletAddr && t.tokenAmount > 0) {
-      // Sent tokens = SELL
       tokenMint = t.mint;
       tokenAmount = t.tokenAmount;
       direction = 'sell';
     }
   }
 
+  // If no non-stable token found, skip truly irrelevant txs (pure SOL transfers, NFTs, etc)
   if (!tokenMint || !direction) return null;
 
   const solAmount = direction === 'buy' ? solSpent : solReceived;
@@ -206,6 +204,7 @@ function extractSwapFromEnhanced(tx, walletAddr) {
     timestamp: tx.timestamp,
     description: tx.description || '',
     source: tx.source || 'UNKNOWN',
+    txType, // SWAP, TRANSFER, etc — we pass this through for context
   };
 }
 
@@ -294,7 +293,7 @@ async function sendTradeAlert(swap, walletAddr) {
   msg += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
   msg += `**Token:** ${tokenInfo.name} (${tokenInfo.symbol})\n`;
   msg += `**Mint:** \`${swap.tokenMint}\`\n`;
-  msg += `**DEX:** ${swap.source} | **Price:** $${tokenPrice ? tokenPrice.toFixed(8) : 'N/A'}\n`;
+  msg += `**DEX:** ${swap.source} | **Type:** ${swap.txType || 'SWAP'} | **Price:** $${tokenPrice ? tokenPrice.toFixed(8) : 'N/A'}\n`;
   msg += `\n`;
   msg += `**💸 Trade:** ${swap.solAmount.toFixed(4)} SOL (~$${solUsd})`;
   if (traderPct) msg += ` — **${traderPct}% of wallet**`;
@@ -366,16 +365,22 @@ async function pollWallets() {
           const parsed = await parseWithHelius(sigList);
 
           for (const tx of parsed) {
-            const swap = extractSwapFromEnhanced(tx, addr);
-            if (swap) {
+            const trade = extractTradeFromEnhanced(tx, addr);
+            if (trade) {
               swaps++;
-              log('SWAP', `✅ ${swap.direction.toUpperCase()} detected: ${swap.tokenMint.slice(0,8)}... via ${swap.source}`, {
-                sol: swap.solAmount.toFixed(4), wallet: addr.slice(0,8)
+              log('SWAP', `✅ ${trade.direction.toUpperCase()} [${tx.type||'?'}] ${trade.tokenMint.slice(0,8)}... via ${trade.source}`, {
+                sol: trade.solAmount.toFixed(4), wallet: addr.slice(0,8)
               });
-              await sendTradeAlert(swap, addr);
+              await sendTradeAlert(trade, addr);
               await sleep(500);
             } else {
-              log('INFO', `  ↳ ${tx.signature?.slice(0,12)}... type=${tx.type||'?'} (not a token swap)`);
+              // No token movement we care about — log it but skip alert
+              const hasAnyTokenTransfer = (tx.tokenTransfers || []).length > 0;
+              if (hasAnyTokenTransfer) {
+                log('INFO', `  ↳ ${tx.signature?.slice(0,12)}... type=${tx.type||'?'} — has token transfers but no non-stable token match`);
+              } else {
+                log('INFO', `  ↳ ${tx.signature?.slice(0,12)}... type=${tx.type||'?'} — no token transfers (SOL only / NFT / other)`);
+              }
             }
           }
         }
