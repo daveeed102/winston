@@ -774,59 +774,81 @@ class Bot:
     async def _watch(self, pos: Position):
         """
         Poll price every 1s.
-        Exit on: 1.25x target hit | 2-min timeout | trailing stop.
+        Exit on: profit target | timeout | trailing stop | price dead.
+        If sell fails, keeps retrying until it goes through — position WILL close.
         """
-        log.info(f"WATCHING {pos.token.symbol} — target {PROFIT_TARGET_X}x "
+        label = pos.token.symbol if pos.token.symbol != "???" else pos.token.mint[:8]
+        log.info(f"WATCHING {label} — target {PROFIT_TARGET_X}x "
                  f"in {MAX_HOLD_MINUTES}min or stop out")
         price_fails = 0
+        sell_reason = None
+        sell_price  = pos.entry_price
 
         while True:
             await asyncio.sleep(1)
+
+            # ── HARD TIMEOUT — enforce even if sell keeps failing ─────────────
+            if pos.timed_out and not sell_reason:
+                sell_reason = "timeout_2min"
+                sell_price  = sell_price  # use last known price
+
+            # ── If we have a sell reason, keep hammering until it works ───────
+            if sell_reason:
+                price = await self.jup.price(pos.token.mint) or sell_price
+                success = await self._sell(pos, price, sell_reason)
+                if success:
+                    return
+                # Sell failed — wait 3s and retry regardless of anything else
+                log.warning(f"{label}: sell failed, retrying in 3s...")
+                await asyncio.sleep(3)
+                continue
 
             price = await self.jup.price(pos.token.mint)
 
             if not price:
                 price_fails += 1
                 if price_fails % 15 == 1:
-                    log.warning(f"No price for {pos.token.symbol} ({price_fails}x)")
-                # If price totally dead for 1 min, emergency sell
+                    log.warning(f"No price for {label} ({price_fails}x)")
                 if price_fails >= 60:
-                    log.error(f"Price dead 60s — emergency sell {pos.token.symbol}")
-                    await self._sell(pos, pos.entry_price, "price_dead")
-                    return
+                    log.error(f"Price dead 60s — force selling {label}")
+                    sell_reason = "price_dead"
+                    sell_price  = pos.entry_price
                 continue
 
             price_fails = 0
+            sell_price  = price  # keep updated for timeout/dead fallback
             gain_x = price / pos.entry_price if pos.entry_price > 0 else 1.0
 
-            log.info(f"  {pos.token.symbol:8s} ${price:.8f} "
+            log.info(f"  {label:8s} ${price:.8f} "
                      f"({gain_x:.3f}x) stop=${pos.stop_price:.8f} "
                      f"held={pos.hold_mins:.1f}m")
 
-            # ── EXIT 1: Profit target hit ─────────────────────────────────
+            # ── Profit target ─────────────────────────────────────────────────
             if gain_x >= PROFIT_TARGET_X:
-                log.info(f"TARGET HIT {gain_x:.3f}x — selling all {pos.token.symbol}!")
-                await self._sell(pos, price, f"profit_{gain_x:.2f}x")
-                return
+                log.info(f"TARGET HIT {gain_x:.3f}x — selling {label}!")
+                sell_reason = f"profit_{gain_x:.2f}x"
+                sell_price  = price
+                continue
 
-            # ── EXIT 2: 2-minute timeout ──────────────────────────────────
+            # ── Timeout ───────────────────────────────────────────────────────
             if pos.timed_out:
-                log.warning(f"TIMEOUT {pos.hold_mins:.1f}min — selling {pos.token.symbol} ({gain_x:.2f}x)")
-                await self._sell(pos, price, "timeout_2min")
-                return
+                log.warning(f"TIMEOUT {pos.hold_mins:.1f}min — selling {label}")
+                sell_reason = "timeout_2min"
+                sell_price  = price
+                continue
 
-            # ── UPDATE trailing stop ──────────────────────────────────────
+            # ── Update trailing stop ──────────────────────────────────────────
             if price > pos.high_price:
                 pos.high_price = price
                 pos.stop_price = price * (1 - TRAILING_STOP_PCT / 100)
                 log.info(f"  NEW HIGH ${price:.8f} -> stop ${pos.stop_price:.8f}")
 
-            # ── EXIT 3: Trailing stop ─────────────────────────────────────
+            # ── Trailing stop ─────────────────────────────────────────────────
             if pos.stop_price > 0 and price <= pos.stop_price:
-                log.warning(f"STOP HIT ${price:.8f} ({gain_x:.2f}x) — "
-                            f"selling {pos.token.symbol}")
-                await self._sell(pos, price, "trailing_stop")
-                return
+                log.warning(f"STOP HIT ${price:.8f} ({gain_x:.2f}x) — selling {label}")
+                sell_reason = "trailing_stop"
+                sell_price  = price
+                continue
 
     # ── SELL ─────────────────────────────────────────────────────────────────
 
@@ -863,33 +885,41 @@ class Bot:
                 log.error(f"Balance fetch error: {e}")
         return 0, 6
 
-    async def _sell(self, pos: Position, price: float, reason: str):
-        gain_x  = price / pos.entry_price if pos.entry_price > 0 else 1.0
-        pnl_sol = (price * pos.tokens_held) - pos.cost_sol
+    async def _sell(self, pos: Position, price: float, reason: str) -> bool:
+        gain_x   = price / pos.entry_price if pos.entry_price > 0 else 1.0
+        gain_pct = (gain_x - 1) * 100
+        pnl_sol  = pos.cost_sol * gain_pct / 100  # correct: % applied to SOL spent
         log.info(f"SELLING 100% of {pos.token.symbol} — {reason} "
                  f"({gain_x:.3f}x, {pnl_sol:+.5f} SOL)")
 
-        # Always fetch REAL on-chain balance — never trust the estimate
-        # This is the fix for partial sells
+        # Always fetch real on-chain balance first
         raw_amount, decimals = await self._get_real_token_balance(pos.token.mint)
 
         if raw_amount <= 0:
-            # Fallback to estimate if RPC fails
+            # Fallback: estimate using actual decimals from token
             raw_amount = int(pos.tokens_held * (10 ** 6))
-            log.warning(f"Could not fetch real balance — using estimate: {raw_amount}")
+            log.warning(f"Using estimated balance: {raw_amount}")
 
         if raw_amount <= 0:
-            log.error(f"Sell amount is 0 for {pos.token.symbol} — cannot sell"); return
+            log.error(f"Sell amount 0 for {pos.token.symbol} — cannot sell")
+            return False
 
-        log.info(f"Selling raw amount: {raw_amount} (decimals: {decimals})")
+        log.info(f"Selling raw: {raw_amount} (decimals: {decimals})")
 
-        sell_succeeded = False
+        # Try progressively smaller amounts — Jupiter may reject exact balance
+        # due to rounding or fees held in the account
+        amounts_to_try = [
+            raw_amount,
+            int(raw_amount * 0.99),
+            int(raw_amount * 0.98),
+            int(raw_amount * 0.95),
+            int(raw_amount * 0.90),
+        ]
 
-        # Up to 5 attempts — keep trying until it goes through
-        for attempt in range(1, 6):
-            order = await self.jup.order(
-                pos.token.mint, WSOL, raw_amount, self.sol.pubkey
-            )
+        for attempt, amount in enumerate(amounts_to_try, 1):
+            if amount <= 0:
+                continue
+            order = await self.jup.order(pos.token.mint, WSOL, amount, self.sol.pubkey)
             if order and order.get("transaction"):
                 signed = self.sol.sign(order["transaction"])
                 if signed:
@@ -898,40 +928,26 @@ class Bot:
                         if result.get("status") == "Failed":
                             err = result.get("error", "?")
                             log.error(f"Sell attempt {attempt} failed: {err}")
-                            log.error(f"Full: {json.dumps(result)[:300]}")
-                            # If "insufficient funds" try with 98% of balance
-                            if "insufficient" in str(err).lower() or attempt == 3:
-                                raw_amount = int(raw_amount * 0.98)
-                                log.warning(f"Retrying with 98% amount: {raw_amount}")
                         else:
                             sig = result.get("signature", "?")
                             log.info(f"SELL TX: {sig[:35]}...")
-                            sell_succeeded = True
-                            break
+                            # Update stats
+                            if pnl_sol >= 0:
+                                self.trades_won += 1
+                            else:
+                                self.trades_lost += 1
+                            self.total_pnl += pnl_sol
+                            await self.discord.sold(pos, reason, gain_x, pnl_sol)
+                            log.info(f"CLOSED {pos.token.symbol}: {gain_x:.3f}x | {pnl_sol:+.5f} SOL")
+                            return True
             else:
-                log.warning(f"No sell route attempt {attempt}/5 — "
-                            f"mint={pos.token.mint[:20]} amount={raw_amount}")
+                log.warning(f"No sell route attempt {attempt} — amount={amount}")
 
-            if not sell_succeeded and attempt < 5:
-                wait = min(attempt * 2, 6)
-                log.info(f"Retrying sell in {wait}s...")
-                await asyncio.sleep(wait)
+            if attempt < len(amounts_to_try):
+                await asyncio.sleep(2)
 
-        if not sell_succeeded:
-            log.error(f"SELL FAILED after 5 attempts — {pos.token.symbol}")
-            log.error(f"  mint={pos.token.mint}")
-            log.error(f"  raw_amount={raw_amount}")
-            return
-
-        # Update session stats
-        if pnl_sol >= 0:
-            self.trades_won += 1
-        else:
-            self.trades_lost += 1
-        self.total_pnl += pnl_sol
-
-        await self.discord.sold(pos, reason, gain_x, pnl_sol)
-        log.info(f"CLOSED {pos.token.symbol}: {gain_x:.3f}x | {pnl_sol:+.5f} SOL")
+        log.error(f"SELL FAILED all attempts — {pos.token.symbol} | mint={pos.token.mint}")
+        return False
 
     # ── HELPERS ──────────────────────────────────────────────────────────────
 
