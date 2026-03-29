@@ -284,7 +284,25 @@ async function sendTradeAlert(swap, walletAddr) {
   const walletStats = CONFIG.TRACKED_WALLETS[walletAddr] || {};
   const tokenInfo = await getTokenInfo(swap.tokenMint);
   const tokenPrice = await getTokenPrice(swap.tokenMint);
+  const solPrice = await getTokenPrice(CONFIG.SOL_MINT);
   const isBuy = swap.direction === 'buy';
+
+  // Get trader's current SOL balance to calculate % of wallet they used
+  let traderBalance = 0;
+  let traderPctUsed = null;
+  try {
+    const balRes = await fetch(CONFIG.HELIUS_RPC, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getBalance', params: [walletAddr] }),
+    });
+    const balData = await balRes.json();
+    traderBalance = (balData?.result?.value || 0) / 1e9;
+    // Their balance AFTER the trade + what they spent = their balance BEFORE
+    const balanceBefore = traderBalance + (isBuy ? swap.solAmount : -swap.solAmount);
+    if (balanceBefore > 0) {
+      traderPctUsed = ((swap.solAmount / balanceBefore) * 100).toFixed(1);
+    }
+  } catch (e) { /* skip balance check */ }
 
   state.alertCount++;
 
@@ -301,6 +319,9 @@ async function sendTradeAlert(swap, walletAddr) {
     ? (grokResult.score >= 70 ? '🔥' : grokResult.score >= 50 ? '⚡' : '⚠️')
     : '';
 
+  const solUsd = solPrice ? (swap.solAmount * solPrice).toFixed(2) : '?';
+  const traderBalUsd = (solPrice && traderBalance) ? (traderBalance * solPrice).toFixed(2) : '?';
+
   let msg = ``;
   msg += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
   msg += `${emoji} ALERT #${state.alertCount}\n`;
@@ -308,10 +329,15 @@ async function sendTradeAlert(swap, walletAddr) {
   msg += `**Token:** ${tokenInfo.name} (${tokenInfo.symbol})\n`;
   msg += `**Mint:** \`${swap.tokenMint}\`\n`;
   msg += `**Price:** $${tokenPrice ? tokenPrice.toFixed(8) : 'N/A'}\n`;
-  msg += `**SOL:** ${swap.solAmount.toFixed(4)}\n`;
   msg += `**Tx:** https://solscan.io/tx/${swap.signature}\n`;
   msg += `\n`;
+  msg += `**💸 Trade Size:** ${swap.solAmount.toFixed(4)} SOL (~$${solUsd})`;
+  if (traderPctUsed) {
+    msg += ` — **${traderPctUsed}% of their wallet**`;
+  }
+  msg += `\n`;
   msg += `**👤 Trader:** \`${walletAddr.slice(0, 12)}...\`\n`;
+  msg += `**💰 Their Balance:** ${traderBalance.toFixed(2)} SOL (~$${traderBalUsd})\n`;
   msg += `**ROI:** ${walletStats.roi || 'N/A'} | **WR:** ${walletStats.wr || 'N/A'} | **Age:** ${walletStats.days || '?'}d\n`;
   msg += `**PnL:** ${walletStats.pnl || '?'} SOL | **Med ROI:** ${walletStats.medianRoi || 'N/A'}\n`;
   msg += `**Hold:** ${walletStats.medianHold || 'N/A'} | **Tokens:** ${walletStats.tokens || '?'}\n`;
@@ -330,6 +356,7 @@ async function sendTradeAlert(swap, walletAddr) {
   // Log locally
   log('ALERT', `${emoji} ${tokenInfo.symbol} from ${walletAddr.slice(0, 8)}...`, {
     sol: swap.solAmount.toFixed(4),
+    traderPct: traderPctUsed || 'N/A',
     grokScore: grokResult?.score || 'N/A',
     verdict: grokResult?.verdict || 'N/A',
   });
@@ -424,8 +451,8 @@ async function healthLoop() {
 // ============================================================
 async function main() {
   console.log('\n╔═══════════════════════════════════════════════════════╗');
-  console.log('║    🤖 WINSTON WINSTON WINSTON WINSTON WINSTON       ║');
-  console.log('║        CREDTED BY: DAVID NATHANIEL ESCOBAR      ║');
+  console.log('║    🤖 WINSTON v9.2 — Alert + Grok Analysis Bot       ║');
+  console.log('║      No Auto-Trade • Discord Alerts • AI Scoring      ║');
   console.log('╚═══════════════════════════════════════════════════════╝\n');
 
   if (!CONFIG.HELIUS_API_KEY) { log('ERROR', 'HELIUS_API_KEY required'); process.exit(1); }
