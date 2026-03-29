@@ -421,84 +421,60 @@ async function scoreWallet(address) {
 
     log('DISCOVERY', `${address.slice(0, 8)}... — fetched ${recentSigs.length} recent txs, found ${allSwaps.length} swaps, ~${totalEstimatedSigs} total sigs`);
 
-    // Step 2: Build per-token trade records (pair buys with sells)
+    // Step 2: Score based on individual swap profitability
+    // Instead of matching buy/sell pairs (which fails with sampling),
+    // treat each swap as an individual trade and look at SOL flow:
+    //   - SELL (token -> SOL): solAmount is positive = they got SOL back
+    //   - BUY (SOL -> token): solAmount is the cost
+    // A profitable trader will have more SOL flowing IN from sells than OUT from buys
 
-    // Step 2: Build per-token trade records (pair buys with sells)
-    const tokenHistory = new Map();
-    for (const swap of allSwaps) {
-      if (!tokenHistory.has(swap.tokenMint)) {
-        tokenHistory.set(swap.tokenMint, []);
-      }
-      tokenHistory.get(swap.tokenMint).push(swap);
-    }
-
-    // Step 3: Calculate per-trade PnL and build equity curve
-    const completedTrades = [];  // { pnlPct, pnlSol, timestamp, tokenMint }
-
-    for (const [mint, trades] of tokenHistory) {
-      const buys = trades.filter(t => t.direction === 'buy').sort((a, b) => a.timestamp - b.timestamp);
-      const sells = trades.filter(t => t.direction === 'sell').sort((a, b) => a.timestamp - b.timestamp);
-
-      if (buys.length > 0 && sells.length > 0) {
-        const totalSpent = buys.reduce((s, t) => s + t.solAmount, 0);
-        const totalReceived = sells.reduce((s, t) => s + t.solAmount, 0);
-
-        if (totalSpent > 0) {
-          const pnlPct = (totalReceived - totalSpent) / totalSpent;
-          const pnlSol = totalReceived - totalSpent;
-          const lastTradeTime = Math.max(...sells.map(s => s.timestamp));
-
-          completedTrades.push({
-            pnlPct,
-            pnlSol,
-            timestamp: lastTradeTime,
-            tokenMint: mint,
-          });
-        }
-      }
-    }
-
-    const totalTrades = completedTrades.length;
-
-    // Early exit: not enough completed trades
-    // Note: we're sampling ~20 txs per 1000 sigs, so seeing even 3 round-trips
-    // from a sample means the wallet likely has dozens of real completed trades
-    if (totalTrades < 3) {
-      log('DISCOVERY', `${address.slice(0, 8)}... — only ${totalTrades} completed round-trips, skipping`);
+    if (allSwaps.length < 5) {
+      log('DISCOVERY', `${address.slice(0, 8)}... — only ${allSwaps.length} swaps found, skipping`);
       return null;
     }
 
-    // Extrapolate total trades from sampling ratio
-    const estimatedTotalTrades = Math.floor(totalTrades * (totalSigsScanned / Math.max(allSwaps.length, 1)) * 0.5);
+    // Sort chronologically
+    allSwaps.sort((a, b) => a.timestamp - b.timestamp);
 
-    // Sort trades chronologically for equity curve
-    completedTrades.sort((a, b) => a.timestamp - b.timestamp);
+    const buys = allSwaps.filter(s => s.direction === 'buy');
+    const sells = allSwaps.filter(s => s.direction === 'sell');
+    const totalBuySol = buys.reduce((s, t) => s + t.solAmount, 0);
+    const totalSellSol = sells.reduce((s, t) => s + t.solAmount, 0);
 
-    // Step 4: Win rate (overall)
-    const wins = completedTrades.filter(t => t.pnlPct > 0).length;
-    const losses = completedTrades.filter(t => t.pnlPct <= 0).length;
-    const winRate = wins / totalTrades;
+    // Net SOL flow: positive = profitable
+    const netSolFlow = totalSellSol - totalBuySol;
+    const totalSwaps = allSwaps.length;
 
-    // Step 5: Win rate (recent — last 25% of trades)
-    const recentCutoff = Math.floor(totalTrades * 0.75);
-    const recentTrades = completedTrades.slice(recentCutoff);
+    // Win rate: what % of sells returned more SOL than the average buy cost
+    const avgBuyCost = buys.length > 0 ? totalBuySol / buys.length : 0;
+    const profitableSells = sells.filter(s => s.solAmount > avgBuyCost * 0.8).length; // 80% of avg buy = "win"
+    const winRate = sells.length > 0 ? profitableSells / sells.length : 0;
+
+    // Recent win rate (last 25% of swaps)
+    const recentCutoff = Math.floor(allSwaps.length * 0.75);
+    const recentSwaps = allSwaps.slice(recentCutoff);
+    const recentSells = recentSwaps.filter(s => s.direction === 'sell');
+    const recentBuys = recentSwaps.filter(s => s.direction === 'buy');
+    const recentAvgBuyCost = recentBuys.length > 0 ? recentBuys.reduce((s, t) => s + t.solAmount, 0) / recentBuys.length : avgBuyCost;
+    const recentProfitableSells = recentSells.filter(s => s.solAmount > recentAvgBuyCost * 0.8).length;
     let recentWinRate = null;
-    if (recentTrades.length >= 5) {
-      const recentWins = recentTrades.filter(t => t.pnlPct > 0).length;
-      recentWinRate = recentWins / recentTrades.length;
+    if (recentSells.length >= 3) {
+      recentWinRate = recentProfitableSells / recentSells.length;
     }
 
-    // Step 6: Average profit
-    const totalProfit = completedTrades.reduce((s, t) => s + t.pnlPct, 0);
-    const avgProfit = totalProfit / totalTrades;
-
-    // Step 7: Max drawdown from peak equity
+    // Equity curve from SOL flow (running balance impact)
     let equity = 0;
     let peakEquity = 0;
     let maxDrawdown = 0;
+    const equityCurve = [];
 
-    for (const trade of completedTrades) {
-      equity += trade.pnlSol;
+    for (const swap of allSwaps) {
+      if (swap.direction === 'sell') {
+        equity += swap.solAmount;
+      } else {
+        equity -= swap.solAmount;
+      }
+      equityCurve.push({ equity, timestamp: swap.timestamp });
       if (equity > peakEquity) peakEquity = equity;
       const drawdown = peakEquity > 0 ? ((peakEquity - equity) / peakEquity) : 0;
       if (drawdown > maxDrawdown) maxDrawdown = drawdown;
@@ -506,52 +482,67 @@ async function scoreWallet(address) {
 
     const maxDrawdownPct = maxDrawdown * 100;
 
-    // Step 8: Largest single win as share of total PnL
-    const totalPnlSol = completedTrades.reduce((s, t) => s + Math.max(0, t.pnlSol), 0);
-    let largestWinSol = 0;
-    for (const trade of completedTrades) {
-      if (trade.pnlSol > largestWinSol) largestWinSol = trade.pnlSol;
+    // Largest single sell as share of total sell volume (red flag check)
+    let largestSellSol = 0;
+    for (const sell of sells) {
+      if (sell.solAmount > largestSellSol) largestSellSol = sell.solAmount;
     }
-    const largestWinShare = totalPnlSol > 0 ? largestWinSol / totalPnlSol : 1;
+    const largestWinShare = totalSellSol > 0 ? largestSellSol / totalSellSol : 1;
 
-    // Step 9: Active months (longevity) — use the deep history check, not just sampled trades
-    const firstTradeTime = oldestKnownTimestamp || completedTrades[0]?.timestamp || 0;
-    const lastTradeTime = newestTimestamp || completedTrades[completedTrades.length - 1]?.timestamp || 0;
+    // Active months (longevity)
+    const firstTradeTime = oldestKnownTimestamp || allSwaps[0]?.timestamp || 0;
+    const lastTradeTime = newestTimestamp || allSwaps[allSwaps.length - 1]?.timestamp || 0;
     const activeMonths = Math.max(0, (lastTradeTime - firstTradeTime) / (30 * 24 * 60 * 60));
 
-    // Step 10: Monthly P&L consistency check
+    // Monthly P&L consistency
     const monthlyPnl = new Map();
-    for (const trade of completedTrades) {
-      const monthKey = new Date(trade.timestamp * 1000).toISOString().slice(0, 7); // YYYY-MM
+    for (const swap of allSwaps) {
+      const monthKey = new Date(swap.timestamp * 1000).toISOString().slice(0, 7);
       const current = monthlyPnl.get(monthKey) || 0;
-      monthlyPnl.set(monthKey, current + trade.pnlSol);
+      const impact = swap.direction === 'sell' ? swap.solAmount : -swap.solAmount;
+      monthlyPnl.set(monthKey, current + impact);
     }
     const profitableMonths = [...monthlyPnl.values()].filter(pnl => pnl > 0).length;
     const totalMonthsTraded = monthlyPnl.size;
     const monthlyConsistency = totalMonthsTraded > 0 ? profitableMonths / totalMonthsTraded : 0;
 
-    // Step 11: Composite score
-    // Weighted: winRate (30%), consistency (25%), avgProfit (20%), longevity (15%), low drawdown (10%)
-    const drawdownScore = Math.max(0, 1 - (maxDrawdownPct / 50)); // 0% dd = 1.0, 50% dd = 0
-    const longevityScore = Math.min(1, activeMonths / 6);          // 6+ months = 1.0
-    const tradeVolumeScore = Math.min(1, estimatedTotalTrades / 1000); // 1000+ = 1.0
+    // Avg profit per swap in SOL terms
+    const avgProfit = netSolFlow / totalSwaps;
+
+    // Estimated total trades from signature count
+    const swapRatio = allSwaps.length / Math.max(recentSigs.length, 1);
+    const estimatedTotalTrades = Math.floor(totalEstimatedSigs * swapRatio);
+
+    // Composite score
+    const drawdownScore = Math.max(0, 1 - (maxDrawdownPct / 50));
+    const longevityScore = Math.min(1, activeMonths / 6);
+    const tradeVolumeScore = Math.min(1, estimatedTotalTrades / 500);
+    const profitabilityScore = netSolFlow > 0 ? Math.min(1, netSolFlow / 5) : 0; // Up to 5 SOL profit = 1.0
 
     const score = (
-      (winRate * 0.30) +
-      (monthlyConsistency * 0.25) +
-      (Math.min(avgProfit, 1) * 0.20) + // Cap avg profit contribution
+      (winRate * 0.25) +
+      (profitabilityScore * 0.25) +
+      (monthlyConsistency * 0.20) +
       (longevityScore * 0.15) +
-      (drawdownScore * 0.10)
-    ) * tradeVolumeScore * 100; // Scale up for readability
+      (drawdownScore * 0.15)
+    ) * tradeVolumeScore * 100;
+
+    // Skip unprofitable wallets entirely
+    if (netSolFlow <= 0 && winRate < 0.5) {
+      log('DISCOVERY', `${address.slice(0, 8)}... — unprofitable (net ${netSolFlow.toFixed(4)} SOL, ${(winRate * 100).toFixed(0)}% WR), skipping`);
+      return null;
+    }
 
     log('DISCOVERY', `${address.slice(0, 8)}... scored`, {
-      totalTrades: `${totalTrades} sampled (~${estimatedTotalTrades} est)`,
+      swaps: `${totalSwaps} (${buys.length}B/${sells.length}S)`,
+      estTotal: estimatedTotalTrades,
+      netSOL: `${netSolFlow >= 0 ? '+' : ''}${netSolFlow.toFixed(4)}`,
       winRate: `${(winRate * 100).toFixed(1)}%`,
-      recentWinRate: recentWinRate !== null ? `${(recentWinRate * 100).toFixed(1)}%` : 'N/A',
-      maxDrawdown: `${maxDrawdownPct.toFixed(1)}%`,
-      largestWinShare: `${(largestWinShare * 100).toFixed(1)}%`,
-      activeMonths: activeMonths.toFixed(1),
-      monthlyConsistency: `${(monthlyConsistency * 100).toFixed(0)}%`,
+      recentWR: recentWinRate !== null ? `${(recentWinRate * 100).toFixed(1)}%` : 'N/A',
+      maxDD: `${maxDrawdownPct.toFixed(1)}%`,
+      topSellShare: `${(largestWinShare * 100).toFixed(1)}%`,
+      months: activeMonths.toFixed(1),
+      consistency: `${(monthlyConsistency * 100).toFixed(0)}%`,
       score: score.toFixed(2),
     });
 
@@ -567,10 +558,10 @@ async function scoreWallet(address) {
       profitableMonths,
       totalMonthsTraded,
       totalTrades: estimatedTotalTrades,
-      sampledTrades: totalTrades,
-      wins,
-      losses,
-      totalPnlSol: equity,
+      sampledTrades: totalSwaps,
+      wins: profitableSells,
+      losses: sells.length - profitableSells,
+      totalPnlSol: netSolFlow,
     };
   } catch (e) {
     log('WARN', `Failed to score wallet ${address.slice(0, 8)}`, { error: e.message });
