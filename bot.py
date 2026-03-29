@@ -48,9 +48,6 @@ DEAD_PRICE_STRIKES   = int(os.getenv("DEAD_PRICE_STRIKES",   "5"))       # 5 ide
 # Anti-rug
 MAX_TOP_HOLDER_PCT   = float(os.getenv("MAX_TOP_HOLDER_PCT",  "20"))
 
-# Daily risk management
-DAILY_MAX_LOSS_SOL   = float(os.getenv("DAILY_MAX_LOSS_SOL",  "0.07"))   # ~$10 at ~$165/SOL
-
 # Env — credentials
 DISCORD_WEBHOOK_URL  = os.getenv("DISCORD_WEBHOOK_URL", "")
 SOLANA_RPC_URL       = os.getenv("SOLANA_RPC_URL",      "")
@@ -135,61 +132,75 @@ class Grok:
     """
 
     async def _fetch_candidates(self, exclude_mints: set) -> list:
-        """Pull trending/new Solana tokens from Dexscreener with tiered filtering."""
+        """Pull trending/new Solana tokens from multiple Dexscreener endpoints."""
         import time as _t
         mints = []
 
+        async def _get_json(url):
+            try:
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(url, timeout=aiohttp.ClientTimeout(total=12)) as r:
+                        if r.status == 200:
+                            return await r.json()
+            except Exception as e:
+                log.debug(f"Fetch {url[:50]}: {e}")
+            return None
+
         # 1. Boosted/trending tokens
-        try:
-            async with aiohttp.ClientSession() as sess:
-                async with sess.get(
-                    "https://api.dexscreener.com/token-boosts/top/v1",
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as r:
-                    if r.status == 200:
-                        items = await r.json()
-                        mints += [
-                            i.get("tokenAddress", "") for i in (items or [])
-                            if i.get("chainId") == "solana" and i.get("tokenAddress", "")
-                        ][:30]
-        except Exception as e:
-            log.debug(f"Dexscreener boost: {e}")
+        data = await _get_json("https://api.dexscreener.com/token-boosts/top/v1")
+        if data:
+            mints += [
+                i.get("tokenAddress", "") for i in (data if isinstance(data, list) else [])
+                if i.get("chainId") == "solana" and i.get("tokenAddress", "")
+            ][:30]
 
-        # 2. New pairs (last 24h) — captures fresh momentum plays
-        try:
-            async with aiohttp.ClientSession() as sess:
-                async with sess.get(
-                    "https://api.dexscreener.com/latest/dex/search?q=solana&sort=v24hUSD",
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as r:
-                    if r.status == 200:
-                        d = await r.json()
-                        for pair in (d.get("pairs") or [])[:30]:
-                            m = pair.get("baseToken", {}).get("address", "")
-                            if m and m not in mints:
-                                mints.append(m)
-        except Exception as e:
-            log.debug(f"Dexscreener search: {e}")
+        # 2. Latest boosts (different from top — catches newer ones)
+        data = await _get_json("https://api.dexscreener.com/token-boosts/latest/v1")
+        if data:
+            for i in (data if isinstance(data, list) else []):
+                if i.get("chainId") == "solana":
+                    m = i.get("tokenAddress", "")
+                    if m and m not in mints:
+                        mints.append(m)
 
-        # Remove already-held positions
+        # 3. Trending pairs by volume on Solana
+        data = await _get_json("https://api.dexscreener.com/latest/dex/search/?q=SOL")
+        if data:
+            for pair in (data.get("pairs") or [])[:40]:
+                if pair.get("chainId") == "solana":
+                    m = pair.get("baseToken", {}).get("address", "")
+                    if m and m not in mints:
+                        mints.append(m)
+
+        # 4. Top gainers — pump.fun style new tokens with momentum
+        data = await _get_json(
+            "https://api.dexscreener.com/latest/dex/search/?q=pump"
+        )
+        if data:
+            for pair in (data.get("pairs") or [])[:30]:
+                if pair.get("chainId") == "solana":
+                    m = pair.get("baseToken", {}).get("address", "")
+                    if m and m not in mints:
+                        mints.append(m)
+
+        # Remove already-held mints
         mints = [m for m in mints if m not in exclude_mints]
 
         # Deduplicate
         seen = set()
         unique = []
         for m in mints:
-            if m and m not in seen:
+            if m and len(m) >= 32 and m not in seen:
                 seen.add(m)
                 unique.append(m)
-        mints = unique[:40]
+        mints = unique[:60]  # bigger pool = more for Grok to pick from
 
-        log.info(f"Checking {len(mints)} candidate tokens...")
-        tier1, tier2, tier3 = [], [], []
+        log.info(f"Fetched {len(mints)} unique mints — pulling Dexscreener data...")
+
+        candidates = []
 
         async with aiohttp.ClientSession() as sess:
             for mint in mints:
-                if not mint or len(mint) < 32:
-                    continue
                 try:
                     async with sess.get(
                         f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
@@ -223,7 +234,15 @@ class Grok:
                     price_usd  = p.get("priceUsd", "0") or "0"
                     age_h      = (_t.time() - created_at / 1000) / 3600 if created_at > 0 else 9999
 
-                    coin = {
+                    # Only hard filters — let Grok decide the rest
+                    if liquidity < 8_000:
+                        continue   # truly no liquidity
+                    if chg24h > 500:
+                        continue   # already 5x'd, too late
+                    if v5m == 0 and v1h == 0:
+                        continue   # completely dead, no trading at all
+
+                    candidates.append({
                         "mint": mint, "symbol": symbol, "name": name,
                         "price_usd": price_usd, "age_hours": round(age_h, 1),
                         "liquidity": liquidity, "mcap": mcap,
@@ -232,40 +251,18 @@ class Grok:
                         "chg_6h": chg6h, "chg_24h": chg24h,
                         "buys_5m": buys5m, "sells_5m": sells5m,
                         "buys_1h": buys1h, "sells_1h": sells1h,
-                    }
-
-                    # Hard pre-filters — don't even send garbage to Grok
-                    if liquidity < 10_000:
-                        continue
-                    if chg24h > 300:
-                        continue  # Already pumped out — skip
-                    if buys5m == 0 and v5m < 1000:
-                        continue  # No activity
-
-                    # Tier 1: strong signal
-                    if (age_h >= 1 and liquidity >= 50_000 and
-                            chg1h > 0 and buys5m > sells5m):
-                        tier1.append(coin)
-                    # Tier 2: moderate signal
-                    elif age_h >= 0.5 and liquidity >= 20_000 and chg5m > 0:
-                        tier2.append(coin)
-                    # Tier 3: at least has some liquidity and activity
-                    else:
-                        tier3.append(coin)
+                    })
 
                 except Exception as e:
                     log.debug(f"Candidate {mint[:16]}: {e}")
                     continue
 
-        if tier1:
-            log.info(f"Tier 1: {len(tier1)} strong candidates")
-            return sorted(tier1, key=lambda x: x["volume_5m"], reverse=True)[:20]
-        elif tier2:
-            log.info(f"Tier 2: {len(tier2)} moderate candidates")
-            return sorted(tier2, key=lambda x: x["volume_5m"], reverse=True)[:20]
-        else:
-            log.info(f"Tier 3: {len(tier3)} fallback candidates")
-            return sorted(tier3, key=lambda x: x["liquidity"], reverse=True)[:20]
+        # Sort by 5m volume descending — best momentum first
+        candidates.sort(key=lambda x: x["volume_5m"], reverse=True)
+        candidates = candidates[:25]  # send top 25 to Grok
+
+        log.info(f"Passing {len(candidates)} candidates to Grok")
+        return candidates
 
     async def score_candidates(self, candidates: list, current_positions: int) -> list:
         """
@@ -275,7 +272,7 @@ class Grok:
         Only returns tokens with score >= GROK_MIN_SCORE.
         """
         if not GROK_API_KEY or not candidates:
-            return []
+            return [], []
 
         from datetime import datetime, timezone
         now_str = datetime.now(timezone.utc).strftime("%A, %B %d, %Y at %H:%M UTC")
@@ -298,29 +295,41 @@ class Grok:
 
         slots_free = MAX_POSITIONS - current_positions
 
-        prompt = f"""Today is {now_str}. You are a professional Solana momentum trader analyzing {len(candidates)} tokens.
+        prompt = f"""Today is {now_str}. You are an aggressive Solana momentum trader. Your goal is to FIND trades, not avoid them.
 
-I have {slots_free} open position slots. I will BUY tokens that score >= {GROK_MIN_SCORE}/100.
+I have {slots_free} open position slots. I want to fill them.
 
-LIVE DEXSCREENER DATA:
+LIVE DEXSCREENER DATA ({len(candidates)} tokens):
 {coin_list}
 
-EXIT STRATEGY (so you know what you're scoring for):
-- Take profit: +15% sell 50%, +25% sell 25%, +40% sell remainder
-- Stop loss: -7% instant full exit
+MY EXIT STRATEGY:
+- +15% → sell 50% (quick profit lock)
+- +25% → sell 25% more
+- +40% → sell remainder
+- -7% → full stop loss
 - Max hold: 2 hours
-- Volume dry-up exit: if volume drops 30% or price stalls 12 min
 
-SCORING CRITERIA (aggressive short-term momentum):
-1. MOMENTUM ALIGNMENT: Is price UP across 5m + 1h? Multi-timeframe agreement = reliable
-2. BUY PRESSURE: High buys vs sells ratio in both 5m and 1h
-3. VOLUME VELOCITY: High 5m volume relative to 1h average = acceleration
-4. ROOM TO RUN: <200% gains in 24h preferred — not already exhausted
-5. LIQUIDITY SAFETY: Enough liquidity that my $2 buy won't spike or my sell won't crash it
-6. RUG RISK: Very new tokens (<30min), very low liquidity (<$15K), or suspicious patterns = score penalty
-7. YOUR KNOWLEDGE: Any fundamental, narrative, or social signal you know about this specific token
+SCORE EACH TOKEN 1-100 for short-term pump potential in the next 1-2 hours.
 
-RETURN FORMAT — respond ONLY with valid JSON, no markdown, no extra text:
+HIGH SCORE (75+) means: ANY of these are true:
+- Active buy pressure right now (buys > sells in 5m or 1h)
+- Price moving UP in 5m and/or 1h
+- High volume relative to market cap (volume velocity)
+- New token with early momentum (can 2-5x fast)
+- Token you have positive knowledge about from Twitter/news
+
+LOW SCORE (under 50) means:
+- More sells than buys consistently
+- Already dumped 24h and no recovery
+- Zero volume, dead
+
+MODERATE (50-74): Has something going for it but not a clear signal
+
+BE AGGRESSIVE: If a token has ANY positive momentum signal, score it 70+.
+Only score below 50 if it's clearly dead or dumping.
+You SHOULD be approving multiple tokens per scan — I want to be in trades.
+
+RETURN ONLY valid JSON, no markdown:
 {{
   "analysis": [
     {{
@@ -329,17 +338,16 @@ RETURN FORMAT — respond ONLY with valid JSON, no markdown, no extra text:
       "score": <1-100>,
       "decision": "BUY" or "SKIP",
       "confidence": "high" or "medium" or "low",
-      "reason": "<one sentence: why this score, cite the specific data>"
+      "reason": "<cite specific data: volume, price change, buy/sell ratio>"
     }}
   ]
 }}
 
-DECISION RULES:
-- score >= {GROK_MIN_SCORE} → set decision to "BUY"
-- score < {GROK_MIN_SCORE} → set decision to "SKIP"
-- Score every single token — do not skip any
-- Be STRICT: most tokens should score below {GROK_MIN_SCORE}. Only genuinely high-conviction setups should be BUY.
-- A high score means: strong buy pressure NOW, momentum clearly present, liquidity good, not overextended"""
+Rules:
+- score >= {GROK_MIN_SCORE} → "BUY"
+- score < {GROK_MIN_SCORE} → "SKIP"
+- Score ALL {len(candidates)} tokens
+- Aim to approve at least {max(1, slots_free // 2)} tokens if the data supports it"""
 
         try:
             async with aiohttp.ClientSession() as sess:
@@ -355,7 +363,7 @@ DECISION RULES:
                 ) as r:
                     if r.status != 200:
                         log.error(f"Grok API {r.status}: {(await r.text())[:200]}")
-                        return []
+                        return [], []
                     data = await r.json()
 
             raw = data["choices"][0]["message"]["content"].strip()
@@ -372,6 +380,7 @@ DECISION RULES:
             analysis = parsed.get("analysis", [])
 
             results = []
+            skipped = []
             for item in analysis:
                 n = int(item.get("number", 1)) - 1
                 if n < 0 or n >= len(candidates):
@@ -384,26 +393,29 @@ DECISION RULES:
 
                 log.info(f"  [{score:3d}] {symbol:12s} → {decision:4s} ({conf}) | {reason[:80]}")
 
+                entry = {
+                    "mint":       candidates[n]["mint"],
+                    "symbol":     candidates[n]["symbol"],
+                    "name":       candidates[n]["name"],
+                    "score":      score,
+                    "confidence": conf,
+                    "reason":     reason,
+                    "data":       candidates[n],
+                }
                 if decision == "BUY" and score >= GROK_MIN_SCORE:
-                    results.append({
-                        "mint":       candidates[n]["mint"],
-                        "symbol":     candidates[n]["symbol"],
-                        "name":       candidates[n]["name"],
-                        "score":      score,
-                        "confidence": conf,
-                        "reason":     reason,
-                        "data":       candidates[n],
-                    })
+                    results.append(entry)
+                else:
+                    skipped.append(entry)
 
             results.sort(key=lambda x: x["score"], reverse=True)
             log.info(f"Grok approved {len(results)}/{len(candidates)} tokens for buying")
-            return results
+            return results, skipped
 
         except json.JSONDecodeError as e:
             log.error(f"Grok JSON parse error: {e}")
         except Exception as e:
             log.error(f"Grok score error: {e}")
-        return []
+        return [], []
 
 # ─── JUPITER ─────────────────────────────────────────────────────────────────
 
@@ -617,148 +629,126 @@ class Discord:
             "title": "🤖 WINSTON v2.0 — ONLINE",
             "color": 0x00FF88,
             "description": (
-                f"Multi-position Grok sniper active\n"
-                f"Balance: **{bal:.4f} SOL** (${usd:.2f})\n"
-                f"Trade size: **{TRADE_AMOUNT_SOL} SOL** (~${TRADE_AMOUNT_SOL*sol_usd:.2f}) per position\n"
-                f"Max positions: **{MAX_POSITIONS}** | Scan every **{SCAN_INTERVAL_MINS:.0f} min**\n"
-                f"Grok min score: **{GROK_MIN_SCORE}/100**\n"
-                f"Exit: +{TP1_PCT:.0f}% sell 50% | +{TP2_PCT:.0f}% sell 25% | +{TP3_PCT:.0f}% sell 25%\n"
-                f"Stop loss: **-{STOP_LOSS_PCT:.0f}%**"
-            ),
-            "fields": [
-                {"name": "Daily max loss", "value": f"{DAILY_MAX_LOSS_SOL:.4f} SOL (${DAILY_MAX_LOSS_SOL*sol_usd:.2f})", "inline": True},
-                {"name": "Max hold", "value": f"{MAX_HOLD_MINUTES:.0f} min", "inline": True},
-            ]
+                f"Balance: **{bal:.4f} SOL** (${usd:.2f}) | "
+                f"Trade size: **{TRADE_AMOUNT_SOL} SOL** (~${TRADE_AMOUNT_SOL*sol_usd:.2f}) | "
+                f"Max: **{MAX_POSITIONS} positions** | "
+                f"Scan every **{SCAN_INTERVAL_MINS:.0f} min**\n"
+                f"Exit: +{TP1_PCT:.0f}% 50% → +{TP2_PCT:.0f}% 25% → +{TP3_PCT:.0f}% 25% | "
+                f"Stop: **-{STOP_LOSS_PCT:.0f}%** | Max hold: {MAX_HOLD_MINUTES:.0f}min"
+            )
         }]})
 
-    async def scan_start(self, n_candidates: int, n_positions: int):
-        await self.send({"content":
-            f"🔍 **Grok scan started** — {n_candidates} candidates | "
-            f"{n_positions}/{MAX_POSITIONS} slots filled"
-        })
+    async def grok_results(self, approved: list, skipped: list, total: int):
+        """Post one clean summary of what Grok decided this scan."""
+        buy_lines  = []
+        skip_lines = []
 
-    async def grok_results(self, approved: list, total: int):
-        if not approved:
-            await self.send({"content":
-                f"🤖 Grok scanned {total} tokens — **no buys** this round"
-            })
-            return
-        fields = []
         for item in approved:
             d = item.get("data", {})
-            fields.append({
-                "name": f"✅ {item['symbol']} [{item['score']}/100] {item['confidence'].upper()}",
-                "value": (
-                    f"{item['reason'][:200]}\n"
-                    f"Liq: ${d.get('liquidity', 0):,.0f} | "
-                    f"Vol5m: ${d.get('volume_5m', 0):,.0f} | "
-                    f"1h: {d.get('chg_1h', 0):+.1f}%"
-                ),
-                "inline": False
-            })
+            buy_lines.append(
+                f"✅ **{item['symbol']}** [{item['score']}/100] {item['confidence'].upper()}\n"
+                f"  ↳ {item['reason'][:160]}"
+            )
+
+        for item in skipped[:8]:  # cap skip list at 8
+            skip_lines.append(
+                f"⏭ {item['symbol']} [{item['score']}/100] — {item['reason'][:80]}"
+            )
+
+        desc = ""
+        if buy_lines:
+            desc += "\n".join(buy_lines)
+        else:
+            desc += "_No buys this round_"
+
+        if skip_lines:
+            desc += "\n\n**Skipped:**\n" + "\n".join(skip_lines)
+
         await self.send({"embeds": [{
-            "title": f"🤖 Grok approved {len(approved)}/{total} tokens",
-            "color": 0xAA00FF,
-            "fields": fields
+            "title": f"🤖 Grok Scan — {len(approved)} BUY / {total - len(approved)} SKIP",
+            "color": 0xAA00FF if approved else 0x555555,
+            "description": desc[:3900]
         }]})
 
-    async def bought(self, pos: Position, sol_usd: float):
+    async def bought(self, pos: "Position", sol_usd: float):
         label = pos.token.symbol if pos.token.symbol != "???" else pos.token.mint[:8]
-        entry_usd = pos.entry_price * 1  # price is in USD terms
         await self.send({"embeds": [{
-            "title": f"💸 BOUGHT — {label} [Grok: {pos.grok_score}/100]",
+            "title": f"💸 BOUGHT — {label}",
             "color": 0x00AAFF,
             "description": (
-                f"In: **{pos.cost_sol:.4f} SOL** (${pos.cost_sol*sol_usd:.2f})\n"
-                f"Entry: **${pos.entry_price:.8f}**\n"
-                f"Grok: *{pos.grok_reason[:200]}*"
+                f"Grok score: **{pos.grok_score}/100**\n"
+                f"_{pos.grok_reason[:200]}_\n\n"
+                f"Entry: **${pos.entry_price:.8f}** | Cost: **{pos.cost_sol:.4f} SOL** (${pos.cost_sol*sol_usd:.2f})\n"
+                f"TP1 +{TP1_PCT:.0f}%: ${pos.entry_price*1.15:.8f} → sell 50%\n"
+                f"TP2 +{TP2_PCT:.0f}%: ${pos.entry_price*1.25:.8f} → sell 25%\n"
+                f"TP3 +{TP3_PCT:.0f}%: ${pos.entry_price*1.40:.8f} → sell 25%\n"
+                f"Stop: ${pos.entry_price*(1-STOP_LOSS_PCT/100):.8f} (-{STOP_LOSS_PCT:.0f}%)"
             ),
-            "fields": [
-                {"name": "TP1 (+15%)", "value": f"${pos.entry_price * 1.15:.8f} → sell 50%", "inline": True},
-                {"name": "TP2 (+25%)", "value": f"${pos.entry_price * 1.25:.8f} → sell 25%", "inline": True},
-                {"name": "TP3 (+40%)", "value": f"${pos.entry_price * 1.40:.8f} → sell 25%", "inline": True},
-                {"name": "Stop Loss", "value": f"${pos.entry_price * (1 - STOP_LOSS_PCT/100):.8f} (-{STOP_LOSS_PCT:.0f}%)", "inline": True},
-                {"name": "Max Hold", "value": f"{MAX_HOLD_MINUTES:.0f} min", "inline": True},
-                {"name": "Chart", "value": f"[Dex](https://dexscreener.com/solana/{pos.token.mint}) | [Solscan](https://solscan.io/token/{pos.token.mint})", "inline": True},
-            ]
+            "fields": [{
+                "name": "Chart",
+                "value": f"[Dex](https://dexscreener.com/solana/{pos.token.mint}) | [Solscan](https://solscan.io/token/{pos.token.mint})",
+                "inline": False
+            }]
         }]})
 
-    async def sold(self, pos: Position, reason: str, gain_pct: float,
+    async def sold(self, pos: "Position", reason: str, gain_pct: float,
                    pnl_sol: float, pct_sold: int, sol_usd: float, price: float):
-        label    = pos.token.symbol if pos.token.symbol != "???" else pos.token.mint[:8]
+        label     = pos.token.symbol if pos.token.symbol != "???" else pos.token.mint[:8]
         is_profit = pnl_sol >= 0
-        color    = 0x00FF88 if is_profit else 0xFF4444
-        emoji    = "✅" if is_profit else "❌"
-        pnl_str  = f"+{pnl_sol:.5f} SOL" if is_profit else f"{pnl_sol:.5f} SOL"
-        pnl_usd  = f"+${abs(pnl_sol)*sol_usd:.2f}" if is_profit else f"-${abs(pnl_sol)*sol_usd:.2f}"
+        color     = 0x00FF88 if is_profit else 0xFF4444
+        emoji     = "✅" if is_profit else "❌"
+        pnl_str   = f"+{pnl_sol:.5f} SOL (+${abs(pnl_sol)*sol_usd:.2f})" if is_profit \
+                    else f"{pnl_sol:.5f} SOL (-${abs(pnl_sol)*sol_usd:.2f})"
 
         reason_map = {
-            "tp1":        "TP1 hit: +15% 🎯",
-            "tp2":        "TP2 hit: +25% 🎯🎯",
-            "tp3":        "TP3 hit: +40% 🎯🎯🎯",
-            "stop_loss":  f"Stop Loss: -{STOP_LOSS_PCT:.0f}% 🛑",
-            "timeout":    f"Max hold: {MAX_HOLD_MINUTES:.0f}min ⏰",
-            "volume_dry": "Volume dried up 📉",
+            "tp1":        f"TP1 hit +{TP1_PCT:.0f}% 🎯",
+            "tp2":        f"TP2 hit +{TP2_PCT:.0f}% 🎯🎯",
+            "tp3":        f"TP3 hit +{TP3_PCT:.0f}% 🎯🎯🎯",
+            "stop_loss":  f"Stop Loss -{STOP_LOSS_PCT:.0f}% 🛑",
+            "timeout":    f"Max hold {MAX_HOLD_MINUTES:.0f}min ⏰",
             "stall":      "Price stalled 😴",
             "price_dead": "No price feed 📡",
-            "manual":     "Manual exit 👋",
         }
 
         await self.send({"embeds": [{
-            "title": f"{emoji} SOLD {pct_sold}% — {label}",
+            "title": f"{emoji} SOLD {pct_sold}% — {label} [{gain_pct:+.1f}%]",
             "color": color,
             "description": (
-                f"**{pnl_str}** ({pnl_usd}) | {gain_pct:+.1f}% | {pos.hold_mins:.1f}min hold\n"
-                f"Reason: {reason_map.get(reason, reason)}"
-            ),
-            "fields": [
-                {"name": "Exit Price", "value": f"${price:.8f}", "inline": True},
-                {"name": "Grok Score", "value": f"{pos.grok_score}/100", "inline": True},
-                {"name": "Chart", "value": f"[Dex](https://dexscreener.com/solana/{pos.token.mint})", "inline": True},
-            ]
+                f"**{pnl_str}**\n"
+                f"Reason: {reason_map.get(reason, reason)} | "
+                f"Hold: {pos.hold_mins:.1f}min | "
+                f"Score was: {pos.grok_score}/100"
+            )
         }]})
 
     async def heartbeat(self, positions: list, stats: dict, bal: float, sol_usd: float):
+        """Hourly summary — open positions + running totals."""
         pos_lines = []
         for p in positions:
             label  = p.token.symbol if p.token.symbol != "???" else p.token.mint[:8]
-            price  = stats.get(f"price_{p.token.mint}", p.entry_price)
-            gain   = ((price / p.entry_price) - 1) * 100 if p.entry_price > 0 else 0
+            cached = stats.get(f"price_{p.token.mint}", p.entry_price)
+            gain   = ((cached / p.entry_price) - 1) * 100 if p.entry_price > 0 else 0
             pos_lines.append(
-                f"• **{label}** | {gain:+.1f}% | {p.hold_mins:.0f}min | Score: {p.grok_score}"
+                f"• **{label}** {gain:+.1f}% | {p.hold_mins:.0f}min | {p.grok_score}/100"
             )
 
         pnl_usd = stats["total_pnl"] * sol_usd
         pnl_str = f"+${pnl_usd:.2f}" if pnl_usd >= 0 else f"-${abs(pnl_usd):.2f}"
 
-        await self.send({"embeds": [{
-            "title": "💓 Winston v2.0 — Heartbeat",
-            "color": 0x888888,
-            "description": (
-                f"Balance: **{bal:.4f} SOL** | "
-                f"{stats['wins']}W / {stats['losses']}L | "
-                f"Net: **{pnl_str}**\n"
-                f"Positions: **{len(positions)}/{MAX_POSITIONS}**\n"
-                + ("\n".join(pos_lines) if pos_lines else "_No open positions_")
-            ),
-            "fields": [
-                {"name": "Daily PnL", "value": f"{stats['daily_pnl']:+.5f} SOL", "inline": True},
-                {"name": "Uptime", "value": f"{stats['uptime_mins']:.0f} min", "inline": True},
-            ]
-        }]})
+        desc = (
+            f"**{stats['wins']}W / {stats['losses']}L** | Net: **{pnl_str}** | "
+            f"Bal: {bal:.4f} SOL | Up: {stats['uptime_mins']:.0f}min\n"
+            f"Positions: **{len(positions)}/{MAX_POSITIONS}**\n"
+        )
+        if pos_lines:
+            desc += "\n".join(pos_lines)
+        else:
+            desc += "_No open positions_"
 
-    async def alert(self, msg: str, color: int = 0xFFAA00):
-        await self.send({"embeds": [{"description": msg, "color": color}]})
-
-    async def daily_stop(self, lost_sol: float, sol_usd: float):
         await self.send({"embeds": [{
-            "title": "🚫 DAILY LOSS LIMIT HIT — TRADING STOPPED",
-            "color": 0xFF0000,
-            "description": (
-                f"Lost **{lost_sol:.5f} SOL** (${lost_sol*sol_usd:.2f}) today\n"
-                f"Limit: {DAILY_MAX_LOSS_SOL:.4f} SOL\n"
-                f"Bot will restart fresh tomorrow"
-            )
+            "title": "💓 Winston v2.0",
+            "color": 0x444444,
+            "description": desc
         }]})
 
 # ─── ANTI-RUG ────────────────────────────────────────────────────────────────
@@ -809,9 +799,6 @@ class Bot:
         self.wins          = 0
         self.losses        = 0
         self.total_pnl     = 0.0
-        self.daily_pnl     = 0.0
-        self.day_start     = time.time()
-        self.trading_halted = False
 
         # For price polling each position
         self._price_cache: dict = {}  # mint -> (price, ts)
@@ -827,7 +814,6 @@ class Bot:
         log.info(f"  Scan every: {SCAN_INTERVAL_MINS} min")
         log.info(f"  TP1 +{TP1_PCT}% 50% | TP2 +{TP2_PCT}% 25% | TP3 +{TP3_PCT}% 25%")
         log.info(f"  Stop: -{STOP_LOSS_PCT}% | Max hold: {MAX_HOLD_MINUTES}min")
-        log.info(f"  Daily max loss: {DAILY_MAX_LOSS_SOL} SOL")
         log.info(f"  Grok: {'✅ ENABLED' if GROK_API_KEY else '❌ NOT SET'}")
         log.info("=" * 60)
 
@@ -861,18 +847,9 @@ class Bot:
 
     async def _do_scan(self):
         """One full scan: fetch candidates → Grok scores → buy approved."""
-        if self.trading_halted:
-            log.info("Trading halted (daily loss limit) — skipping scan")
-            return
-
         open_slots = MAX_POSITIONS - len(self.positions)
         if open_slots <= 0:
             log.info(f"All {MAX_POSITIONS} slots full — skipping scan")
-            return
-
-        # Check daily loss limit
-        if self._daily_pnl_exceeded():
-            await self._halt_trading()
             return
 
         log.info(f"=== SCAN START | {len(self.positions)}/{MAX_POSITIONS} positions open ===")
@@ -881,16 +858,13 @@ class Bot:
         candidates = await self.grok._fetch_candidates(self.held_mints)
         if not candidates:
             log.warning("No candidates found this scan")
-            await self.discord.alert("🔍 Scan complete — no candidates passed pre-filter")
             return
-
-        await self.discord.scan_start(len(candidates), len(self.positions))
 
         # Ask Grok to score them
         log.info(f"Sending {len(candidates)} candidates to Grok...")
-        approved = await self.grok.score_candidates(candidates, len(self.positions))
+        approved, skipped = await self.grok.score_candidates(candidates, len(self.positions))
 
-        await self.discord.grok_results(approved, len(candidates))
+        await self.discord.grok_results(approved, skipped, len(candidates))
 
         if not approved:
             log.info("Grok approved nothing — no trades this round")
@@ -909,7 +883,6 @@ class Bot:
             success = await self._open_position(item)
             if success:
                 bought += 1
-                # Small delay between buys
                 await asyncio.sleep(2)
 
         log.info(f"=== SCAN END | bought {bought} | {len(self.positions)}/{MAX_POSITIONS} positions ===")
@@ -927,7 +900,6 @@ class Bot:
         needed = TRADE_AMOUNT_SOL + 0.005
         if bal < needed:
             log.error(f"Insufficient balance: {bal:.4f} SOL (need {needed:.4f})")
-            await self.discord.alert(f"⚠️ Low balance: {bal:.4f} SOL — cannot open position for {symbol}")
             return False
 
         token = Token(mint=mint, symbol=symbol,
@@ -936,8 +908,7 @@ class Bot:
         log.info(f"Anti-rug check for {symbol}...")
         passed, rug_reason = await self.antirug.check(token)
         if not passed:
-            log.warning(f"SKIP {symbol}: anti-rug failed — {rug_reason}")
-            await self.discord.alert(f"🛡️ **Anti-rug BLOCK** — {symbol}: {rug_reason}")
+            log.warning(f"SKIP {symbol}: anti-rug — {rug_reason}")
             return False
 
         # Get entry price
@@ -1145,7 +1116,6 @@ class Bot:
         else:
             self.losses  += 1
         self.total_pnl  += pnl_sol
-        self.daily_pnl  += pnl_sol
 
         self.sol_usd = await self.jup.sol_usd()
         await self.discord.sold(pos, reason, gain_pct, pnl_sol, pct, self.sol_usd, price)
@@ -1179,7 +1149,6 @@ class Bot:
         else:
             self.losses += 1
         self.total_pnl += pnl_sol
-        self.daily_pnl += pnl_sol
 
         self.sol_usd = await self.jup.sol_usd()
         await self.discord.sold(pos, reason, gain_pct, pnl_sol, 100, self.sol_usd, price)
@@ -1220,30 +1189,11 @@ class Bot:
 
         return False
 
-    # ─── RISK MANAGEMENT ─────────────────────────────────────────────────────
-
-    def _daily_pnl_exceeded(self) -> bool:
-        # Reset daily counter at midnight UTC
-        now = time.time()
-        if now - self.day_start > 86400:
-            self.daily_pnl  = 0.0
-            self.day_start  = now
-            self.trading_halted = False
-            log.info("Daily PnL counter reset")
-
-        return self.daily_pnl <= -DAILY_MAX_LOSS_SOL
-
-    async def _halt_trading(self):
-        if not self.trading_halted:
-            self.trading_halted = True
-            log.warning(f"DAILY LOSS LIMIT HIT: {self.daily_pnl:.5f} SOL")
-            await self.discord.daily_stop(abs(self.daily_pnl), self.sol_usd)
-
     # ─── HEARTBEAT ───────────────────────────────────────────────────────────
 
     async def _heartbeat_loop(self):
         while True:
-            await asyncio.sleep(300)  # every 5 minutes
+            await asyncio.sleep(3600)  # every hour
             try:
                 bal = await self.sol.balance()
                 self.sol_usd = await self.jup.sol_usd()
@@ -1255,23 +1205,20 @@ class Bot:
                         price_stats[f"price_{p.token.mint}"] = cached[0]
 
                 stats = {
-                    "wins":       self.wins,
-                    "losses":     self.losses,
-                    "total_pnl":  self.total_pnl,
-                    "daily_pnl":  self.daily_pnl,
+                    "wins":        self.wins,
+                    "losses":      self.losses,
+                    "total_pnl":   self.total_pnl,
                     "uptime_mins": (time.time() - self.start_ts) / 60,
                     **price_stats,
                 }
 
-                uptime_mins = stats["uptime_mins"]
                 pnl_usd = self.total_pnl * self.sol_usd
                 pnl_str = f"+${pnl_usd:.2f}" if pnl_usd >= 0 else f"-${abs(pnl_usd):.2f}"
-                status = "HALTED" if self.trading_halted else f"{len(self.positions)}/{MAX_POSITIONS} pos"
 
                 log.info(
-                    f"HEARTBEAT [{status}] | up {uptime_mins:.0f}m | "
+                    f"HEARTBEAT | up {stats['uptime_mins']:.0f}m | "
                     f"{self.wins}W/{self.losses}L | net {self.total_pnl:+.5f} SOL ({pnl_str}) | "
-                    f"bal {bal:.4f} SOL"
+                    f"bal {bal:.4f} SOL | {len(self.positions)}/{MAX_POSITIONS} pos"
                 )
 
                 await self.discord.heartbeat(self.positions, stats, bal, self.sol_usd)
