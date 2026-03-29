@@ -1,12 +1,14 @@
 // ============================================================
-// WINSTON v9.1 — Dune Top Trader Copy Bot
+// WINSTON v9.2 — Discord Alert + Grok Analysis Bot
 // ============================================================
-// Copies trades from proven profitable wallets sourced from
-// Dune Analytics. One position at a time, tight fees.
+// Monitors top Dune wallets. On every buy/sell, sends a
+// Discord alert with Grok AI analysis (momentum score,
+// buy/skip recommendation, estimated hold time).
+// NO auto-trading — David makes the final call.
 // ============================================================
 
 require('dotenv').config();
-const { Connection, Keypair, VersionedTransaction, PublicKey } = require('@solana/web3.js');
+const { Connection, Keypair } = require('@solana/web3.js');
 const bs58 = require('bs58');
 const fetch = require('node-fetch');
 
@@ -17,26 +19,13 @@ const CONFIG = {
   HELIUS_API_KEY: process.env.HELIUS_API_KEY || '',
   get HELIUS_RPC() { return `https://mainnet.helius-rpc.com/?api-key=${this.HELIUS_API_KEY}`; },
   PRIVATE_KEY: process.env.WALLET_PRIVATE_KEY || process.env.PRIVATE_KEY || '',
-  JUPITER_QUOTE: 'https://lite-api.jup.ag/swap/v1/quote',
-  JUPITER_SWAP: 'https://lite-api.jup.ag/swap/v1/swap',
-  JUPITER_PRICE: 'https://lite-api.jup.ag/price/v2',
+  GROK_API_KEY: process.env.GROK_API_KEY || '',
   DISCORD_WEBHOOK: process.env.DISCORD_WEBHOOK_URL || process.env.DISCORD_WEBHOOK || '',
-
-  // Trading
-  MAX_SLIPPAGE_BPS: 200,
-  PRIORITY_FEE_LAMPORTS: 100000,
-  POSITION_SIZE_PCT: 0.85,
-  MAX_PRICE_IMPACT_PCT: 0.05,
-
-  // Exit strategy
-  STOP_LOSS_PCT: -15,
-  TAKE_PROFIT_1_PCT: 25,
-  TAKE_PROFIT_2_PCT: 50,
+  JUPITER_PRICE: 'https://lite-api.jup.ag/price/v2',
 
   // Timing
-  POLL_INTERVAL_MS: 4000,
-  PRICE_CHECK_INTERVAL_MS: 15000,
-  HEALTH_LOG_INTERVAL_MS: 120000,
+  POLL_INTERVAL_MS: 3000,          // Check wallets every 3s
+  HEALTH_LOG_INTERVAL_MS: 300000,  // Health log every 5min
 
   // Constants
   SOL_MINT: 'So11111111111111111111111111111111111111112',
@@ -45,93 +34,52 @@ const CONFIG = {
   JUPITER_PROGRAM: 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4',
   RAYDIUM_AMM: '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',
 
-  // Top wallets from Dune: https://dune.com/couldbebasic/top-traders
-  // Curated: 100%+ ROI, 50%+ WR, 5+ SOL balance, wallet age > 5 days
-  // Red flags removed: brand new wallets, low WR, 0% median ROI
-  TRACKED_WALLETS: [
-    // === PAGE 1 — Elite (200%+ ROI) ===
-    'FRhgF9TXCXyGfUiQ5WsdCGxHUmBXPseenTdnEA4UmUGi',  // 675% ROI, 73% WR, 150d old
-    '7z8hbNzmgYvRMNVk27TQm8xW3yXgAkwQVhA6Nht5WEkU',  // 420% ROI, 90% WR, 299d old
-    '61MQSdRgpe98pxMn6gcLH4M4MAFr8mAKuoTDFMwbpn6Y',  // 466% ROI, 100% WR, 113d old
-    'AjKCctQtCnCj48tR3YaGm1ZrQtURoodjfg6YKLy97Uub',  // 286% ROI, 95% WR, 11d old
-    'FEXornKkXE2u51WfCGVdEBsmrvquu9UvGPpM9gd986se',  // 242% ROI, 100% WR, 99d old
-    'CsKnRER9Sjpau8Mk9WTZkoBytB2uFnqdmLYR5GTGtaKz',  // 324% ROI, 71% WR
-    'ATFRUwvyMh61w2Ab6AZxUyxsAfiiuG1RqL6iv3Vi9q2B',  // 208% ROI, 100% WR, 450d old
-    'GJvBxoj79TqhvyafMpTPyu5CP5rEq2V9LnbfxtDqgYhS',  // 215% ROI, 81% WR, 56d old
-    'F7HXUvhmCjkHM1ePFCSRReXXbnCAKdiJMDFNfH8u8khG',  // 215% ROI, 86% WR, 135d old
-    '9jYMojHaJxyXsvVMN2foih8knXb5AXYkMmUnxjQT5BoJ',  // 202% ROI, 77% WR, 11d old
-    '8gDRLa498xXCdch3DvtvjCJ7C1joJ1BpftTDVZztxigv',  // 396% ROI, 50% WR, 16d old
-    '6wLkK9AKTcCLiB5mW7pyp9Fq9wchydyatk8XtxKdVHgn',  // 345% ROI, 60% WR, 297d old
-    '2M4Ka8W5i7eK9Z3zMpzbeYRsAVM4HtpwhtTnbmPDdiMn',  // 324% ROI, 60% WR
-    '8DqpugHmWXVcSAYaZs9W2jXnCE4Cx1XbNMsZYC8EU1JV',  // 237% ROI, 60% WR
-    '9p7PFT2HYhVKXDsvCZd43d8GRm1jQcWBH7tmawe96b6X',  // 237% ROI, 67% WR
-    'AnWgJ1csbod2tWS2mZNEyhxo1XWndhNVvzbchh81zZ8k',  // 404% ROI, 57% WR
-    'H5G1btoS96YZ6fcaDDhAo99A9p4RkenV9XKLw2aPCeaF',  // 228% ROI, 50% WR
-    'FYfSEsc5DxwKH2LbxNpWE9KiGvajN8bYVHSe1mk4oSDy',  // 204% ROI, 60% WR, 45d old
-
-    // === PAGE 1 — Strong (150-199% ROI) ===
-    '5VXyg5nXWtpjsNQvt6EXQPQ5ziZBnxhoXDYaz9ZBbXao',  // 199% ROI, 100% WR, 529d old
-    '683qAwQbpkiWpSfUsi49BKUcP4XqdJaxGaiBMK4etRvv',  // 186% ROI, 100% WR
-    's69tyCAuNtaXUFT6AXoTMPQnHbsSG4nW34qu8oRK9vG',   // 185% ROI, 50% WR, 210d old
-    'HfY4gNZUhicrjt8FHrHPhx41HtavVVYGmgpmPvaMDx6n',  // 181% ROI, 75% WR
-    '5vXih4GeYcfQv88R59B5sZaRYEwJzorKpCGhqjAmqTqu',  // 177% ROI, 83% WR, 503d old
-    '3P8JV5CSTvngRZv84v82ASD5mo8kBVxKMbk9Yx3TbosU',  // 177% ROI, 75% WR
-    'HWWaEmQCcVFaYweovWdPB2db44Kk7w5P1vMDLkoX8kFP',  // 176% ROI, 50% WR
-    'Gc2WT9QnTCLffWc88nKXwtqKVWh7djZeMy9yqZYXevi1',  // 174% ROI, 86% WR
-    '66svXsZH7NEEsSG6w8RZKmLCDX2csR5y9XFuYQSgszE8',  // 174% ROI, 70% WR
-    'AZZcxmxS89iv4bbu2t15i1xTaRafpDcAXGBfdTizS4AN',  // 173% ROI, 71% WR
-    'BpZB8BhLwCn8SG2cHieUCoK6Lq8f9hrohj1c5yGtGnZe',  // 171% ROI, 56% WR
-    'FvYsGPiQoG5A7aQsbQM7bR3VdjY2TKeG8xLwhBQMNQWY',  // 168% ROI, 100% WR, 237d old
-    'EY8kS2GvTL4vQmQFi6nN2dnGJSFQhwmEMdktYpyLRvtP',  // 167% ROI, 85% WR
-    'HXhnm8S1pd1KYjoYKrTFLAHnw6ED7nkrp3SmGGddtoLD',  // 167% ROI, 60% WR, 137d old
-    'BPHQrgjM2rBzxNMebMJsPCLki36X2tiNFLU2c1W8pD7q',  // 165% ROI, 50% WR
-    'GeSVoLkL3DQSxcw2zwTq8GrZ6HEGfqWH8BVcChj4UZcQ',  // 164% ROI, 67% WR
-    'BZWzvFQrqbT5Tb1T4F73SWKhM5auiPMDo9agb456HLTC',  // 156% ROI, 100% WR
-    '6WLquntFTiEh84JvH3R6fA1k5PQLSUouY7CmEMQwaj34',  // 153% ROI, 55% WR, 71d old
-    'EoC9UDaX4PgMPS49gnLkFJVjX4eoBWPi6iXAUZGwdTPj',  // 153% ROI, 58% WR
-    '4i88267TQpasJoL3Zv5C9Szq9XctMSHExmmQMWgBbFeB',  // 152% ROI, 60% WR, 90d old
-
-    // === PAGE 2 — Solid (120-149% ROI) ===
-    '4tzVuWHootaHdbY8DoguYpMe1RaNYd8xNiYYjWF8ZYit',  // 135% ROI, 75% WR
-    '55oiTxTRNAKP72hc1yuKd5LiMSkjp4drmPHnsmJvdE3c',  // 132% ROI, 50% WR
-    '7rtqMoobKfNKz7DyKTEdPQAQ9xk7Kpk75VZQQX8c6FxM',  // 132% ROI, 57% WR
-    'GvAyrpEM88uMYLp8QLUf7SRfqfsLNBEFhLctj2Hn8y9P',  // 131% ROI, 100% WR, 91d old
-    'tsZNG3Xo5kKJn8xmTAcCqeskarTQsrPnBFW4736jtWu',  // 128% ROI, 74% WR
-    '12KuEro7Cr7WjjxKTQ56TPdmUfVSuP6z7otP9KnNHWhK',  // 126% ROI, 60% WR, 200d old
-    '82hYg8UYV6VjEczaWT2Rrh3miMjHL2vfBwKApT9hV59u',  // 124% ROI, 56% WR
-    '9WTsj8VvY3QBLY69Z153upbLSS1thEqCeE5AK28GRG8X',  // 122% ROI, 75% WR
-    'DJGm2u3ZRJJaaobyPPDQB9dvpaKTutUo5y4CdxoywRBJ',  // 121% ROI, 100% WR, 303d old
-    '2FzChsNvEqRvX36jy4Gvpu9Xjv1pk6TBJct7pPVyeTJL',  // 119% ROI, 77% WR, 674d old
-    '8XjdJLcw5G7qzhh1tAUaHEsPHjyoU6Yr6QRD1kT43zKJ',  // 118% ROI, 57% WR
-    'AqpY5YrdXqsYyhCrXkSwqD6G8Umi1PL8hz4MJkjizrA7w',  // 118% ROI, 73% WR, 58d old
-    'ARchqCp5pSjGd6Bt6HAY1YF1dNMgCbZ91mVygBC6LdWT',  // 117% ROI, 67% WR
-    '85Aq4c1xQUDcHbb7z521pKysZVpf1YTXiZodkK9nPhov',  // 116% ROI, 56% WR, 133d old
-    'FWir4vJBJrDsKMmTLy9cPorrgtUhKRcr1n5CRCvciyFZ',  // 115% ROI, 60% WR
-    'ATHGRiHxar9FB7hTF2awkjzQjxKAUSNGPTAixqEUjX9M',  // 115% ROI, 77% WR
-    'FPp4xGY1pnCnGx1zDgiykUW9sssaY8kgkQBZrLCi1drD',  // 115% ROI, 57% WR, 680d old
-    '4ypxvwdjg7wDvEFLkhKBqCioRmDtKzu1z55C1Sah12Xv',  // 151% ROI, 100% WR, 482d old
-
-    // === PAGE 3 — Consistent (100-119% ROI) ===
-    'D9Eoby4puakYU3QX8aLGmQ3vqotWYk7V6YD7WtrKDfxw',  // 107% ROI, 56% WR, 126d old
-    'G9hxBRpp4iDtzrbYuMibM4UQZyTmmhJY9ci2i2mPdTw2',  // 106% ROI, 100% WR
-    '6i1UngrDzzdXur2kfXengdeDFRQRRz2KDCSkn5QAQMTP',  // 106% ROI, 60% WR
-    'EJEWyg2ZLmCq1uyKeWZz9L7z6FQWJCyP5pNR3smD6RXu',  // 105% ROI, 58% WR, 763d old
-    'HbA7fZnpvFKS1ye3d6NFkkSfFghJJK6touZXHPJysAPq',  // 104% ROI, 86% WR
-    '6JXxsX1e1jxn4sSAU1X3HKpBDZfwFTBx4ZcrdqsFWiEw',  // 103% ROI, 67% WR
-    'AEwdbcEaLpp5vdfBFYaxgKQyLoDrAGJu5cMGNn6S6jGA',  // 102% ROI, 91% WR
-    '5PiqYRfJDhS8sMjRyBXW3eyTtfh7GgAuYWFtqaRdDH9T',  // 102% ROI, 67% WR, 290d old
-    'ArAh8V2UwkgGP12j2wpNMJHCVm4ZEoCHtKd2fXCKKi1K',  // 102% ROI, 80% WR, 202d old
-
-    // === PAGE 4-5 — Active High WR (80%+ ROI, high frequency) ===
-    'BQqG1qRkhqkidYAgYh7T9RcL7AEmhfG9Sd8esaZWw51P',  // 89% ROI, 62% WR, 490d old
-    '4MdtaDSqc6G6g6N9Pt79A2Zj9wUC9wJcnf62YP6bssfu',  // 88% ROI, 57% WR
-    '6LZs9rk7nKQWYgeb6XnUvLp8XaMyQdaog2VU87dsPuSj',  // 87% ROI, 100% WR
-    'HCFg8YVKJJycWjnnu4GJoHjsrpwffHvwNhXVHUezVyyM',  // 85% ROI, 80% WR
-    '2xdqw5qvFovVwUJgAUJzcKNvy3qXgAhPSZHVu6hcFyZM',  // 82% ROI, 91% WR, 131d old
-  ],
+  // ============================================================
+  // WALLET DATABASE — Dune stats embedded for Grok context
+  // ============================================================
+  TRACKED_WALLETS: {
+    'FRhgF9TXCXyGfUiQ5WsdCGxHUmBXPseenTdnEA4UmUGi': { roi: '675%', wr: '73%', days: 150, pnl: 68.12, medianRoi: '221%', tokens: 11, medianHold: '02:32:23' },
+    '7z8hbNzmgYvRMNVk27TQm8xW3yXgAkwQVhA6Nht5WEkU': { roi: '420%', wr: '90%', days: 299, pnl: 99.88, medianRoi: '108%', tokens: 10, medianHold: '00:00:43' },
+    '61MQSdRgpe98pxMn6gcLH4M4MAFr8mAKuoTDFMwbpn6Y': { roi: '466%', wr: '100%', days: 113, pnl: 52.35, medianRoi: '28%', tokens: 9, medianHold: '00:00:10' },
+    'AjKCctQtCnCj48tR3YaGm1ZrQtURoodjfg6YKLy97Uub': { roi: '286%', wr: '95%', days: 11, pnl: 75.23, medianRoi: '162%', tokens: 19, medianHold: '00:01:23' },
+    'FEXornKkXE2u51WfCGVdEBsmrvquu9UvGPpM9gd986se': { roi: '242%', wr: '100%', days: 99, pnl: 43.32, medianRoi: '66%', tokens: 6, medianHold: '02:22:52' },
+    'CsKnRER9Sjpau8Mk9WTZkoBytB2uFnqdmLYR5GTGtaKz': { roi: '324%', wr: '71%', days: 4, pnl: 30.03, medianRoi: '118%', tokens: 7, medianHold: '00:00:29' },
+    'ATFRUwvyMh61w2Ab6AZxUyxsAfiiuG1RqL6iv3Vi9q2B': { roi: '208%', wr: '100%', days: 450, pnl: 64.94, medianRoi: '87%', tokens: 7, medianHold: '00:00:37' },
+    'GJvBxoj79TqhvyafMpTPyu5CP5rEq2V9LnbfxtDqgYhS': { roi: '215%', wr: '81%', days: 56, pnl: 19.50, medianRoi: '128%', tokens: 16, medianHold: '18:38:21' },
+    'F7HXUvhmCjkHM1ePFCSRReXXbnCAKdiJMDFNfH8u8khG': { roi: '215%', wr: '86%', days: 135, pnl: 23.62, medianRoi: '43%', tokens: 21, medianHold: '00:04:06' },
+    '9jYMojHaJxyXsvVMN2foih8knXb5AXYkMmUnxjQT5BoJ': { roi: '202%', wr: '77%', days: 11, pnl: 61.24, medianRoi: '17%', tokens: 22, medianHold: '00:00:06' },
+    '8gDRLa498xXCdch3DvtvjCJ7C1joJ1BpftTDVZztxigv': { roi: '396%', wr: '50%', days: 16, pnl: 115.34, medianRoi: '1%', tokens: 24, medianHold: '00:01:47' },
+    '6wLkK9AKTcCLiB5mW7pyp9Fq9wchydyatk8XtxKdVHgn': { roi: '345%', wr: '60%', days: 297, pnl: 81.94, medianRoi: '64%', tokens: 10, medianHold: '00:00:43' },
+    'AnWgJ1csbod2tWS2mZNEyhxo1XWndhNVvzbchh81zZ8k': { roi: '404%', wr: '57%', days: 3, pnl: 190.98, medianRoi: '43%', tokens: 14, medianHold: '00:00:44' },
+    '2M4Ka8W5i7eK9Z3zMpzbeYRsAVM4HtpwhtTnbmPDdiMn': { roi: '324%', wr: '60%', days: 8, pnl: 17.79, medianRoi: '12%', tokens: 10, medianHold: '00:07:28' },
+    'H5G1btoS96YZ6fcaDDhAo99A9p4RkenV9XKLw2aPCeaF': { roi: '228%', wr: '50%', days: 5, pnl: 39.50, medianRoi: '1%', tokens: 16, medianHold: '00:33:26' },
+    'FYfSEsc5DxwKH2LbxNpWE9KiGvajN8bYVHSe1mk4oSDy': { roi: '204%', wr: '60%', days: 45, pnl: 10.82, medianRoi: '44%', tokens: 5, medianHold: '06:22:07' },
+    '5VXyg5nXWtpjsNQvt6EXQPQ5ziZBnxhoXDYaz9ZBbXao': { roi: '199%', wr: '100%', days: 529, pnl: 14.52, medianRoi: '83%', tokens: 7, medianHold: 'N/A' },
+    'FvYsGPiQoG5A7aQsbQM7bR3VdjY2TKeG8xLwhBQMNQWY': { roi: '168%', wr: '100%', days: 237, pnl: 73.03, medianRoi: '206%', tokens: 6, medianHold: 'N/A' },
+    'EY8kS2GvTL4vQmQFi6nN2dnGJSFQhwmEMdktYpyLRvtP': { roi: '167%', wr: '85%', days: 79, pnl: 47.94, medianRoi: '14%', tokens: 14, medianHold: 'N/A' },
+    'HXhnm8S1pd1KYjoYKrTFLAHnw6ED7nkrp3SmGGddtoLD': { roi: '167%', wr: '60%', days: 137, pnl: 50.53, medianRoi: '101%', tokens: 12, medianHold: 'N/A' },
+    'BZWzvFQrqbT5Tb1T4F73SWKhM5auiPMDo9agb456HLTC': { roi: '156%', wr: '100%', days: 46, pnl: 16.32, medianRoi: '65%', tokens: 9, medianHold: 'N/A' },
+    '6WLquntFTiEh84JvH3R6fA1k5PQLSUouY7CmEMQwaj34': { roi: '153%', wr: '55%', days: 71, pnl: 38.00, medianRoi: '1%', tokens: 13, medianHold: 'N/A' },
+    '4i88267TQpasJoL3Zv5C9Szq9XctMSHExmmQMWgBbFeB': { roi: '152%', wr: '60%', days: 90, pnl: 13.91, medianRoi: '8%', tokens: 7, medianHold: 'N/A' },
+    '4ypxvwdjg7wDvEFLkhKBqCioRmDtKzu1z55C1Sah12Xv': { roi: '151%', wr: '100%', days: 482, pnl: 32.85, medianRoi: '147%', tokens: 8, medianHold: 'N/A' },
+    'DJGm2u3ZRJJaaobyPPDQB9dvpaKTutUo5y4CdxoywRBJ': { roi: '121%', wr: '100%', days: 303, pnl: 58.69, medianRoi: '115%', tokens: 10, medianHold: 'N/A' },
+    '2FzChsNvEqRvX36jy4Gvpu9Xjv1pk6TBJct7pPVyeTJL': { roi: '119%', wr: '77%', days: 674, pnl: 21.32, medianRoi: '89%', tokens: 14, medianHold: 'N/A' },
+    'AqpY5YrdXqsYyhCrXkSwqD6G8Umi1PL8hz4MJkjizrA7w': { roi: '118%', wr: '73%', days: 58, pnl: 47.59, medianRoi: '17%', tokens: 16, medianHold: 'N/A' },
+    '85Aq4c1xQUDcHbb7z521pKysZVpf1YTXiZodkK9nPhov': { roi: '116%', wr: '56%', days: 133, pnl: 12.94, medianRoi: '5%', tokens: 17, medianHold: 'N/A' },
+    'FPp4xGY1pnCnGx1zDgiykUW9sssaY8kgkQBZrLCi1drD': { roi: '115%', wr: '57%', days: 680, pnl: 15.12, medianRoi: '18%', tokens: 11, medianHold: 'N/A' },
+    'GvAyrpEM88uMYLp8QLUf7SRfqfsLNBEFhLctj2Hn8y9P': { roi: '131%', wr: '100%', days: 91, pnl: 39.88, medianRoi: '128%', tokens: 9, medianHold: 'N/A' },
+    '12KuEro7Cr7WjjxKTQ56TPdmUfVSuP6z7otP9KnNHWhK': { roi: '126%', wr: '60%', days: 200, pnl: 8.64, medianRoi: '68%', tokens: 8, medianHold: 'N/A' },
+    '6LZs9rk7nKQWYgeb6XnUvLp8XaMyQdaog2VU87dsPuSj': { roi: '87%', wr: '100%', days: 41, pnl: 37.67, medianRoi: '78%', tokens: 8, medianHold: 'N/A' },
+    'HCFg8YVKJJycWjnnu4GJoHjsrpwffHvwNhXVHUezVyyM': { roi: '85%', wr: '80%', days: 50, pnl: 18.16, medianRoi: '92%', tokens: 10, medianHold: 'N/A' },
+    '2xdqw5qvFovVwUJgAUJzcKNvy3qXgAhPSZHVu6hcFyZM': { roi: '82%', wr: '91%', days: 131, pnl: 17.11, medianRoi: '14%', tokens: 18, medianHold: 'N/A' },
+    'EJEWyg2ZLmCq1uyKeWZz9L7z6FQWJCyP5pNR3smD6RXu': { roi: '105%', wr: '58%', days: 763, pnl: 19.18, medianRoi: '19%', tokens: 22, medianHold: 'N/A' },
+    '5PiqYRfJDhS8sMjRyBXW3eyTtfh7GgAuYWFtqaRdDH9T': { roi: '102%', wr: '67%', days: 290, pnl: 15.22, medianRoi: '13%', tokens: 15, medianHold: 'N/A' },
+    'ArAh8V2UwkgGP12j2wpNMJHCVm4ZEoCHtKd2fXCKKi1K': { roi: '102%', wr: '80%', days: 202, pnl: 12.96, medianRoi: '15%', tokens: 13, medianHold: 'N/A' },
+  },
 };
 
 const STABLES = new Set([CONFIG.USDC_MINT, CONFIG.USDT_MINT]);
+const WALLET_LIST = Object.keys(CONFIG.TRACKED_WALLETS);
 
 // ============================================================
 // STATE
@@ -139,10 +87,9 @@ const STABLES = new Set([CONFIG.USDC_MINT, CONFIG.USDT_MINT]);
 const state = {
   wallet: null,
   connection: null,
-  position: null,
   lastSigs: new Map(),
   isRunning: false,
-  stats: { trades: 0, wins: 0, totalPnlSol: 0, startBalance: 0 },
+  alertCount: 0,
 };
 
 // ============================================================
@@ -150,17 +97,12 @@ const state = {
 // ============================================================
 function log(level, msg, data = {}) {
   const ts = new Date().toISOString();
-  const icons = { INFO: '📡', TRADE: '💰', WARN: '⚠️', ERROR: '❌', EXIT: '🚪', COPY: '🎯' };
+  const icons = { INFO: '📡', ALERT: '🔔', WARN: '⚠️', ERROR: '❌', GROK: '🤖' };
   const extra = Object.keys(data).length ? ' ' + JSON.stringify(data) : '';
   console.log(`[${ts}] ${icons[level] || '📋'} [${level}] ${msg}${extra}`);
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-async function getSOLBalance() {
-  try { return (await state.connection.getBalance(state.wallet.publicKey)) / 1e9; }
-  catch (e) { return 0; }
-}
 
 async function getTokenPrice(mint) {
   try {
@@ -171,10 +113,120 @@ async function getTokenPrice(mint) {
   } catch (e) { return 0; }
 }
 
-async function discord(msg) {
-  if (!CONFIG.DISCORD_WEBHOOK) return;
-  try { await fetch(CONFIG.DISCORD_WEBHOOK, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: msg }) }); }
-  catch (e) { /* silent */ }
+async function getTokenInfo(mint) {
+  // Try to get token name from Jupiter
+  try {
+    const res = await fetch(`https://lite-api.jup.ag/tokens/v1/token/${mint}`);
+    if (res.ok) {
+      const data = await res.json();
+      return { name: data.name || 'Unknown', symbol: data.symbol || '???', decimals: data.decimals || 9 };
+    }
+  } catch (e) { /* fallback */ }
+  return { name: 'Unknown Token', symbol: '???', decimals: 9 };
+}
+
+async function sendDiscord(content) {
+  if (!CONFIG.DISCORD_WEBHOOK) { log('WARN', 'No Discord webhook configured'); return; }
+  try {
+    // Discord max is 2000 chars
+    const truncated = content.length > 1990 ? content.slice(0, 1990) + '...' : content;
+    await fetch(CONFIG.DISCORD_WEBHOOK, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: truncated }),
+    });
+  } catch (e) {
+    log('ERROR', 'Discord send failed', { error: e.message });
+  }
+}
+
+// ============================================================
+// GROK AI ANALYSIS
+// ============================================================
+async function getGrokAnalysis(swap, walletAddr, walletStats, tokenInfo, tokenPrice) {
+  if (!CONFIG.GROK_API_KEY) {
+    log('WARN', 'No GROK_API_KEY — skipping AI analysis');
+    return null;
+  }
+
+  const prompt = `You are an AI trading analyst for a Solana memecoin copy-trading bot. A tracked wallet just made a trade. Analyze it and give a recommendation.
+
+CONTEXT: I'm running a copy-trading bot with about $25 worth of SOL (~0.18 SOL). I track proven profitable wallets from Dune Analytics and get alerts when they trade. My standard buy is about 25% of my wallet (~$6). I need you to tell me if I should follow this trade, how much of my wallet to put in, and how long to hold.
+
+TRADE SIGNAL:
+- Direction: ${swap.direction.toUpperCase()}
+- Token: ${tokenInfo.name} (${tokenInfo.symbol})
+- Token Mint: ${swap.tokenMint}
+- SOL Amount the trader used: ${swap.solAmount.toFixed(4)} SOL
+- Token Price: $${tokenPrice ? tokenPrice.toFixed(8) : 'unknown'}
+
+TRADER WALLET STATS (from Dune Analytics, last 30 days):
+- Wallet: ${walletAddr}
+- Overall ROI: ${walletStats.roi}
+- Win Rate: ${walletStats.wr}
+- Wallet Age: ${walletStats.days} days
+- Total PnL: ${walletStats.pnl} SOL profit
+- Median ROI per trade: ${walletStats.medianRoi}
+- Distinct Tokens Traded: ${walletStats.tokens}
+- Median Hold Time: ${walletStats.medianHold}
+
+POSITION SIZING GUIDE:
+- 15-20% of wallet = low confidence (sketchy token, mediocre trader stats)
+- 25% of wallet = standard confidence (decent trader, normal signal)
+- 30-40% of wallet = high confidence (elite trader + strong momentum)
+- 50%+ of wallet = very high confidence (100% WR trader + perfect setup)
+Never recommend more than 60%.
+
+RESPOND IN EXACTLY THIS FORMAT (no extra text):
+SCORE: [number 0-100]
+VERDICT: [BUY/SKIP]
+POSITION: [percentage of wallet to invest, like "25%" or "40%"]
+HOLD TIME: [estimated hold duration like "30 minutes" or "2 hours"]
+REASONING: [1-2 sentences max explaining why]`;
+
+  try {
+    const res = await fetch('https://api.x.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${CONFIG.GROK_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'grok-3-mini',
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 200,
+        temperature: 0.3,
+      }),
+    });
+
+    if (!res.ok) {
+      log('ERROR', `Grok API error: ${res.status}`);
+      return null;
+    }
+
+    const data = await res.json();
+    const reply = data.choices?.[0]?.message?.content?.trim();
+    if (!reply) return null;
+
+    // Parse the response
+    const scoreMatch = reply.match(/SCORE:\s*(\d+)/i);
+    const verdictMatch = reply.match(/VERDICT:\s*(BUY|SKIP)/i);
+    const positionMatch = reply.match(/POSITION:\s*(\d+)%?/i);
+    const holdMatch = reply.match(/HOLD TIME:\s*(.+)/i);
+    const reasonMatch = reply.match(/REASONING:\s*(.+)/is);
+
+    return {
+      score: scoreMatch ? parseInt(scoreMatch[1]) : 50,
+      verdict: verdictMatch ? verdictMatch[1].toUpperCase() : 'UNKNOWN',
+      positionPct: positionMatch ? parseInt(positionMatch[1]) : 25,
+      holdTime: holdMatch ? holdMatch[1].trim() : 'Unknown',
+      reasoning: reasonMatch ? reasonMatch[1].trim().split('\n')[0] : reply.slice(0, 200),
+      raw: reply,
+    };
+  } catch (e) {
+    log('ERROR', 'Grok analysis failed', { error: e.message });
+    return null;
+  }
 }
 
 // ============================================================
@@ -226,11 +278,72 @@ function parseSwap(tx, walletAddress) {
 }
 
 // ============================================================
+// ALERT BUILDER — Format Discord message
+// ============================================================
+async function sendTradeAlert(swap, walletAddr) {
+  const walletStats = CONFIG.TRACKED_WALLETS[walletAddr] || {};
+  const tokenInfo = await getTokenInfo(swap.tokenMint);
+  const tokenPrice = await getTokenPrice(swap.tokenMint);
+  const isBuy = swap.direction === 'buy';
+
+  state.alertCount++;
+
+  // Get Grok analysis for BUY signals
+  let grokResult = null;
+  if (isBuy) {
+    log('GROK', `Analyzing ${tokenInfo.symbol} buy from ${walletAddr.slice(0, 8)}...`);
+    grokResult = await getGrokAnalysis(swap, walletAddr, walletStats, tokenInfo, tokenPrice);
+  }
+
+  // Build Discord message
+  const emoji = isBuy ? '🟢 BUY' : '🔴 SELL';
+  const scoreEmoji = grokResult
+    ? (grokResult.score >= 70 ? '🔥' : grokResult.score >= 50 ? '⚡' : '⚠️')
+    : '';
+
+  let msg = ``;
+  msg += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+  msg += `${emoji} ALERT #${state.alertCount}\n`;
+  msg += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+  msg += `**Token:** ${tokenInfo.name} (${tokenInfo.symbol})\n`;
+  msg += `**Mint:** \`${swap.tokenMint}\`\n`;
+  msg += `**Price:** $${tokenPrice ? tokenPrice.toFixed(8) : 'N/A'}\n`;
+  msg += `**SOL:** ${swap.solAmount.toFixed(4)}\n`;
+  msg += `**Tx:** https://solscan.io/tx/${swap.signature}\n`;
+  msg += `\n`;
+  msg += `**👤 Trader:** \`${walletAddr.slice(0, 12)}...\`\n`;
+  msg += `**ROI:** ${walletStats.roi || 'N/A'} | **WR:** ${walletStats.wr || 'N/A'} | **Age:** ${walletStats.days || '?'}d\n`;
+  msg += `**PnL:** ${walletStats.pnl || '?'} SOL | **Med ROI:** ${walletStats.medianRoi || 'N/A'}\n`;
+  msg += `**Hold:** ${walletStats.medianHold || 'N/A'} | **Tokens:** ${walletStats.tokens || '?'}\n`;
+
+  if (grokResult) {
+    const dollarEstimate = (25 * grokResult.positionPct / 100).toFixed(2);
+    msg += `\n`;
+    msg += `${scoreEmoji} **GROK SCORE: ${grokResult.score}/100** → **${grokResult.verdict}**\n`;
+    msg += `💵 **Suggested Size:** ${grokResult.positionPct}% of wallet (~$${dollarEstimate})\n`;
+    msg += `⏱️ **Hold Estimate:** ${grokResult.holdTime}\n`;
+    msg += `💬 ${grokResult.reasoning}\n`;
+  }
+
+  msg += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
+
+  // Log locally
+  log('ALERT', `${emoji} ${tokenInfo.symbol} from ${walletAddr.slice(0, 8)}...`, {
+    sol: swap.solAmount.toFixed(4),
+    grokScore: grokResult?.score || 'N/A',
+    verdict: grokResult?.verdict || 'N/A',
+  });
+
+  // Send to Discord
+  await sendDiscord(msg);
+}
+
+// ============================================================
 // POLLING LOOP
 // ============================================================
 async function initLastSigs() {
-  log('INFO', `Initializing ${CONFIG.TRACKED_WALLETS.length} wallets...`);
-  for (const addr of CONFIG.TRACKED_WALLETS) {
+  log('INFO', `Initializing ${WALLET_LIST.length} wallets...`);
+  for (const addr of WALLET_LIST) {
     try {
       const res = await fetch(CONFIG.HELIUS_RPC, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -239,16 +352,16 @@ async function initLastSigs() {
       const data = await res.json();
       const sig = data?.result?.[0]?.signature;
       if (sig) state.lastSigs.set(addr, sig);
-      await sleep(150);
+      await sleep(100);
     } catch (e) { /* skip */ }
   }
-  log('INFO', `Ready. Tracking ${state.lastSigs.size}/${CONFIG.TRACKED_WALLETS.length} wallets.`);
+  log('INFO', `Ready. Tracking ${state.lastSigs.size}/${WALLET_LIST.length} wallets.`);
 }
 
 async function pollWallets() {
   log('INFO', '👀 Watching for trades...');
   while (state.isRunning) {
-    for (const addr of CONFIG.TRACKED_WALLETS) {
+    for (const addr of WALLET_LIST) {
       try {
         const res = await fetch(CONFIG.HELIUS_RPC, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -275,194 +388,17 @@ async function pollWallets() {
               if (!txData?.result) continue;
               const swap = parseSwap(txData.result, addr);
               if (!swap) continue;
-              log('COPY', `${addr.slice(0, 8)}... ${swap.direction.toUpperCase()} ${swap.tokenMint.slice(0, 8)}...`, { sol: swap.solAmount.toFixed(4) });
-              await handleSignal(swap, addr);
-              await sleep(200);
+
+              // Send alert to Discord + Grok analysis
+              await sendTradeAlert(swap, addr);
+              await sleep(500);
             } catch (e) { /* skip */ }
           }
         }
-        await sleep(200);
+        await sleep(150);
       } catch (e) { /* skip */ }
     }
     await sleep(CONFIG.POLL_INTERVAL_MS);
-  }
-}
-
-// ============================================================
-// SIGNAL HANDLER
-// ============================================================
-async function handleSignal(swap, walletAddr) {
-  const { tokenMint, direction } = swap;
-
-  if (direction === 'sell' && state.position?.mint === tokenMint) {
-    log('EXIT', `Tracked wallet selling our token — exiting`);
-    await executeSell(100, 'tracked_wallet_sold');
-    return;
-  }
-
-  if (direction !== 'buy') return;
-  if (state.position) {
-    log('INFO', `Already holding ${state.position.mint.slice(0, 8)}... — skipping`);
-    return;
-  }
-
-  const balance = await getSOLBalance();
-  const tradeLamports = Math.floor(balance * CONFIG.POSITION_SIZE_PCT * 1e9);
-  if (tradeLamports < 5000000) { log('WARN', 'Balance too low'); return; }
-
-  try {
-    const quoteRes = await fetch(`${CONFIG.JUPITER_QUOTE}?inputMint=${CONFIG.SOL_MINT}&outputMint=${tokenMint}&amount=${tradeLamports}&slippageBps=${CONFIG.MAX_SLIPPAGE_BPS}`);
-    if (!quoteRes.ok) { log('WARN', `No route for ${tokenMint.slice(0, 8)}...`); return; }
-    const quote = await quoteRes.json();
-    if (!quote.outAmount || quote.outAmount === '0') { log('WARN', 'No liquidity'); return; }
-
-    const impact = Math.abs(parseFloat(quote.priceImpactPct || 0));
-    if (impact > CONFIG.MAX_PRICE_IMPACT_PCT) { log('WARN', `Impact too high: ${(impact * 100).toFixed(2)}%`); return; }
-
-    await executeBuy(tokenMint, quote, tradeLamports, walletAddr);
-  } catch (e) {
-    log('ERROR', 'Quote failed', { error: e.message });
-  }
-}
-
-// ============================================================
-// EXECUTION
-// ============================================================
-async function executeBuy(tokenMint, quote, lamports, copiedWallet) {
-  try {
-    const sol = lamports / 1e9;
-    log('TRADE', `🛒 BUYING ${tokenMint.slice(0, 8)}... for ${sol.toFixed(4)} SOL (copied ${copiedWallet.slice(0, 8)}...)`);
-
-    const swapRes = await fetch(CONFIG.JUPITER_SWAP, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        quoteResponse: quote,
-        userPublicKey: state.wallet.publicKey.toString(),
-        wrapAndUnwrapSol: true,
-        dynamicSlippage: { minBps: 50, maxBps: CONFIG.MAX_SLIPPAGE_BPS },
-        prioritizationFeeLamports: CONFIG.PRIORITY_FEE_LAMPORTS,
-      }),
-    });
-
-    if (!swapRes.ok) { log('ERROR', `Swap request failed: ${swapRes.status}`); return; }
-    const swapData = await swapRes.json();
-    if (!swapData.swapTransaction) { log('ERROR', 'No swap tx returned'); return; }
-
-    const txBuf = Buffer.from(swapData.swapTransaction, 'base64');
-    const tx = VersionedTransaction.deserialize(txBuf);
-    tx.sign([state.wallet]);
-    const sig = await state.connection.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 3 });
-    log('TRADE', `📤 Sent: ${sig}`);
-
-    if (await confirmTx(sig)) {
-      const price = await getTokenPrice(tokenMint);
-      state.position = { mint: tokenMint, entryPrice: price, entrySolAmount: sol, entryTime: Date.now(), soldPct: 0, signature: sig, copiedFrom: copiedWallet };
-      state.stats.trades++;
-      const msg = `🛒 **BUY** \`${tokenMint.slice(0, 8)}...\` | ${sol.toFixed(4)} SOL | Copied ${copiedWallet.slice(0, 8)}...`;
-      log('TRADE', msg);
-      await discord(msg);
-    } else {
-      log('ERROR', 'Buy failed to confirm');
-    }
-  } catch (e) {
-    log('ERROR', 'Buy failed', { error: e.message });
-  }
-}
-
-async function executeSell(pct, reason) {
-  if (!state.position) return;
-  const { mint, entrySolAmount, soldPct } = state.position;
-  const actualPct = Math.min(pct, 100 - soldPct);
-  if (actualPct <= 0) return;
-
-  try {
-    log('EXIT', `🚪 SELLING ${actualPct}% of ${mint.slice(0, 8)}...`, { reason });
-    const accts = await state.connection.getParsedTokenAccountsByOwner(state.wallet.publicKey, { mint: new PublicKey(mint) });
-    const acct = accts?.value?.[0];
-    if (!acct) { state.position = null; return; }
-
-    const bal = parseFloat(acct.account.data.parsed.info.tokenAmount.uiAmount || 0);
-    if (bal <= 0) { state.position = null; return; }
-
-    const dec = acct.account.data.parsed.info.tokenAmount.decimals;
-    const sellAmt = BigInt(Math.floor(bal * (actualPct / 100) * Math.pow(10, dec)));
-    if (sellAmt <= 0n) { state.position = null; return; }
-
-    const quoteRes = await fetch(`${CONFIG.JUPITER_QUOTE}?inputMint=${mint}&outputMint=${CONFIG.SOL_MINT}&amount=${sellAmt.toString()}&slippageBps=${CONFIG.MAX_SLIPPAGE_BPS}`);
-    if (!quoteRes.ok) { log('ERROR', 'Sell quote failed'); return; }
-    const quote = await quoteRes.json();
-    if (!quote.outAmount) { log('ERROR', 'No sell route'); return; }
-
-    const swapRes = await fetch(CONFIG.JUPITER_SWAP, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        quoteResponse: quote,
-        userPublicKey: state.wallet.publicKey.toString(),
-        wrapAndUnwrapSol: true,
-        dynamicSlippage: { minBps: 50, maxBps: CONFIG.MAX_SLIPPAGE_BPS },
-        prioritizationFeeLamports: CONFIG.PRIORITY_FEE_LAMPORTS,
-      }),
-    });
-
-    if (!swapRes.ok) { log('ERROR', 'Sell swap failed'); return; }
-    const swapData = await swapRes.json();
-    const txBuf = Buffer.from(swapData.swapTransaction, 'base64');
-    const tx = VersionedTransaction.deserialize(txBuf);
-    tx.sign([state.wallet]);
-    const sig = await state.connection.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 3 });
-
-    if (await confirmTx(sig)) {
-      const solBack = parseFloat(quote.outAmount) / 1e9;
-      const pnlSol = solBack - (entrySolAmount * (actualPct / 100));
-      state.stats.totalPnlSol += pnlSol;
-      state.position.soldPct += actualPct;
-
-      if (state.position.soldPct >= 100) {
-        if (pnlSol > 0) state.stats.wins++;
-        const msg = `🚪 **SOLD** \`${mint.slice(0, 8)}...\` | ${solBack.toFixed(4)} SOL | PnL: ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL | ${reason}`;
-        log('EXIT', msg); await discord(msg);
-        state.position = null;
-      } else {
-        const msg = `🚪 **PARTIAL** ${actualPct}% of \`${mint.slice(0, 8)}...\` | ${solBack.toFixed(4)} SOL | ${reason}`;
-        log('EXIT', msg); await discord(msg);
-      }
-    }
-  } catch (e) {
-    log('ERROR', 'Sell failed', { error: e.message });
-  }
-}
-
-async function confirmTx(sig, timeout = 60000) {
-  const start = Date.now();
-  while (Date.now() - start < timeout) {
-    try {
-      const s = await state.connection.getSignatureStatuses([sig]);
-      const r = s?.value?.[0];
-      if (r?.err) return false;
-      if (r?.confirmationStatus === 'confirmed' || r?.confirmationStatus === 'finalized') return true;
-    } catch (e) { /* retry */ }
-    await sleep(2000);
-  }
-  return false;
-}
-
-// ============================================================
-// POSITION MONITOR
-// ============================================================
-async function monitorPosition() {
-  while (state.isRunning) {
-    if (state.position && state.position.entryPrice > 0) {
-      const { mint, entryPrice, soldPct } = state.position;
-      const price = await getTokenPrice(mint);
-      if (price > 0) {
-        const pnl = ((price - entryPrice) / entryPrice) * 100;
-        if (pnl <= CONFIG.STOP_LOSS_PCT) { await executeSell(100, `stop_loss_${pnl.toFixed(1)}%`); }
-        else if (pnl >= CONFIG.TAKE_PROFIT_1_PCT && soldPct < 50) { await executeSell(50, `tp1_+${pnl.toFixed(1)}%`); }
-        else if (pnl >= CONFIG.TAKE_PROFIT_2_PCT && soldPct < 100) { await executeSell(100, `tp2_+${pnl.toFixed(1)}%`); }
-        else if (pnl <= -50) { await executeSell(100, 'dead_coin'); }
-      }
-    }
-    await sleep(CONFIG.PRICE_CHECK_INTERVAL_MS);
   }
 }
 
@@ -471,27 +407,14 @@ async function monitorPosition() {
 // ============================================================
 async function healthLoop() {
   while (state.isRunning) {
-    const bal = await getSOLBalance();
-    const solP = await getTokenPrice(CONFIG.SOL_MINT);
-    const wr = state.stats.trades > 0 ? ((state.stats.wins / state.stats.trades) * 100).toFixed(0) : '0';
-
-    console.log('\n' + '═'.repeat(55));
-    console.log('  🤖 WINSTON v9.1 — Dune Copy Trader');
-    console.log('═'.repeat(55));
-    console.log(`  💰 ${bal.toFixed(4)} SOL ($${(bal * solP).toFixed(2)})`);
-    console.log(`  📊 PnL: ${state.stats.totalPnlSol >= 0 ? '+' : ''}${state.stats.totalPnlSol.toFixed(4)} SOL`);
-    console.log(`  🎯 ${state.stats.trades} trades | ${state.stats.wins} wins | ${wr}% WR`);
-    console.log(`  👀 ${CONFIG.TRACKED_WALLETS.length} wallets`);
-
-    if (state.position) {
-      const p = state.position;
-      const pr = await getTokenPrice(p.mint);
-      const pnl = pr && p.entryPrice ? (((pr - p.entryPrice) / p.entryPrice) * 100).toFixed(1) : '?';
-      console.log(`  📦 ${p.mint.slice(0, 8)}... | ${pnl}% | ${((Date.now() - p.entryTime) / 60000).toFixed(0)}m | sold ${p.soldPct}%`);
-    } else {
-      console.log('  📦 Waiting for signal...');
-    }
-    console.log('═'.repeat(55) + '\n');
+    console.log('\n' + '═'.repeat(50));
+    console.log('  🤖 WINSTON v9.2 — Alert Mode');
+    console.log('═'.repeat(50));
+    console.log(`  👀 Tracking: ${WALLET_LIST.length} wallets`);
+    console.log(`  🔔 Alerts sent: ${state.alertCount}`);
+    console.log(`  🤖 Grok: ${CONFIG.GROK_API_KEY ? 'Active' : 'NOT CONFIGURED'}`);
+    console.log(`  📢 Discord: ${CONFIG.DISCORD_WEBHOOK ? 'Active' : 'NOT CONFIGURED'}`);
+    console.log('═'.repeat(50) + '\n');
     await sleep(CONFIG.HEALTH_LOG_INTERVAL_MS);
   }
 }
@@ -501,42 +424,40 @@ async function healthLoop() {
 // ============================================================
 async function main() {
   console.log('\n╔═══════════════════════════════════════════════════════╗');
-  console.log('║      🤖 WINSTON v9.1 — Dune Top Trader Copy Bot      ║');
-  console.log('║         One Trade • Tight Fees • Proven Wallets       ║');
+  console.log('║    🤖 WINSTON WINSTON WINSTON WINSTON WINSTON       ║');
+  console.log('║        CREDTED BY: DAVID NATHANIEL ESCOBAR      ║');
   console.log('╚═══════════════════════════════════════════════════════╝\n');
 
   if (!CONFIG.HELIUS_API_KEY) { log('ERROR', 'HELIUS_API_KEY required'); process.exit(1); }
-  if (!CONFIG.PRIVATE_KEY) { log('ERROR', 'WALLET_PRIVATE_KEY required'); process.exit(1); }
+  if (!CONFIG.DISCORD_WEBHOOK) { log('ERROR', 'DISCORD_WEBHOOK_URL required for alert mode'); process.exit(1); }
+  if (!CONFIG.GROK_API_KEY) { log('WARN', '⚠️ GROK_API_KEY not set — alerts will work but without AI analysis'); }
 
-  try { state.wallet = Keypair.fromSecretKey(bs58.decode(CONFIG.PRIVATE_KEY)); }
-  catch (e) { log('ERROR', 'Bad private key'); process.exit(1); }
+  // Wallet init (still needed for Helius auth, not for trading)
+  if (CONFIG.PRIVATE_KEY) {
+    try {
+      state.wallet = Keypair.fromSecretKey(bs58.decode(CONFIG.PRIVATE_KEY));
+      log('INFO', `Wallet: ${state.wallet.publicKey.toString()}`);
+    } catch (e) { log('WARN', 'Private key invalid — running in alert-only mode'); }
+  }
 
-  log('INFO', `Wallet: ${state.wallet.publicKey.toString()}`);
   state.connection = new Connection(CONFIG.HELIUS_RPC, { commitment: 'confirmed' });
-
-  state.stats.startBalance = await getSOLBalance();
-  const solP = await getTokenPrice(CONFIG.SOL_MINT);
-  log('INFO', `Balance: ${state.stats.startBalance.toFixed(4)} SOL ($${(state.stats.startBalance * solP).toFixed(2)})`);
-  if (state.stats.startBalance < 0.01) { log('ERROR', 'Balance too low'); process.exit(1); }
-
   state.isRunning = true;
+
   await initLastSigs();
 
-  log('INFO', `🚀 Live — watching ${CONFIG.TRACKED_WALLETS.length} Dune top traders`);
-  await discord(`🚀 Winston v9.1 | ${state.stats.startBalance.toFixed(4)} SOL | ${CONFIG.TRACKED_WALLETS.length} wallets`);
+  log('INFO', `🚀 Live — alerting on ${WALLET_LIST.length} Dune top traders`);
+  await sendDiscord(`🚀 **Winston v9.2 Online** | Alert Mode | Watching ${WALLET_LIST.length} wallets | Grok AI: ${CONFIG.GROK_API_KEY ? '✅' : '❌'}`);
 
   const shutdown = async () => {
     state.isRunning = false;
-    const f = await getSOLBalance();
-    const pnl = f - state.stats.startBalance;
-    log('INFO', `🛑 Final: ${f.toFixed(4)} SOL | ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} SOL`);
-    await discord(`🛑 Shutdown | ${f.toFixed(4)} SOL | ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} SOL`);
+    log('INFO', `🛑 Shutdown. Sent ${state.alertCount} alerts this session.`);
+    await sendDiscord(`🛑 Winston offline. Sent ${state.alertCount} alerts.`);
     process.exit(0);
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-  await Promise.all([pollWallets(), monitorPosition(), healthLoop()]);
+  await Promise.all([pollWallets(), healthLoop()]);
 }
 
 main().catch(e => { log('ERROR', 'Fatal', { error: e.message }); process.exit(1); });
