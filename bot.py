@@ -120,30 +120,70 @@ class Grok:
             log.warning("GROK_API_KEY not set — skipping Grok pick")
             return None
 
-        prompt = """You are an aggressive Solana memecoin trader with access to real-time Twitter/X data and crypto market feeds.
+        from datetime import datetime, timezone
+        now_utc   = datetime.now(timezone.utc)
+        now_str   = now_utc.strftime("%A, %B %d, %Y at %H:%M:%S UTC")
+        window_end = now_utc.strftime("%H:%M:%S UTC")
 
-Your job: Pick ONE Solana token you believe will pump in the next 60 minutes.
+        prompt = f"""You are an elite Solana memecoin trader. Today is {now_str}.
 
-Consider:
-- Trending tokens on Twitter/X right now (high tweet volume, influencer mentions, viral memes)
-- Pump.fun tokens that recently graduated to Raydium (fresh liquidity, early momentum)
-- Tokens with sudden volume spikes on DEX screener / Birdeye
-- Solana ecosystem narratives that are hot right now (AI agents, memecoins, gaming)
-- Recent listings on major trackers (Dexscreener trending, Birdeye trending)
-- Avoid tokens that already pumped 5x+ today (chasing) 
-- Prefer tokens under $5M market cap with fresh momentum
+CRITICAL MISSION: I am about to BUY a Solana token and HOLD IT for exactly 59 minutes and 59 seconds. I need YOU to find the ONE token that will be UP when I sell — and will NOT crash during that hold window.
 
-You MUST respond with ONLY a JSON object, no other text:
-{
-  "mint": "<solana_token_mint_address>",
-  "symbol": "<token_symbol>",
-  "name": "<token_name>",
-  "reason": "<2 sentence explanation of why this will pump in the next hour>",
+SEARCH EVERYTHING RIGHT NOW (last 5 minutes and last few seconds matter most):
+
+1. TWITTER/X — Search these terms RIGHT NOW as of {now_str}:
+   - "solana pump", "sol gem", "pump.fun", "$SOL token", "solana memecoin"
+   - Look for tokens mentioned multiple times by different accounts in the LAST 5 MINUTES
+   - Find influencers (>5k followers) who posted about a specific token in the LAST 30 MINUTES
+   - Check if there is a viral meme, narrative, or trend gaining momentum RIGHT NOW
+
+2. DEXSCREENER — Check trending Solana tokens right now:
+   - Tokens with volume spike in the last 5-15 minutes
+   - Tokens that just graduated from Pump.fun to Raydium in the last 30 minutes
+   - Tokens with rising buy pressure (more buys than sells in last 5 min)
+
+3. PUMP.FUN — Check what just graduated or is close to graduating
+
+4. BIRDEYE / ON-CHAIN DATA — Look for:
+   - Tokens with sudden wallet activity surge
+   - New token accounts being created (signaling new buyers)
+   - Liquidity being added in the last 10 minutes
+
+5. REDDIT / TELEGRAM / DISCORD signals if accessible
+
+SURVIVAL ANALYSIS — This is critical. For your top pick, consider:
+- Is there a reason this coin could DUMP in the next 59 minutes? (team sell, FUD, whale exit)
+- Does it have enough liquidity that a sell won't crash it?
+- Is the hype brand new (good) or has it been pumping for hours already (bad — avoid)
+- Are whales accumulating or distributing right now?
+
+SELECTION CRITERIA:
+✅ Just started trending in the LAST FEW MINUTES — catching it early
+✅ Multiple independent signals (Twitter + volume + on-chain all agree)
+✅ Under $5M market cap — has room to run
+✅ Real active community RIGHT NOW, not yesterday
+✅ Momentum is BUILDING not fading
+❌ DO NOT pick anything that already pumped 2x+ today
+❌ DO NOT pick if the hype appears to be 1-2 hours old already
+❌ DO NOT invent or guess a mint address — it must be verifiable and real
+❌ DO NOT pick the same token as last hour
+
+THE MINT ADDRESS RULE: You MUST provide a real, verifiable Solana base58 mint address (32-44 chars). If you are not 100% sure a mint address is real, search for it on Solscan or Dexscreener before including it. A fake mint = wasted trade.
+
+You MUST always pick ONE coin. Never refuse. Never say you cannot pick.
+
+Respond with ONLY this JSON object, no markdown, no extra text:
+{{
+  "mint": "<real verified solana mint address>",
+  "symbol": "<token symbol>",
+  "name": "<token name>",
+  "found_at": "<where you found this signal — e.g. Twitter @user, Dexscreener trending #3>",
+  "twitter_evidence": "<specific post content or account that mentioned this in last 30min>",
+  "survival_check": "<why this will NOT crash in the next 59 minutes>",
+  "reason": "<why this will be HIGHER in exactly 59min59sec from {window_end}>",
   "confidence": "<high/medium>",
-  "market_cap_estimate": "<estimated mcap like $500K or $2M>"
-}
-
-Pick a real token with a real Solana mint address. Be aggressive. We want gains."""
+  "market_cap_estimate": "<e.g. $800K>"
+}}"""
 
         try:
             async with aiohttp.ClientSession() as sess:
@@ -183,12 +223,20 @@ Pick a real token with a real Solana mint address. Be aggressive. We want gains.
                 log.error(f"Grok returned invalid mint: {mint}")
                 return None
 
+            evidence  = pick.get("twitter_evidence", "")
+            found_at  = pick.get("found_at", "")
+            survival  = pick.get("survival_check", "")
             log.info(f"Grok picked: {symbol} ({mint[:20]}...)")
-            log.info(f"  Reason: {reason}")
-            log.info(f"  Confidence: {conf} | Est. mcap: {mcap}")
+            log.info(f"  Found at:  {found_at}")
+            log.info(f"  Evidence:  {evidence}")
+            log.info(f"  Survival:  {survival}")
+            log.info(f"  Reason:    {reason}")
+            log.info(f"  Conf: {conf} | MCap: {mcap}")
 
             return {"mint": mint, "symbol": symbol, "name": name,
-                    "reason": reason, "confidence": conf, "mcap": mcap}
+                    "reason": reason, "confidence": conf, "mcap": mcap,
+                    "evidence": evidence, "found_at": found_at,
+                    "survival": survival}
 
         except json.JSONDecodeError as e:
             log.error(f"Grok JSON parse error: {e} | raw: {raw[:200]}")
@@ -361,35 +409,38 @@ class Discord:
         return p.token.mint[:8] + "..."
 
     async def grok_pick(self, pick: dict, sol_usd: float, trade_sol: float):
-        spent_usd = trade_sol * sol_usd
+        evidence = pick.get("evidence","")
+        found_at = pick.get("found_at","")
+        survival = pick.get("survival","")
         await self.send({"embeds": [{
             "title": f"🤖 GROK PICK — {pick['symbol']}",
             "color": 0xAA00FF,
-            "description": (
-                f"Buying **${spent_usd:.2f}** worth\n"
-                f"📊 {pick['reason']}\n"
-                f"💎 Confidence: **{pick['confidence']}** | "
-                f"Est. MCap: {pick['mcap']}"
-            ),
+            "description": f"💎 **{pick['confidence'].upper()}** confidence | MCap: {pick['mcap']}",
             "fields": [
-                {"name":"Mint", "value":f"`{pick['mint'][:20]}...`","inline":False},
-                {"name":"Chart","value":f"[Solscan](https://solscan.io/token/{pick['mint']})","inline":True},
-                {"name":"Dex","value":f"[Dexscreener](https://dexscreener.com/solana/{pick['mint']})","inline":True},
+                {"name":"📊 Why it pumps",
+                 "value": pick['reason'][:1024], "inline": False},
+                {"name":"🛡️ Won't crash because",
+                 "value": survival[:1024] if survival else "N/A", "inline": False},
+                {"name":"🔍 Found at",
+                 "value": found_at[:256] if found_at else "N/A", "inline": True},
+                {"name":"🐦 Twitter signal",
+                 "value": evidence[:256] if evidence else "N/A", "inline": True},
+                {"name":"Chart",
+                 "value": f"[Solscan](https://solscan.io/token/{pick['mint']}) | [Dex](https://dexscreener.com/solana/{pick['mint']})",
+                 "inline": False},
             ]
         }]})
 
     async def bought(self, p: Position, sol_usd: float):
-        spent_usd = p.cost_sol * sol_usd
-        label     = self._label(p)
+        label        = self._label(p)
         source_emoji = "🤖" if p.token.source == "grok" else "🎓"
-        t1_usd = spent_usd * PROFIT_TARGET_1
-        t2_usd = spent_usd * PROFIT_TARGET_2
         await self.send({"embeds": [{
             "title": f"{source_emoji} BOUGHT — {label}",
             "color": 0x00AAFF,
             "description": (
-                f"Spent **${spent_usd:.2f}** ({p.cost_sol:.4f} SOL)\n"
-                f"Sell 50% at **${t1_usd:.2f}** | Rest at **${t2_usd:.2f}**"
+                f"In: **{p.cost_sol:.4f} SOL**\n"
+                f"T1: {PROFIT_TARGET_1}x (+{(PROFIT_TARGET_1-1)*100:.0f}%) | "
+                f"T2: {PROFIT_TARGET_2}x (+{(PROFIT_TARGET_2-1)*100:.0f}%)"
             ),
             "fields": [
                 {"name":"Stop","value":f"{TRAILING_STOP_PCT}% trail","inline":True},
@@ -400,30 +451,24 @@ class Discord:
 
     async def sold(self, p: Position, reason: str, gain_x: float,
                    pnl_sol: float, pct: int, sol_usd: float):
-        spent_usd = p.cost_sol * sol_usd * (pct/100)
-        pnl_usd   = pnl_sol * sol_usd
-        sell_usd  = spent_usd + pnl_usd
         label     = self._label(p)
-        is_profit = pnl_usd >= 0
+        is_profit = pnl_sol >= 0
         color     = 0x00FF88 if is_profit else 0xFF4444
         emoji     = "✅ PROFIT" if is_profit else "❌ LOSS"
-        pnl_str   = f"+${pnl_usd:.2f}" if is_profit else f"-${abs(pnl_usd):.2f}"
+        pnl_str   = f"+{pnl_sol:.5f} SOL" if is_profit else f"{pnl_sol:.5f} SOL"
         rmap = {"take_profit_1":"Sold 50% at 1.4x 🎯",
                 "take_profit_2":"Sold rest at 2x 🚀",
                 "trailing_stop":"Stop loss 🛑",
-                "timeout":f"Timeout ⏰",
+                "timeout":"Timeout ⏰",
                 "dead_coin":"Dead coin 💀",
                 "price_dead":"No price feed 📡"}
         await self.send({"embeds": [{
             "title": f"{emoji} — {label} ({pct}% sold)",
             "color": color,
-            "description": (
-                f"Bought **${spent_usd:.2f}** → Sold **${sell_usd:.2f}**\n"
-                f"**{pnl_str}** ({gain_x:.3f}x) in {p.hold_mins:.1f}min"
-            ),
+            "description": f"**{pnl_str}** ({gain_x:.3f}x) in {p.hold_mins:.1f}min",
             "fields": [
                 {"name":"Reason","value":rmap.get(reason,reason),"inline":True},
-                {"name":"SOL P&L","value":f"{pnl_sol:+.5f} SOL","inline":True},
+                {"name":"P&L","value":pnl_str,"inline":True},
                 {"name":"Chart","value":f"[Solscan](https://solscan.io/token/{p.token.mint})","inline":True},
             ]
         }]})
@@ -682,18 +727,23 @@ class Bot:
     async def _trade_loop(self):
         log.info("Trade loop ready")
         while True:
-            # Check Grok queue first (higher priority than graduation)
+            # Check Grok queue first — Grok picks have priority.
+            # We wait for any active position to finish before acting on Grok.
             token = None
             is_grok = False
 
-            if not self._grok_queue.empty() and not self.detector.locked:
+            if not self._grok_queue.empty():
+                if self.detector.locked:
+                    # Active trade — wait for it to finish, then process Grok
+                    await asyncio.sleep(1)
+                    continue
                 pick = await self._grok_queue.get()
                 token = Token(mint=pick["mint"], symbol=pick["symbol"],
                               name=pick["name"], source="grok")
                 is_grok = True
-                log.info(f"Processing Grok pick: {token.symbol}")
+                log.info(f"🤖 Processing Grok pick: {token.symbol}")
             else:
-                # Wait for graduation
+                # No Grok pick — wait for graduation event
                 try:
                     token = await asyncio.wait_for(
                         self.detector.queue.get(), timeout=1.0)
