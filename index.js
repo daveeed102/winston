@@ -1,111 +1,98 @@
 // ============================================================
-// WINSTON v9.3 — Helius Enhanced TX + Grok Alert Bot
+// WINSTON v10 — Single Wallet Mirror Bot
 // ============================================================
-// Uses Helius Enhanced Transactions API to detect swaps across
-// ALL Solana DEXes (Jupiter, Raydium, Orca, Meteora, Pump.fun).
-// Sends Discord alerts with Grok AI analysis.
+// Mirrors EVERY trade from one proven trader automatically.
+// When he buys → we buy. When he sells → we sell.
+// Uses Helius Enhanced TX API (catches all DEXes).
+// Proportional position sizing based on wallet ratio.
 // ============================================================
 
 require('dotenv').config();
-const { Connection, Keypair } = require('@solana/web3.js');
+const { Connection, Keypair, VersionedTransaction, PublicKey } = require('@solana/web3.js');
 const bs58 = require('bs58');
 const fetch = require('node-fetch');
 
+// ============================================================
+// CONFIG
+// ============================================================
 const CONFIG = {
   HELIUS_API_KEY: process.env.HELIUS_API_KEY || '',
   get HELIUS_RPC() { return `https://mainnet.helius-rpc.com/?api-key=${this.HELIUS_API_KEY}`; },
   get HELIUS_TX_API() { return `https://api-mainnet.helius-rpc.com/v0/transactions?api-key=${this.HELIUS_API_KEY}`; },
-  get HELIUS_HISTORY_API() { return (addr) => `https://api-mainnet.helius-rpc.com/v0/addresses/${addr}/transactions?api-key=${this.HELIUS_API_KEY}&type=SWAP&limit=1`; },
   PRIVATE_KEY: process.env.WALLET_PRIVATE_KEY || process.env.PRIVATE_KEY || '',
-  GROK_API_KEY: process.env.GROK_API_KEY || '',
   DISCORD_WEBHOOK: process.env.DISCORD_WEBHOOK_URL || process.env.DISCORD_WEBHOOK || '',
+
+  // Jupiter
+  JUPITER_QUOTE: 'https://lite-api.jup.ag/swap/v1/quote',
+  JUPITER_SWAP: 'https://lite-api.jup.ag/swap/v1/swap',
   JUPITER_PRICE: 'https://lite-api.jup.ag/price/v2',
+
+  // The ONE trader we mirror
+  TARGET_WALLET: 'ARu4n5mFdZogZAravu7CcizaojWnS6oqka37gdLT5SZn',
+
+  // His total value ~$1818, our total ~$25
+  // We scale every trade proportionally
+  // He bets $100 → we bet ~$1.38
+  // But we set a minimum of $2 and max of 50% of our balance per trade
+  // so we don't get stuck on dust trades or blow the whole wallet
+  TARGET_TOTAL_VALUE_USD: 1818,
+  OUR_TOTAL_VALUE_USD: 25,
+  MIN_TRADE_PCT: 0.08,     // Minimum 8% of our balance per trade (~$2)
+  MAX_TRADE_PCT: 0.50,     // Maximum 50% of our balance per trade
+  PROPORTIONAL_BOOST: 1.5, // Boost our ratio slightly to be more aggressive
+
+  // Execution
+  MAX_SLIPPAGE_BPS: 250,          // 2.5% slippage (needs to be fast)
+  PRIORITY_FEE_LAMPORTS: 200000,  // 0.0002 SOL priority (speed matters)
+
+  // Polling — as fast as possible without getting rate limited
+  POLL_INTERVAL_MS: 2000,         // Check every 2 seconds
+  HEALTH_LOG_INTERVAL_MS: 120000, // Health every 2 min
+
+  // Constants
   SOL_MINT: 'So11111111111111111111111111111111111111112',
-  POLL_INTERVAL_MS: 3000,
-  HEALTH_LOG_INTERVAL_MS: 300000,
-
-  // Combined wallet list: young active + proven older wallets
-  // Each has Dune stats for Grok context
-  WALLETS: {
-    // === YOUNG & ACTIVE (≤21 days, actively trading) ===
-    '8gDRLa498xXCdch3DvtvjCJ7C1joJ1BpftTDVZztxigv': { roi:'396%', wr:'50%', days:16, pnl:115.34, medRoi:'1%', buys:27 },
-    'AjKCctQtCnCj48tR3YaGm1ZrQtURoodjfg6YKLy97Uub': { roi:'286%', wr:'95%', days:11, pnl:75.23, medRoi:'162%', buys:19 },
-    '9p7PFT2HYhVKXDsvCZd43d8GRm1jQcWBH7tmawe96b6X': { roi:'237%', wr:'67%', days:12, pnl:28.30, medRoi:'8%', buys:23 },
-    '3bLSiJ7RTMqypwhNqu6zNC2jcoQdknnGd5Y7feoaPXT9': { roi:'229%', wr:'50%', days:12, pnl:33.01, medRoi:'4%', buys:23 },
-    'H5G1btoS96YZ6fcaDDhAo99A9p4RkenV9XKLw2aPCeaF': { roi:'228%', wr:'50%', days:5, pnl:39.50, medRoi:'1%', buys:18 },
-    '9jYMojHaJxyXsvVMN2foih8knXb5AXYkMmUnxjQT5BoJ': { roi:'202%', wr:'77%', days:11, pnl:61.24, medRoi:'17%', buys:24 },
-    '8DqpugHmWXVcSAYaZs9W2jXnCE4Cx1XbNMsZYC8EU1JV': { roi:'237%', wr:'60%', days:10, pnl:21.99, medRoi:'91%', buys:6 },
-    '2M4Ka8W5i7eK9Z3zMpzbeYRsAVM4HtpwhtTnbmPDdiMn': { roi:'324%', wr:'60%', days:8, pnl:17.79, medRoi:'12%', buys:10 },
-    'AnWgJ1csbod2tWS2mZNEyhxo1XWndhNVvzbchh81zZ8k': { roi:'404%', wr:'57%', days:3, pnl:190.98, medRoi:'43%', buys:14 },
-    'CsKnRER9Sjpau8Mk9WTZkoBytB2uFnqdmLYR5GTGtaKz': { roi:'324%', wr:'71%', days:4, pnl:30.03, medRoi:'118%', buys:7 },
-    '4ScXhkEPVkxhzcJdp89oybDH5LA4iCocxAn1u3oLmvbK': { roi:'496%', wr:'60%', days:8, pnl:37.86, medRoi:'2%', buys:14 },
-    'CPQHDdLszLoagjM6MbM4S7DCiT3p4XC2zoe6CHJETanB': { roi:'651%', wr:'100%', days:1, pnl:116.12, medRoi:'86%', buys:6 },
-    '81dtsioFgo7Y3Mes6oPaDiUdUGcYjsUx3XAnAfynD3mk': { roi:'43%', wr:'86%', days:6, pnl:18.24, medRoi:'39%', buys:26 },
-    '8GPswY8JZddPqcnyur4asSSpUnTQ17rfRsDdnnPMZuNt': { roi:'37%', wr:'89%', days:6, pnl:16.85, medRoi:'44%', buys:20 },
-    'DMYZW5Krh3c8Jf7R2GZ6Ftm9qNeoy1payx5ZoRpvCiXc': { roi:'112%', wr:'89%', days:6, pnl:14.99, medRoi:'6%', buys:10 },
-    '9WeTRsLdrjSSNquSqNvSy8VDii4u5E5adpJ2smx7GVyM': { roi:'42%', wr:'92%', days:7, pnl:19.09, medRoi:'33%', buys:28 },
-    '3qau7RJjDAszMVY3W6dDsBtuqNUeTnP8YMqyXv3kocn3': { roi:'65%', wr:'83%', days:9, pnl:14.92, medRoi:'103%', buys:20 },
-    '2Y9cjafAkHjyo4Ge7GKxa2nkpMh1tVwKuFAoXxhQCXmX': { roi:'43%', wr:'85%', days:9, pnl:15.37, medRoi:'29%', buys:13 },
-    '8GPswY8JZddPqcnyur4asSSpUnTQ17rfRsDdnnPMZuNt': { roi:'37%', wr:'89%', days:6, pnl:16.85, medRoi:'44%', buys:20 },
-    '2FFnhYefCdARYfyiTY2GR7ZKA72Wt9QgY5ZEn7j1udUQ': { roi:'32%', wr:'82%', days:0, pnl:4.74, medRoi:'25%', buys:25 },
-    '4PH7LPnrwC9y2xz6F8RNcPSa6MhVk5CV5mmGZCqe8WU6': { roi:'99%', wr:'80%', days:7, pnl:17.77, medRoi:'41%', buys:20 },
-    '92ShpinZecEtxeR4ar9sKNCjveqfws1f2Dq99ec9wDkY': { roi:'74%', wr:'80%', days:6, pnl:13.32, medRoi:'85%', buys:23 },
-    'CJSduQc6GLrNCpE4w8LigAb5AynNCc6142jP1u71kmLJ': { roi:'56%', wr:'88%', days:7, pnl:9.28, medRoi:'32%', buys:19 },
-    'DE4btrVmoq2CLWbQLWmL8yq4qC3daiBMsxwNdcsXa9cw': { roi:'56%', wr:'83%', days:13, pnl:9.14, medRoi:'24%', buys:8 },
-    'AFs5DZ92CZ8PCfwFE9WPrp9Ac6nmfq184Tao6Dx1C4rq': { roi:'32%', wr:'90%', days:5, pnl:6.29, medRoi:'26%', buys:20 },
-    'AADuT157v1xrJPg1xrH2tVbVepxCGvdr6c5UQwfg317F': { roi:'32%', wr:'91%', days:5, pnl:12.08, medRoi:'17%', buys:22 },
-    '8GPsWY8JZddPqcnyur4asSSpUnTQ17rfRsDdnnPMZuNt': { roi:'44%', wr:'89%', days:6, pnl:16.85, medRoi:'44%', buys:20 },
-
-    // === PROVEN OLDER (>21d but high ROI, confirmed active recently) ===
-    'FRhgF9TXCXyGfUiQ5WsdCGxHUmBXPseenTdnEA4UmUGi': { roi:'675%', wr:'73%', days:150, pnl:68.12, medRoi:'221%', buys:13 },
-    '7z8hbNzmgYvRMNVk27TQm8xW3yXgAkwQVhA6Nht5WEkU': { roi:'420%', wr:'90%', days:299, pnl:99.88, medRoi:'108%', buys:10 },
-    '61MQSdRgpe98pxMn6gcLH4M4MAFr8mAKuoTDFMwbpn6Y': { roi:'466%', wr:'100%', days:113, pnl:52.35, medRoi:'28%', buys:12 },
-    'FEXornKkXE2u51WfCGVdEBsmrvquu9UvGPpM9gd986se': { roi:'242%', wr:'100%', days:99, pnl:43.32, medRoi:'66%', buys:12 },
-    'ATFRUwvyMh61w2Ab6AZxUyxsAfiiuG1RqL6iv3Vi9q2B': { roi:'208%', wr:'100%', days:450, pnl:64.94, medRoi:'87%', buys:13 },
-    'GJvBxoj79TqhvyafMpTPyu5CP5rEq2V9LnbfxtDqgYhS': { roi:'215%', wr:'81%', days:56, pnl:19.50, medRoi:'128%', buys:29 },
-    'F7HXUvhmCjkHM1ePFCSRReXXbnCAKdiJMDFNfH8u8khG': { roi:'215%', wr:'86%', days:135, pnl:23.62, medRoi:'43%', buys:25 },
-    '6wLkK9AKTcCLiB5mW7pyp9Fq9wchydyatk8XtxKdVHgn': { roi:'345%', wr:'60%', days:297, pnl:81.94, medRoi:'64%', buys:10 },
-    'FYfSEsc5DxwKH2LbxNpWE9KiGvajN8bYVHSe1mk4oSDy': { roi:'204%', wr:'60%', days:45, pnl:10.82, medRoi:'44%', buys:5 },
-    '5vXih4GeYcfQv88R59B5sZaRYEwJzorKpCGhqjAmqTqu': { roi:'177%', wr:'83%', days:503, pnl:24.32, medRoi:'126%', buys:8 },
-    'Gc2WT9QnTCLffWc88nKXwtqKVWh7djZeMy9yqZYXevi1': { roi:'174%', wr:'86%', days:39, pnl:16.38, medRoi:'25%', buys:7 },
-    'FvYsGPiQoG5A7aQsbQM7bR3VdjY2TKeG8xLwhBQMNQWY': { roi:'168%', wr:'100%', days:237, pnl:73.03, medRoi:'206%', buys:6 },
-    'HXhnm8S1pd1KYjoYKrTFLAHnw6ED7nkrp3SmGGddtoLD': { roi:'167%', wr:'60%', days:137, pnl:50.53, medRoi:'101%', buys:12 },
-    'BZWzvFQrqbT5Tb1T4F73SWKhM5auiPMDo9agb456HLTC': { roi:'156%', wr:'100%', days:46, pnl:16.32, medRoi:'65%', buys:9 },
-    'EoC9UDaX4PgMPS49gnLkFJVjX4eoBWPi6iXAUZGwdTPj': { roi:'153%', wr:'58%', days:35, pnl:28.63, medRoi:'35%', buys:13 },
-    'DJGm2u3ZRJJaaobyPPDQB9dvpaKTutUo5y4CdxoywRBJ': { roi:'121%', wr:'100%', days:303, pnl:58.69, medRoi:'115%', buys:10 },
-    '2FzChsNvEqRvX36jy4Gvpu9Xjv1pk6TBJct7pPVyeTJL': { roi:'119%', wr:'77%', days:674, pnl:21.32, medRoi:'89%', buys:14 },
-    'Aud9afBrEvPxF3teiF5FtZcq4MD1HMDb1MZShQJMu1DZ': { roi:'93%', wr:'95%', days:229, pnl:18.52, medRoi:'78%', buys:19 },
-    'Cf3Ja9hAXPCpJvRZuTtL1LPyZFrKfHyA1uXybYpcBDEV': { roi:'58%', wr:'90%', days:26, pnl:20.61, medRoi:'105%', buys:23 },
-
-    // === HIGH FREQUENCY PAGES 28-32 (active, high WR) ===
-    'FX2fNGE3nXaCcuTw4133Nb5CLJqTjzhZGtxSpnSuapX8': { roi:'94%', wr:'82%', days:138, pnl:10.56, medRoi:'80%', buys:16 },
-    'ArAh8V2UwkgGP12j2wpNMJHCVm4ZEoCHtKd2fXCKKi1K': { roi:'102%', wr:'80%', days:202, pnl:12.96, medRoi:'15%', buys:13 },
-    '5vXih4GeYcfQv88R59B5sZaRYEwJzorKpCGhqjAmqTqu': { roi:'177%', wr:'83%', days:503, pnl:24.32, medRoi:'126%', buys:8 },
-    'HbA7fZnpvFKS1ye3d6NFkkSfFghJJK6touZXHPJysAPq': { roi:'104%', wr:'86%', days:243, pnl:11.21, medRoi:'49%', buys:10 },
-    'F7HXUvhmCjkHM1ePFCSRReXXbnCAKdiJMDFNfH8u8khG': { roi:'215%', wr:'86%', days:135, pnl:23.62, medRoi:'43%', buys:25 },
-    'DEEDBHXhgvno5ddCrwR4jHLJrMQCAEtAPMaMLmKJBNUL': { roi:'75%', wr:'76%', days:474, pnl:19.94, medRoi:'11%', buys:24 },
-    'GkNkdM5CxAUjnCyX3XAXv4q7vBqtFWjDcvjP9xCGQkym': { roi:'45%', wr:'86%', days:493, pnl:22.43, medRoi:'23%', buys:9 },
-    'HCFg8YVKJJycWjnnu4GJoHjsrpwffHvwNhXVHUezVyyM': { roi:'85%', wr:'80%', days:50, pnl:18.16, medRoi:'92%', buys:10 },
-    '5DqXu9GrX8MxWC5WrfDKK924cjdFwVdtDpSGmV6Qr4Yv': { roi:'99%', wr:'77%', days:62, pnl:8.41, medRoi:'6%', buys:13 },
-    '8Lh4ESqtGEVxfyYS74sdZzthKS84ZxJrDzJzdeTb46wv': { roi:'29%', wr:'78%', days:67, pnl:22.39, medRoi:'83%', buys:25 },
-  },
 };
 
-const WALLET_LIST = Object.keys(CONFIG.WALLETS);
-const STABLES = new Set(['EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB']);
+const STABLES = new Set([
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
+]);
 
-const state = { wallet: null, connection: null, lastSigs: new Map(), isRunning: false, alertCount: 0 };
+// ============================================================
+// STATE
+// ============================================================
+const state = {
+  wallet: null,
+  connection: null,
+  lastSig: null,
+  isRunning: false,
+  positions: new Map(),  // mint -> { entryTime, entrySolAmount }
+  stats: {
+    trades: 0,
+    buys: 0,
+    sells: 0,
+    totalPnlSol: 0,
+    startBalance: 0,
+    errors: 0,
+  },
+};
 
 // ============================================================
 // UTILITIES
 // ============================================================
 function log(level, msg, data = {}) {
   const ts = new Date().toISOString();
-  const icons = { INFO:'📡', ALERT:'🔔', WARN:'⚠️', ERROR:'❌', GROK:'🤖', SWAP:'💱' };
+  const icons = { INFO:'📡', BUY:'🟢', SELL:'🔴', WARN:'⚠️', ERROR:'❌', EXEC:'⚡', MIRROR:'🪞' };
   const extra = Object.keys(data).length ? ' ' + JSON.stringify(data) : '';
   console.log(`[${ts}] ${icons[level]||'📋'} [${level}] ${msg}${extra}`);
 }
+
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function getSOLBalance() {
+  try { return (await state.connection.getBalance(state.wallet.publicKey)) / 1e9; }
+  catch(e) { return 0; }
+}
 
 async function getTokenPrice(mint) {
   try {
@@ -121,322 +108,492 @@ async function getTokenInfo(mint) {
     const r = await fetch(`https://lite-api.jup.ag/tokens/v1/token/${mint}`);
     if (r.ok) { const d = await r.json(); return { name: d.name||'Unknown', symbol: d.symbol||'???' }; }
   } catch(e) {}
-  return { name: 'Unknown Token', symbol: '???' };
+  return { name: 'Unknown', symbol: '???' };
 }
 
-async function sendDiscord(content) {
+async function discord(msg) {
   if (!CONFIG.DISCORD_WEBHOOK) return;
   try {
-    const t = content.length > 1990 ? content.slice(0, 1990) + '...' : content;
+    const t = msg.length > 1990 ? msg.slice(0, 1990) + '...' : msg;
     await fetch(CONFIG.DISCORD_WEBHOOK, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ content: t }) });
-  } catch(e) { log('ERROR', 'Discord failed', { error: e.message }); }
+  } catch(e) {}
 }
 
 // ============================================================
-// HELIUS ENHANCED TX PARSER — catches ALL DEX swaps
+// POSITION SIZING — Proportional to the target trader
+// ============================================================
+function calculateTradeSize(targetSolAmount, ourBalance) {
+  // What % of his portfolio did he use?
+  // His SOL balance is ~8.37 SOL, total ~$1818
+  // We scale proportionally with a small boost
+  const ratio = (CONFIG.OUR_TOTAL_VALUE_USD / CONFIG.TARGET_TOTAL_VALUE_USD) * CONFIG.PROPORTIONAL_BOOST;
+  let ourAmount = targetSolAmount * ratio;
+
+  // Apply min/max bounds
+  const minAmount = ourBalance * CONFIG.MIN_TRADE_PCT;
+  const maxAmount = ourBalance * CONFIG.MAX_TRADE_PCT;
+
+  ourAmount = Math.max(ourAmount, minAmount);
+  ourAmount = Math.min(ourAmount, maxAmount);
+
+  // Never trade more than we have (leave 0.005 SOL for fees)
+  ourAmount = Math.min(ourAmount, ourBalance - 0.005);
+
+  if (ourAmount < 0.003) return 0; // Dust guard
+
+  return ourAmount;
+}
+
+// ============================================================
+// HELIUS ENHANCED TX PARSER
 // ============================================================
 async function parseWithHelius(signatures) {
-  // Helius Enhanced Transactions API auto-detects swaps across all DEXes
   try {
     const res = await fetch(CONFIG.HELIUS_TX_API, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ transactions: signatures }),
     });
-    if (!res.ok) {
-      log('WARN', `Helius enhanced TX API error: ${res.status}`);
-      return [];
-    }
-    const parsed = await res.json();
-    return parsed || [];
-  } catch (e) {
-    log('ERROR', 'Helius parse failed', { error: e.message });
-    return [];
-  }
+    if (!res.ok) { log('WARN', `Helius API ${res.status}`); return []; }
+    return await res.json() || [];
+  } catch(e) { log('ERROR', 'Helius parse fail', { error: e.message }); return []; }
 }
 
-function extractTradeFromEnhanced(tx, walletAddr) {
-  // Process ANY transaction type that involves token movement
+function extractTrade(tx) {
   if (tx.transactionError) return null;
 
+  const walletAddr = CONFIG.TARGET_WALLET;
   const transfers = tx.tokenTransfers || [];
   const nativeTransfers = tx.nativeTransfers || [];
-  const txType = tx.type || 'UNKNOWN';
 
-  let solSpent = 0;
-  let solReceived = 0;
-  let tokenMint = null;
-  let tokenAmount = 0;
-  let direction = null;
+  let solSpent = 0, solReceived = 0;
+  let tokenMint = null, tokenAmount = 0, direction = null;
 
-  // Check native SOL transfers
   for (const t of nativeTransfers) {
     if (t.fromUserAccount === walletAddr) solSpent += (t.amount || 0) / 1e9;
     if (t.toUserAccount === walletAddr) solReceived += (t.amount || 0) / 1e9;
   }
 
-  // Check token transfers for non-SOL, non-stablecoin tokens
   for (const t of transfers) {
     if (STABLES.has(t.mint) || t.mint === CONFIG.SOL_MINT) continue;
-
     if (t.toUserAccount === walletAddr && t.tokenAmount > 0) {
-      tokenMint = t.mint;
-      tokenAmount = t.tokenAmount;
-      direction = 'buy';
+      tokenMint = t.mint; tokenAmount = t.tokenAmount; direction = 'buy';
     } else if (t.fromUserAccount === walletAddr && t.tokenAmount > 0) {
-      tokenMint = t.mint;
-      tokenAmount = t.tokenAmount;
-      direction = 'sell';
+      tokenMint = t.mint; tokenAmount = t.tokenAmount; direction = 'sell';
     }
   }
 
-  // If no non-stable token found, skip truly irrelevant txs (pure SOL transfers, NFTs, etc)
   if (!tokenMint || !direction) return null;
 
-  const solAmount = direction === 'buy' ? solSpent : solReceived;
-
   return {
-    tokenMint,
-    direction,
-    solAmount: solAmount || 0.001,
-    tokenAmount,
-    signature: tx.signature,
-    timestamp: tx.timestamp,
+    tokenMint, direction,
+    solAmount: (direction === 'buy' ? solSpent : solReceived) || 0.001,
+    tokenAmount, signature: tx.signature, timestamp: tx.timestamp,
+    source: tx.source || 'UNKNOWN', txType: tx.type || 'UNKNOWN',
     description: tx.description || '',
-    source: tx.source || 'UNKNOWN',
-    txType, // SWAP, TRANSFER, etc — we pass this through for context
   };
 }
 
 // ============================================================
-// GROK AI ANALYSIS
+// EXECUTION ENGINE
 // ============================================================
-async function getGrokAnalysis(swap, walletAddr, stats, tokenInfo, price) {
-  if (!CONFIG.GROK_API_KEY) return null;
-  const prompt = `You are an AI trading analyst for a Solana copy-trading bot. A tracked wallet just bought a token. Analyze and recommend.
+async function executeBuy(tokenMint, solAmount, trade) {
+  const tokenInfo = await getTokenInfo(tokenMint);
+  const lamports = Math.floor(solAmount * 1e9);
 
-CONTEXT: I copy-trade with ~$25 SOL. Standard buy = 25% of wallet (~$6). I need: score, verdict, position size, hold time.
-
-TRADE:
-- Token: ${tokenInfo.name} (${tokenInfo.symbol}) on ${swap.source}
-- Mint: ${swap.tokenMint}
-- Trader spent: ${swap.solAmount.toFixed(4)} SOL
-- Price: $${price ? price.toFixed(8) : 'unknown'}
-
-TRADER STATS (30d from Dune):
-- ROI: ${stats.roi} | Win Rate: ${stats.wr} | Age: ${stats.days}d
-- PnL: ${stats.pnl} SOL | Median ROI: ${stats.medRoi} | Buys: ${stats.buys}
-
-POSITION SIZING: 15-20% low confidence, 25% standard, 30-40% high, 50%+ very high (max 60%).
-
-RESPOND EXACTLY:
-SCORE: [0-100]
-VERDICT: [BUY/SKIP]
-POSITION: [percentage like 25%]
-HOLD TIME: [duration like "30 minutes"]
-REASONING: [1-2 sentences]`;
+  log('EXEC', `🛒 BUYING ${tokenInfo.symbol} (${tokenMint.slice(0,12)}...) for ${solAmount.toFixed(4)} SOL`);
 
   try {
-    const r = await fetch('https://api.x.ai/v1/chat/completions', {
-      method:'POST',
-      headers: { 'Content-Type':'application/json', 'Authorization':`Bearer ${CONFIG.GROK_API_KEY}` },
-      body: JSON.stringify({ model:'grok-3-mini', messages:[{role:'user',content:prompt}], max_tokens:200, temperature:0.3 }),
+    // Get quote
+    const quoteUrl = `${CONFIG.JUPITER_QUOTE}?inputMint=${CONFIG.SOL_MINT}&outputMint=${tokenMint}&amount=${lamports}&slippageBps=${CONFIG.MAX_SLIPPAGE_BPS}`;
+    const quoteRes = await fetch(quoteUrl);
+    if (!quoteRes.ok) {
+      log('ERROR', `Quote failed: ${quoteRes.status}`);
+      await discord(`❌ Quote failed for ${tokenInfo.symbol} (\`${tokenMint}\`)`);
+      return false;
+    }
+    const quote = await quoteRes.json();
+    if (!quote.outAmount || quote.outAmount === '0') {
+      log('ERROR', 'No route/liquidity');
+      await discord(`❌ No route for ${tokenInfo.symbol} (\`${tokenMint}\`)`);
+      return false;
+    }
+
+    // Swap
+    const swapRes = await fetch(CONFIG.JUPITER_SWAP, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        quoteResponse: quote,
+        userPublicKey: state.wallet.publicKey.toString(),
+        wrapAndUnwrapSol: true,
+        dynamicSlippage: { minBps: 50, maxBps: CONFIG.MAX_SLIPPAGE_BPS },
+        prioritizationFeeLamports: CONFIG.PRIORITY_FEE_LAMPORTS,
+      }),
     });
-    if (!r.ok) { log('ERROR', `Grok ${r.status}`); return null; }
-    const d = await r.json();
-    const reply = d.choices?.[0]?.message?.content?.trim();
-    if (!reply) return null;
-    return {
-      score: parseInt(reply.match(/SCORE:\s*(\d+)/i)?.[1] || 50),
-      verdict: (reply.match(/VERDICT:\s*(BUY|SKIP)/i)?.[1] || 'UNKNOWN').toUpperCase(),
-      positionPct: parseInt(reply.match(/POSITION:\s*(\d+)/i)?.[1] || 25),
-      holdTime: reply.match(/HOLD TIME:\s*(.+)/i)?.[1]?.trim() || 'Unknown',
-      reasoning: reply.match(/REASONING:\s*(.+)/is)?.[1]?.trim().split('\n')[0] || reply.slice(0, 200),
-    };
-  } catch(e) { log('ERROR', 'Grok failed', { error: e.message }); return null; }
+    if (!swapRes.ok) { log('ERROR', `Swap req failed: ${swapRes.status}`); state.stats.errors++; return false; }
+    const swapData = await swapRes.json();
+    if (!swapData.swapTransaction) { log('ERROR', 'No swap tx'); state.stats.errors++; return false; }
+
+    // Sign & send
+    const txBuf = Buffer.from(swapData.swapTransaction, 'base64');
+    const tx = VersionedTransaction.deserialize(txBuf);
+    tx.sign([state.wallet]);
+    const sig = await state.connection.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 3 });
+    log('EXEC', `📤 TX sent: ${sig}`);
+
+    // Confirm
+    const confirmed = await confirmTx(sig);
+    if (confirmed) {
+      state.positions.set(tokenMint, { entryTime: Date.now(), entrySolAmount: solAmount });
+      state.stats.trades++;
+      state.stats.buys++;
+
+      const price = await getTokenPrice(tokenMint);
+      const msg = `🪞 **MIRROR BUY** #${state.stats.buys}\n` +
+        `**Token:** ${tokenInfo.name} (${tokenInfo.symbol})\n` +
+        `**Mint:** \`${tokenMint}\`\n` +
+        `**Amount:** ${solAmount.toFixed(4)} SOL\n` +
+        `**Price:** $${price ? price.toFixed(8) : 'N/A'}\n` +
+        `**Target spent:** ${trade.solAmount.toFixed(4)} SOL\n` +
+        `**Via:** ${trade.source}\n` +
+        `**Tx:** https://solscan.io/tx/${sig}`;
+      log('BUY', msg);
+      await discord(msg);
+      return true;
+    } else {
+      log('ERROR', `TX failed to confirm: ${sig}`);
+      state.stats.errors++;
+      await discord(`❌ Buy TX failed to confirm for ${tokenInfo.symbol} (\`${tokenMint}\`)`);
+      return false;
+    }
+  } catch(e) {
+    log('ERROR', 'Buy failed', { error: e.message });
+    state.stats.errors++;
+    return false;
+  }
 }
 
-// ============================================================
-// ALERT BUILDER
-// ============================================================
-async function sendTradeAlert(swap, walletAddr) {
-  const stats = CONFIG.WALLETS[walletAddr] || {};
-  const tokenInfo = await getTokenInfo(swap.tokenMint);
-  const tokenPrice = await getTokenPrice(swap.tokenMint);
-  const solPrice = await getTokenPrice(CONFIG.SOL_MINT);
-  const isBuy = swap.direction === 'buy';
+async function executeSell(tokenMint, trade) {
+  const tokenInfo = await getTokenInfo(tokenMint);
 
-  // Trader balance + % of wallet used
-  let traderBal = 0, traderPct = null;
+  log('EXEC', `🚪 SELLING ${tokenInfo.symbol} (${tokenMint.slice(0,12)}...)`);
+
   try {
-    const r = await fetch(CONFIG.HELIUS_RPC, { method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({jsonrpc:'2.0',id:1,method:'getBalance',params:[walletAddr]}) });
-    const d = await r.json();
-    traderBal = (d?.result?.value || 0) / 1e9;
-    const before = traderBal + (isBuy ? swap.solAmount : -swap.solAmount);
-    if (before > 0) traderPct = ((swap.solAmount / before) * 100).toFixed(1);
-  } catch(e) {}
+    // Get our token balance
+    const accts = await state.connection.getParsedTokenAccountsByOwner(
+      state.wallet.publicKey, { mint: new PublicKey(tokenMint) }
+    );
+    const acct = accts?.value?.[0];
+    if (!acct) {
+      log('WARN', `No token account for ${tokenMint.slice(0,8)}... — nothing to sell`);
+      state.positions.delete(tokenMint);
+      return false;
+    }
 
-  state.alertCount++;
-  let grok = null;
-  if (isBuy) {
-    log('GROK', `Analyzing ${tokenInfo.symbol} from ${walletAddr.slice(0,8)}...`);
-    grok = await getGrokAnalysis(swap, walletAddr, stats, tokenInfo, tokenPrice);
+    const bal = parseFloat(acct.account.data.parsed.info.tokenAmount.uiAmount || 0);
+    if (bal <= 0) {
+      log('WARN', 'Zero balance — clearing position');
+      state.positions.delete(tokenMint);
+      return false;
+    }
+
+    const dec = acct.account.data.parsed.info.tokenAmount.decimals;
+    // Sell 100% — mirror his exit completely
+    const sellAmtRaw = BigInt(Math.floor(bal * Math.pow(10, dec)));
+    if (sellAmtRaw <= 0n) { state.positions.delete(tokenMint); return false; }
+
+    // Quote
+    const quoteUrl = `${CONFIG.JUPITER_QUOTE}?inputMint=${tokenMint}&outputMint=${CONFIG.SOL_MINT}&amount=${sellAmtRaw.toString()}&slippageBps=${CONFIG.MAX_SLIPPAGE_BPS}`;
+    const quoteRes = await fetch(quoteUrl);
+    if (!quoteRes.ok) { log('ERROR', `Sell quote failed: ${quoteRes.status}`); return false; }
+    const quote = await quoteRes.json();
+    if (!quote.outAmount) { log('ERROR', 'No sell route'); return false; }
+
+    // Swap
+    const swapRes = await fetch(CONFIG.JUPITER_SWAP, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        quoteResponse: quote,
+        userPublicKey: state.wallet.publicKey.toString(),
+        wrapAndUnwrapSol: true,
+        dynamicSlippage: { minBps: 50, maxBps: CONFIG.MAX_SLIPPAGE_BPS },
+        prioritizationFeeLamports: CONFIG.PRIORITY_FEE_LAMPORTS,
+      }),
+    });
+    if (!swapRes.ok) { log('ERROR', `Sell swap failed: ${swapRes.status}`); return false; }
+    const swapData = await swapRes.json();
+
+    const txBuf = Buffer.from(swapData.swapTransaction, 'base64');
+    const tx = VersionedTransaction.deserialize(txBuf);
+    tx.sign([state.wallet]);
+    const sig = await state.connection.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 3 });
+    log('EXEC', `📤 Sell TX: ${sig}`);
+
+    const confirmed = await confirmTx(sig);
+    if (confirmed) {
+      const solBack = parseFloat(quote.outAmount) / 1e9;
+      const entry = state.positions.get(tokenMint);
+      const pnlSol = entry ? (solBack - entry.entrySolAmount) : 0;
+      state.stats.totalPnlSol += pnlSol;
+      state.stats.trades++;
+      state.stats.sells++;
+      state.positions.delete(tokenMint);
+
+      const msg = `🪞 **MIRROR SELL** #${state.stats.sells}\n` +
+        `**Token:** ${tokenInfo.name} (${tokenInfo.symbol})\n` +
+        `**Mint:** \`${tokenMint}\`\n` +
+        `**Got back:** ${solBack.toFixed(4)} SOL\n` +
+        `**PnL:** ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL\n` +
+        `**Tx:** https://solscan.io/tx/${sig}`;
+      log('SELL', msg);
+      await discord(msg);
+      return true;
+    } else {
+      log('ERROR', 'Sell TX failed to confirm');
+      state.stats.errors++;
+      return false;
+    }
+  } catch(e) {
+    log('ERROR', 'Sell failed', { error: e.message });
+    state.stats.errors++;
+    return false;
   }
-
-  const emoji = isBuy ? '🟢 BUY' : '🔴 SELL';
-  const scoreEmoji = grok ? (grok.score >= 70 ? '🔥' : grok.score >= 50 ? '⚡' : '⚠️') : '';
-  const solUsd = solPrice ? (swap.solAmount * solPrice).toFixed(2) : '?';
-
-  let msg = `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-  msg += `${emoji} ALERT #${state.alertCount}\n`;
-  msg += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-  msg += `**Token:** ${tokenInfo.name} (${tokenInfo.symbol})\n`;
-  msg += `**Mint:** \`${swap.tokenMint}\`\n`;
-  msg += `**DEX:** ${swap.source} | **Type:** ${swap.txType || 'SWAP'} | **Price:** $${tokenPrice ? tokenPrice.toFixed(8) : 'N/A'}\n`;
-  msg += `\n`;
-  msg += `**💸 Trade:** ${swap.solAmount.toFixed(4)} SOL (~$${solUsd})`;
-  if (traderPct) msg += ` — **${traderPct}% of wallet**`;
-  msg += `\n`;
-  msg += `**👤 Trader:** \`${walletAddr.slice(0,12)}...\`\n`;
-  msg += `**💰 Balance:** ${traderBal.toFixed(2)} SOL\n`;
-  msg += `**ROI:** ${stats.roi||'?'} | **WR:** ${stats.wr||'?'} | **Age:** ${stats.days||'?'}d | **PnL:** ${stats.pnl||'?'} SOL\n`;
-  msg += `**Tx:** https://solscan.io/tx/${swap.signature}\n`;
-
-  if (grok) {
-    const dollarEst = (25 * grok.positionPct / 100).toFixed(2);
-    msg += `\n${scoreEmoji} **GROK: ${grok.score}/100** → **${grok.verdict}**\n`;
-    msg += `💵 **Size:** ${grok.positionPct}% (~$${dollarEst}) | ⏱️ **Hold:** ${grok.holdTime}\n`;
-    msg += `💬 ${grok.reasoning}\n`;
-  }
-  msg += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
-
-  log('ALERT', `${emoji} ${tokenInfo.symbol} via ${swap.source} from ${walletAddr.slice(0,8)}...`, {
-    sol: swap.solAmount.toFixed(4), traderPct: traderPct||'N/A', grok: grok?.score||'N/A'
-  });
-  await sendDiscord(msg);
 }
 
-// ============================================================
-// POLLING WITH HELIUS ENHANCED PARSING
-// ============================================================
-async function initLastSigs() {
-  log('INFO', `Initializing ${WALLET_LIST.length} wallets...`);
-  let ok = 0;
-  for (const addr of WALLET_LIST) {
+async function confirmTx(sig, timeout = 60000) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
     try {
-      const r = await fetch(CONFIG.HELIUS_RPC, { method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({jsonrpc:'2.0',id:1,method:'getSignaturesForAddress',params:[addr,{limit:1}]}) });
-      const d = await r.json();
-      const sig = d?.result?.[0]?.signature;
-      if (sig) { state.lastSigs.set(addr, sig); ok++; }
-      await sleep(100);
+      const s = await state.connection.getSignatureStatuses([sig]);
+      const r = s?.value?.[0];
+      if (r?.err) return false;
+      if (r?.confirmationStatus === 'confirmed' || r?.confirmationStatus === 'finalized') return true;
     } catch(e) {}
+    await sleep(2000);
   }
-  log('INFO', `Ready: ${ok}/${WALLET_LIST.length} wallets initialized`);
+  return false;
 }
 
-async function pollWallets() {
-  log('INFO', '👀 Watching for trades (Helius Enhanced TX parser)...');
+// ============================================================
+// CORE POLLING LOOP — Watch target wallet, mirror instantly
+// ============================================================
+async function pollTarget() {
+  log('INFO', `👀 Watching ${CONFIG.TARGET_WALLET.slice(0,12)}... every ${CONFIG.POLL_INTERVAL_MS/1000}s`);
   let cycle = 0;
+
   while (state.isRunning) {
     cycle++;
-    let checked = 0, newTxs = 0, swaps = 0;
+    try {
+      // Get latest signatures
+      const r = await fetch(CONFIG.HELIUS_RPC, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'getSignaturesForAddress',
+          params: [CONFIG.TARGET_WALLET, { limit: 5 }] }),
+      });
+      const d = await r.json();
+      const sigs = d?.result || [];
 
-    for (const addr of WALLET_LIST) {
-      try {
-        const r = await fetch(CONFIG.HELIUS_RPC, { method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({jsonrpc:'2.0',id:1,method:'getSignaturesForAddress',params:[addr,{limit:3}]}) });
-        const d = await r.json();
-        const sigs = d?.result || [];
-        const lastKnown = state.lastSigs.get(addr);
-        const newSigs = [];
-        for (const s of sigs) { if (s.signature === lastKnown) break; if (!s.err) newSigs.push(s); }
-        checked++;
+      // Find new transactions
+      const newSigs = [];
+      for (const s of sigs) {
+        if (s.signature === state.lastSig) break;
+        if (!s.err) newSigs.push(s);
+      }
 
-        if (newSigs.length > 0) {
-          newTxs += newSigs.length;
-          state.lastSigs.set(addr, newSigs[0].signature);
-          const sigList = newSigs.map(s => s.signature);
+      if (newSigs.length > 0) {
+        state.lastSig = newSigs[0].signature;
+        const sigList = newSigs.map(s => s.signature);
 
-          log('INFO', `🔍 ${addr.slice(0,8)}... → ${newSigs.length} new tx(s)`);
+        log('MIRROR', `🔍 Target has ${newSigs.length} new tx(s) — parsing...`);
 
-          // Use Helius Enhanced API to parse ALL of them at once
-          const parsed = await parseWithHelius(sigList);
+        // Parse with Helius Enhanced API
+        const parsed = await parseWithHelius(sigList);
 
-          for (const tx of parsed) {
-            const trade = extractTradeFromEnhanced(tx, addr);
-            if (trade) {
-              swaps++;
-              log('SWAP', `✅ ${trade.direction.toUpperCase()} [${tx.type||'?'}] ${trade.tokenMint.slice(0,8)}... via ${trade.source}`, {
-                sol: trade.solAmount.toFixed(4), wallet: addr.slice(0,8)
-              });
-              await sendTradeAlert(trade, addr);
-              await sleep(500);
+        for (const tx of parsed) {
+          const trade = extractTrade(tx);
+          if (!trade) {
+            const hasTokens = (tx.tokenTransfers || []).length > 0;
+            log('INFO', `  ↳ ${tx.signature?.slice(0,12)}... type=${tx.type||'?'}${hasTokens ? ' (tokens but no match)' : ' (no tokens)'}`);
+            continue;
+          }
+
+          log('MIRROR', `🎯 Target ${trade.direction.toUpperCase()} ${trade.tokenMint.slice(0,8)}... (${trade.solAmount.toFixed(4)} SOL) via ${trade.source}`);
+
+          if (trade.direction === 'buy') {
+            const ourBal = await getSOLBalance();
+            const tradeSize = calculateTradeSize(trade.solAmount, ourBal);
+
+            if (tradeSize <= 0) {
+              log('WARN', `Trade too small or balance too low (bal: ${ourBal.toFixed(4)} SOL)`);
+              await discord(`⚠️ Skipped BUY — balance too low (${ourBal.toFixed(4)} SOL)\nTarget bought \`${trade.tokenMint}\``);
+              continue;
+            }
+
+            log('MIRROR', `Mirroring BUY: target=${trade.solAmount.toFixed(4)} SOL → us=${tradeSize.toFixed(4)} SOL`, {
+              balance: ourBal.toFixed(4), pctOfBal: ((tradeSize / ourBal) * 100).toFixed(1) + '%'
+            });
+
+            await executeBuy(trade.tokenMint, tradeSize, trade);
+
+          } else if (trade.direction === 'sell') {
+            // Check if we hold this token
+            if (state.positions.has(trade.tokenMint)) {
+              log('MIRROR', `Mirroring SELL for ${trade.tokenMint.slice(0,8)}...`);
+              await executeSell(trade.tokenMint, trade);
             } else {
-              // No token movement we care about — log it but skip alert
-              const hasAnyTokenTransfer = (tx.tokenTransfers || []).length > 0;
-              if (hasAnyTokenTransfer) {
-                log('INFO', `  ↳ ${tx.signature?.slice(0,12)}... type=${tx.type||'?'} — has token transfers but no non-stable token match`);
-              } else {
-                log('INFO', `  ↳ ${tx.signature?.slice(0,12)}... type=${tx.type||'?'} — no token transfers (SOL only / NFT / other)`);
+              // We might hold it from a previous session — try to sell anyway
+              try {
+                const accts = await state.connection.getParsedTokenAccountsByOwner(
+                  state.wallet.publicKey, { mint: new PublicKey(trade.tokenMint) }
+                );
+                const bal = parseFloat(accts?.value?.[0]?.account?.data?.parsed?.info?.tokenAmount?.uiAmount || 0);
+                if (bal > 0) {
+                  log('MIRROR', `Found ${bal} tokens from previous session — selling`);
+                  state.positions.set(trade.tokenMint, { entryTime: 0, entrySolAmount: 0 });
+                  await executeSell(trade.tokenMint, trade);
+                } else {
+                  log('INFO', `Target sold ${trade.tokenMint.slice(0,8)}... but we don't hold it`);
+                }
+              } catch(e) {
+                log('INFO', `Target sold ${trade.tokenMint.slice(0,8)}... but we don't hold it`);
               }
             }
           }
+
+          await sleep(300); // Brief pause between executions
         }
-        await sleep(150);
-      } catch(e) {}
+      }
+
+      // Log every 15 cycles (~30s)
+      if (cycle % 15 === 0) {
+        log('INFO', `📊 Cycle #${cycle} | Watching target | ${state.positions.size} open positions | ${state.stats.trades} trades`);
+      }
+
+    } catch(e) {
+      log('ERROR', 'Poll error', { error: e.message });
     }
 
-    if (cycle % 10 === 0) {
-      log('INFO', `📊 Cycle #${cycle} | ${checked}/${WALLET_LIST.length} checked | ${newTxs} new txs | ${swaps} swaps`);
-    }
     await sleep(CONFIG.POLL_INTERVAL_MS);
   }
 }
 
 // ============================================================
-// HEALTH + MAIN
+// HEALTH DASHBOARD
 // ============================================================
 async function healthLoop() {
   while (state.isRunning) {
-    console.log('\n' + '═'.repeat(50));
-    console.log('  🤖 WINSTON v9.3 — Enhanced TX Alert Bot');
-    console.log('═'.repeat(50));
-    console.log(`  👀 ${WALLET_LIST.length} wallets | 🔔 ${state.alertCount} alerts`);
-    console.log(`  🤖 Grok: ${CONFIG.GROK_API_KEY ? 'Active' : 'OFF'} | 📢 Discord: ${CONFIG.DISCORD_WEBHOOK ? 'Active' : 'OFF'}`);
-    console.log(`  🔧 Parser: Helius Enhanced TX (all DEXes)`);
-    console.log('═'.repeat(50) + '\n');
+    const bal = await getSOLBalance();
+    const solP = await getTokenPrice(CONFIG.SOL_MINT);
+    const usd = (bal * solP).toFixed(2);
+    const sessionPnl = bal - state.stats.startBalance;
+
+    console.log('\n' + '═'.repeat(55));
+    console.log('  🪞 WINSTON v10 — Mirror Bot');
+    console.log('═'.repeat(55));
+    console.log(`  🎯 Mirroring: ${CONFIG.TARGET_WALLET.slice(0,16)}...`);
+    console.log(`  💰 Balance: ${bal.toFixed(4)} SOL ($${usd})`);
+    console.log(`  📊 Session PnL: ${sessionPnl >= 0 ? '+' : ''}${sessionPnl.toFixed(4)} SOL`);
+    console.log(`  🛒 Buys: ${state.stats.buys} | 🚪 Sells: ${state.stats.sells} | ❌ Errors: ${state.stats.errors}`);
+    console.log(`  📦 Open positions: ${state.positions.size}`);
+    if (state.positions.size > 0) {
+      for (const [mint, pos] of state.positions) {
+        const age = ((Date.now() - pos.entryTime) / 60000).toFixed(0);
+        const price = await getTokenPrice(mint);
+        const info = await getTokenInfo(mint);
+        console.log(`     ${info.symbol} (${mint.slice(0,8)}...) | ${age}m | entry: ${pos.entrySolAmount.toFixed(4)} SOL`);
+      }
+    }
+    console.log('═'.repeat(55) + '\n');
     await sleep(CONFIG.HEALTH_LOG_INTERVAL_MS);
   }
 }
 
+// ============================================================
+// MAIN
+// ============================================================
 async function main() {
-  console.log('\n╔═══════════════════════════════════════════════════════╗');
-  console.log('║   🤖 WINSTON v9.3 — Helius Enhanced + Grok Alerts    ║');
-  console.log('║     All DEXes • AI Scoring • Discord Notifications    ║');
-  console.log('╚═══════════════════════════════════════════════════════╝\n');
+  console.log('\n╔═══════════════════════════════════════════════════════════╗');
+  console.log('║     🪞 WINSTON v10 — Single Wallet Mirror Bot             ║');
+  console.log('║     Auto-Buy • Auto-Sell • Proportional Sizing            ║');
+  console.log('║     Target: ARu4n5...SZn                                  ║');
+  console.log('╚═══════════════════════════════════════════════════════════╝\n');
 
+  // Validate
   if (!CONFIG.HELIUS_API_KEY) { log('ERROR', 'HELIUS_API_KEY required'); process.exit(1); }
-  if (!CONFIG.DISCORD_WEBHOOK) { log('ERROR', 'DISCORD_WEBHOOK_URL required'); process.exit(1); }
-  if (!CONFIG.GROK_API_KEY) log('WARN', 'GROK_API_KEY not set — no AI analysis');
+  if (!CONFIG.PRIVATE_KEY) { log('ERROR', 'WALLET_PRIVATE_KEY required'); process.exit(1); }
 
-  if (CONFIG.PRIVATE_KEY) {
-    try { state.wallet = Keypair.fromSecretKey(bs58.decode(CONFIG.PRIVATE_KEY)); log('INFO', `Wallet: ${state.wallet.publicKey}`); }
-    catch(e) { log('WARN', 'Private key invalid — alert-only mode'); }
+  // Init wallet
+  try {
+    state.wallet = Keypair.fromSecretKey(bs58.decode(CONFIG.PRIVATE_KEY));
+    log('INFO', `Our wallet: ${state.wallet.publicKey.toString()}`);
+  } catch(e) {
+    log('ERROR', 'Invalid private key');
+    process.exit(1);
   }
 
-  state.connection = new Connection(CONFIG.HELIUS_RPC, { commitment:'confirmed' });
+  // Init connection
+  state.connection = new Connection(CONFIG.HELIUS_RPC, { commitment: 'confirmed' });
+
+  // Check balance
+  state.stats.startBalance = await getSOLBalance();
+  const solPrice = await getTokenPrice(CONFIG.SOL_MINT);
+  const usd = (state.stats.startBalance * solPrice).toFixed(2);
+  log('INFO', `Balance: ${state.stats.startBalance.toFixed(4)} SOL ($${usd})`);
+
+  if (state.stats.startBalance < 0.01) {
+    log('ERROR', 'Balance too low — need at least 0.01 SOL');
+    process.exit(1);
+  }
+
+  // Initialize — get target's latest signature so we only mirror NEW trades
+  try {
+    const r = await fetch(CONFIG.HELIUS_RPC, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'getSignaturesForAddress',
+        params: [CONFIG.TARGET_WALLET, { limit: 1 }] }),
+    });
+    const d = await r.json();
+    state.lastSig = d?.result?.[0]?.signature || null;
+    log('INFO', `Target wallet initialized. Last sig: ${state.lastSig?.slice(0,16)}...`);
+  } catch(e) {
+    log('ERROR', 'Failed to init target wallet');
+    process.exit(1);
+  }
+
   state.isRunning = true;
-  await initLastSigs();
 
-  log('INFO', `🚀 Live — ${WALLET_LIST.length} wallets — Helius Enhanced TX parser (catches ALL swaps)`);
-  await sendDiscord(`🚀 **Winston v9.3** | ${WALLET_LIST.length} wallets | Helius Enhanced TX | All DEXes | Grok: ${CONFIG.GROK_API_KEY ? '✅' : '❌'}`);
+  // Calculate sizing info
+  const ratio = ((CONFIG.OUR_TOTAL_VALUE_USD / CONFIG.TARGET_TOTAL_VALUE_USD) * CONFIG.PROPORTIONAL_BOOST * 100).toFixed(2);
+  log('INFO', `📐 Sizing: ${ratio}% of target's trades (boosted ${CONFIG.PROPORTIONAL_BOOST}x)`);
+  log('INFO', `📐 Bounds: ${(CONFIG.MIN_TRADE_PCT * 100)}% min — ${(CONFIG.MAX_TRADE_PCT * 100)}% max of our balance`);
+  log('INFO', `🚀 LIVE — Mirroring ${CONFIG.TARGET_WALLET.slice(0,16)}...`);
 
-  process.on('SIGINT', async () => { state.isRunning = false; await sendDiscord(`🛑 Winston offline. ${state.alertCount} alerts sent.`); process.exit(0); });
-  process.on('SIGTERM', async () => { state.isRunning = false; await sendDiscord(`🛑 Winston offline. ${state.alertCount} alerts sent.`); process.exit(0); });
+  await discord(
+    `🪞 **Winston v10 LIVE**\n` +
+    `**Mirroring:** \`${CONFIG.TARGET_WALLET}\`\n` +
+    `**Balance:** ${state.stats.startBalance.toFixed(4)} SOL ($${usd})\n` +
+    `**Sizing:** ~${ratio}% of target (min ${(CONFIG.MIN_TRADE_PCT*100)}%, max ${(CONFIG.MAX_TRADE_PCT*100)}% of balance)\n` +
+    `**Speed:** Checking every ${CONFIG.POLL_INTERVAL_MS/1000}s`
+  );
 
-  await Promise.all([pollWallets(), healthLoop()]);
+  // Shutdown
+  const shutdown = async () => {
+    state.isRunning = false;
+    const finalBal = await getSOLBalance();
+    const pnl = finalBal - state.stats.startBalance;
+    log('INFO', `🛑 Shutdown | Final: ${finalBal.toFixed(4)} SOL | PnL: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} SOL`);
+    await discord(
+      `🛑 **Winston v10 Offline**\n` +
+      `Final: ${finalBal.toFixed(4)} SOL | PnL: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} SOL\n` +
+      `Trades: ${state.stats.buys} buys, ${state.stats.sells} sells, ${state.stats.errors} errors`
+    );
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
+  // Run
+  await Promise.all([pollTarget(), healthLoop()]);
 }
 
 main().catch(e => { log('ERROR', 'Fatal', { error: e.message }); process.exit(1); });
