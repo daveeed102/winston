@@ -27,7 +27,7 @@ const CONFIG = {
 
   // Sizing: 1 SOL he spends = $2 for us = 0.024 SOL
   RATIO: 0.024,
-  MIN_BUY_SOL: 0.02,
+  MIN_BUY_SOL: 0.025,
   MAX_BUY_PCT: 0.06,
   MAX_RETRIES: 3,
 
