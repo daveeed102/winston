@@ -24,12 +24,12 @@ const CONFIG = {
   TARGET_WALLET: 'ARu4n5mFdZogZAravu7CcizaojWnS6oqka37gdLT5SZn',
 
   // Fixed $5 per trade (~0.037 SOL at ~$135/SOL)
-  TRADE_AMOUNT_SOL: 0.037,
+  TRADE_AMOUNT_SOL: 0.061,
   MAX_POSITIONS: 3,
 
   // Momentum: take 2 price snapshots 3s apart, need >0% gain
   MOMENTUM_DELAY_MS: 3000,
-  MIN_MOMENTUM_PCT: 0,  // Any positive movement = go
+  MIN_MOMENTUM_PCT: 0.1,  // Need at least +0.1% in 3s (filters noise + stablecoins)
 
   // Fees — minimal
   MAX_SLIPPAGE_BPS: 200,
@@ -64,7 +64,16 @@ const CONFIG = {
   SOL_MINT: 'So11111111111111111111111111111111111111112',
 };
 
-const STABLES = new Set(['EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v','Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB']);
+const STABLES = new Set([
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
+  'USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB',   // USD1 (World Liberty Financial)
+  'CASHx9KJUStyftLFWGvEVf59SGeG9sh5FfcnZMVPCASH', // CASH stablecoin
+  'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So',  // mSOL (Marinade staked SOL)
+  'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn', // jitoSOL
+  'bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1',  // bSOL
+  'jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL',  // JitoSOL (JTO staked)
+]);
 const state = {
   wallet:null, connection:null, lastSig:null, isRunning:false,
   positions: new Map(),
