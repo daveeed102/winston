@@ -27,8 +27,8 @@ const CONFIG = {
 
   // Sizing: 1 SOL he spends = $2 for us = 0.024 SOL
   RATIO: 0.024,
-  MIN_BUY_SOL: 0.025,
-  MAX_BUY_PCT: 0.06,
+  MIN_BUY_SOL: 0.02,
+  MAX_BUY_PCT: 0.60,
   MAX_RETRIES: 3,
 
   // Normal fees for buys
@@ -184,9 +184,9 @@ async function execBuy(mint, sol, targetSol, attempt=1) {
     const sig = await state.connection.sendRawTransaction(tx.serialize(),{skipPreflight:true,maxRetries:3});
 
     if(await confirm(sig)) {
-      state.positions.set(mint, {time:Date.now(), sol, sym:info.sym, soldPct:0, isSelling:false, highestRoi:-Infinity});
+      state.positions.set(mint, {time:Date.now(), sol, sym:info.sym, soldPct:0, isSelling:false, highestRoi:-Infinity, lastBarStep:0});
       state.stats.buys++;
-      const msg = `🪞🟢 **BUY** ${info.name} (${info.sym})\n\`${mint}\`\n${sol.toFixed(4)} SOL (target: ${targetSol.toFixed(2)} SOL)\nhttps://solscan.io/tx/${sig}`;
+      const msg = `🟢  **BUY** \`${mint}\`\n💸  **${sol.toFixed(4)} SOL**  ·  target: ${targetSol.toFixed(2)} SOL\n🔗  https://solscan.io/tx/${sig}`;
       log('BUY', `✅ ${info.sym} ${sol.toFixed(4)} SOL`);
       await discord(msg);
       return true;
@@ -254,8 +254,23 @@ async function execSell(mint, pct, reason, emergency=false, attempt=1) {
       if(pos) pos.soldPct = (pos.soldPct||0) + sellPct;
       if(!pos || pos.soldPct >= 100) state.positions.delete(mint);
 
-      const emoji = emergency ? '🚨' : '🪞🔴';
-      const msg = `${emoji} **SELL ${sellPct}%** ${info.name} (${info.sym})\n\`${mint}\`\n${solBack.toFixed(4)} SOL back | PnL: ${pnlPortion>=0?'+':''}${pnlPortion.toFixed(4)} SOL\n${reason}${emergency?' [EMERGENCY]':''}\nhttps://solscan.io/tx/${sig}`;
+      const pnlSign = pnlPortion >= 0 ? '+' : '';
+      const pnlEmoji = pnlPortion >= 0 ? '📈' : '📉';
+      let sellEmoji, sellLabel;
+      if(emergency) {
+        sellEmoji = '⚠️🚨';
+        sellLabel = '**EMERGENCY SELL**';
+      } else if(reason.startsWith('TRAILING SL') || reason.startsWith('STOP LOSS') || reason.startsWith('SL')) {
+        sellEmoji = '🛑';
+        sellLabel = '**STOP LOSS**';
+      } else if(reason.startsWith('stall')) {
+        sellEmoji = '⏰';
+        sellLabel = '**STALL EXIT**';
+      } else {
+        sellEmoji = '🔴';
+        sellLabel = '**SELL**';
+      }
+      const msg = `${sellEmoji}  ${sellLabel} \`${mint}\`\n💰  **${solBack.toFixed(4)} SOL** back  ·  ${pnlEmoji} PnL: **${pnlSign}${pnlPortion.toFixed(4)} SOL**\n📋  ${reason}\n🔗  https://solscan.io/tx/${sig}`;
       log('SELL', `✅ ${info.sym} ${sellPct}% → ${solBack.toFixed(4)} SOL (${pnlPortion>=0?'+':''}${pnlPortion.toFixed(4)})${emergency?' EMERGENCY':''}`);
       await discord(msg);
       return true;
@@ -341,6 +356,20 @@ async function exitManager() {
         const slLabel = dynamicSL !== CONFIG.STOP_LOSS_PCT ? ` | TSL:${dynamicSL>=0?'+':''}${dynamicSL}%` : '';
         console.log(`  [WATCHING] ${pos.sym} | Whale/Bot PnL: ${roiPct>=0?'+':''}${roiPct.toFixed(1)}% [${bar}] | Peak: ${pos.highestRoi>-Infinity?(pos.highestRoi>=0?'+':'')+pos.highestRoi.toFixed(1)+'%':'--'}${slLabel} | Target: +${CONFIG.WHALE_TP_MIN}% | ${ageSec}s${danger}`);
 
+        // === DISCORD PROGRESS BAR: Post update at each 10% ROI milestone ===
+        if(roiPct > 0) {
+          const step = Math.floor(roiPct / 10); // 1=10%, 2=20%, ... 5=50%+
+          if(step > (pos.lastBarStep || 0)) {
+            pos.lastBarStep = step;
+            const cappedPct = Math.min(roiPct, 50);
+            const filled = Math.round(cappedPct / 5); // 10 blocks = 50%
+            const discordBar = '🟩'.repeat(filled) + '⬛'.repeat(Math.max(10 - filled, 0));
+            const milestoneLabel = roiPct >= 40 ? ' 🔥 DUMP ZONE' : roiPct >= 30 ? ' ⚠️ DANGER ZONE' : '';
+            const slInfo = dynamicSL !== CONFIG.STOP_LOSS_PCT ? `  ·  TSL locked at **${dynamicSL>=0?'+':''}${dynamicSL}%**` : '';
+            await discord(`🐋  **WHALE TRACKER** \`${mint.slice(0,16)}...\`\n${discordBar}\n📊  ROI: **+${roiPct.toFixed(1)}%** / **50% rug zone**${milestoneLabel}\n⏱  Age: **${ageSec}s**  ·  SL: **${dynamicSL>=0?'+':''}${dynamicSL}%**${slInfo}`);
+          }
+        }
+
         // === 1. STOP LOSS: dynamic trailing SL → dump everything ===
         if(roiPct <= dynamicSL) {
           const slType = dynamicSL !== CONFIG.STOP_LOSS_PCT ? 'TRAILING SL' : 'STOP LOSS';
@@ -364,7 +393,7 @@ async function exitManager() {
           log('EXIT', `🎯🔥 WHALE TRACKER ${pos.sym} at +${roiPct.toFixed(1)}% — FRONT-RUNNING WHALE DUMP — selling 100%`);
           pos.isSelling = true;
           await execSell(mint, 100, `WHALE_FRONTRUN_+${roiPct.toFixed(0)}%`, false);
-          await discord(`🎯🔥 **WHALE FRONT-RUN** ${pos.sym}\n\`${mint}\`\nROI: +${roiPct.toFixed(1)}% | Peak: +${pos.highestRoi.toFixed(1)}% | Sold 100% BEFORE whale dump zone (+50%)`);
+          await discord(`🐋🎯  **WHALE FRONT-RUN — SOLD**\n\`${mint}\`\n📊  ROI: **+${roiPct.toFixed(1)}%**  ·  Peak: **+${pos.highestRoi.toFixed(1)}%**\n✅  Sold 100% before whale dump zone (+50%)\n📋  ${`WHALE_FRONTRUN_+${roiPct.toFixed(0)}%`}`);
           continue;
         }
 
@@ -499,12 +528,16 @@ async function main() {
   log('INFO', `🎯 Whale Tracker: single-shot 100% sell at +${CONFIG.WHALE_TP_MIN}% to +${CONFIG.WHALE_TP_MAX}% (whale dumps at +50%)`);
   log('INFO', `⛔ SL: ${CONFIG.STOP_LOSS_PCT}% | ⏰ Stall: ${CONFIG.STALL_MINUTES}min | 🚨 Emergency: ${CONFIG.EMERGENCY_SLIPPAGE_BPS/100}% slip, ${CONFIG.EMERGENCY_PRIORITY_LAMPORTS/1e9} SOL priority`);
 
-  await discord(`🪞 **Winston v11.1 — Whale Tracker Mirror**\nTarget: \`${CONFIG.TARGET}\`\nBalance: ${state.stats.startBal.toFixed(4)} SOL\n**Whale Tracker:** sell 100% at +${CONFIG.WHALE_TP_MIN}% (whale dumps at +50%)\n**SL:** ${CONFIG.STOP_LOSS_PCT}% | **Stall:** ${CONFIG.STALL_MINUTES}min\n**Emergency:** 10% slippage, 16x priority`);
+  await discord(`▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🟢  **WINSTON NOW ONLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🎯  Target: \`${CONFIG.TARGET}\`\n💰  Balance: **${state.stats.startBal.toFixed(4)} SOL**\n📊  TP: **+${CONFIG.WHALE_TP_MIN}%**  |  SL: **${CONFIG.STOP_LOSS_PCT}%**  |  Stall: **${CONFIG.STALL_MINUTES}min**\n🚨  Emergency: ${CONFIG.EMERGENCY_SLIPPAGE_BPS/100}% slippage, 16x priority\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬`);
 
+  let shuttingDown = false;
   const shutdown = async () => {
+    if(shuttingDown) return;
+    shuttingDown = true;
     state.isRunning = false;
     const f = await solBal(); const p = f - state.stats.startBal;
-    await discord(`🛑 **Offline** | ${f.toFixed(4)} SOL | PnL: ${p>=0?'+':''}${p.toFixed(4)} | ${state.stats.buys}B ${state.stats.sells}S ${state.stats.errors}E`);
+    const pnlStr = `${p>=0?'+':''}${p.toFixed(4)} SOL`;
+    await discord(`▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n💰  Balance: **${f.toFixed(4)} SOL**\n📈  Session PnL: **${pnlStr}**\n🛒  ${state.stats.buys} Buys  |  🚪 ${state.stats.sells} Sells  |  ❌ ${state.stats.errors} Errors\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬`);
     process.exit(0);
   };
   process.on('SIGINT', shutdown);
