@@ -86,7 +86,55 @@ async function getSOLBalance() {
   try{return(await state.connection.getBalance(state.wallet.publicKey))/1e9;}catch(e){return 0;}
 }
 async function getTokenPrice(mint) {
-  try{const r=await fetch(`${CONFIG.JUPITER_PRICE}?ids=${mint}`);if(!r.ok)return 0;const d=await r.json();return parseFloat(d?.data?.[mint]?.price||0);}catch(e){return 0;}
+  // Source 1: Jupiter Price API (works for established tokens)
+  try {
+    const r = await fetch(`${CONFIG.JUPITER_PRICE}?ids=${mint}`);
+    if (r.ok) {
+      const d = await r.json();
+      const p = parseFloat(d?.data?.[mint]?.price || 0);
+      if (p > 0) return p;
+    }
+  } catch(e) {}
+
+  // Source 2: Get price via Jupiter quote (works for ANY tradeable token including pump.fun)
+  // Ask "how much SOL would I get for 1M units of this token?" and derive price
+  try {
+    const testAmount = '1000000000'; // 1 billion raw units (covers most decimals)
+    const r = await fetch(`${CONFIG.JUPITER_QUOTE}?inputMint=${mint}&outputMint=${CONFIG.SOL_MINT}&amount=${testAmount}&slippageBps=500`);
+    if (r.ok) {
+      const q = await r.json();
+      if (q.outAmount && q.outAmount !== '0') {
+        const solOut = parseFloat(q.outAmount) / 1e9;
+        const inputDecimals = q.inputMint === mint ? (q.routePlan?.[0]?.swapInfo?.inputMint === mint ? 9 : 6) : 9;
+        // outAmount is in lamports, inAmount is in raw token units
+        const inAmount = parseFloat(q.inAmount || testAmount);
+        if (inAmount > 0 && solOut > 0) {
+          // Price per token in SOL, then we'd need SOL price to get USD
+          // But for momentum comparison, SOL-denominated price works fine
+          const solPrice = solOut / (inAmount / Math.pow(10, 9)); // approximate
+          return solPrice; // Returns price in SOL terms — good enough for momentum
+        }
+      }
+    }
+  } catch(e) {}
+
+  // Source 3: Try with a smaller amount (some tokens have very different decimals)
+  try {
+    const r = await fetch(`${CONFIG.JUPITER_QUOTE}?inputMint=${CONFIG.SOL_MINT}&outputMint=${mint}&amount=10000000&slippageBps=500`);
+    if (r.ok) {
+      const q = await r.json();
+      if (q.outAmount && q.outAmount !== '0') {
+        // We're asking "how many tokens for 0.01 SOL?"
+        // If we get tokens back, the token is tradeable — return a synthetic price
+        const tokensOut = parseFloat(q.outAmount);
+        if (tokensOut > 0) {
+          return 10000000 / tokensOut; // lamports per token unit — consistent for momentum
+        }
+      }
+    }
+  } catch(e) {}
+
+  return 0;
 }
 async function getTokenInfo(mint) {
   try{const r=await fetch(`https://lite-api.jup.ag/tokens/v1/token/${mint}`);if(r.ok){const d=await r.json();return{name:d.name||'Unknown',symbol:d.symbol||'???'};}}catch(e){}
@@ -199,9 +247,9 @@ async function executeBuy(mint, sol, momentum) {
     const sig=await state.connection.sendRawTransaction(tx.serialize(),{skipPreflight:true,maxRetries:3});
 
     if(await confirmTx(sig)){
+      const price=await getTokenPrice(mint);
       state.positions.set(mint,{entryTime:Date.now(),entrySolAmount:sol,symbol:info.symbol,entryPrice:price||0,peakPrice:price||0,soldPct:0});
       state.stats.trades++;state.stats.buys++;
-      const price=await getTokenPrice(mint);
       const msg=`🪞📈 **MOMENTUM BUY** #${state.stats.buys}\n`+
         `**${info.name}** (${info.symbol})\n`+
         `**Mint:** \`${mint}\`\n`+
@@ -428,8 +476,11 @@ async function pollTarget() {
             }else{
               state.stats.momentumFails++;
               const info=await getTokenInfo(mint);
-              log('MOMENTUM',`⏭️ Skipping ${info.symbol} (${mint.slice(0,8)}...) — ${m.reason||'no momentum'}`);
-              await discord(`⏭️ **SKIP** ${info.name} (${info.symbol})\n**Mint:** \`${mint}\`\n**Reason:** ${m.reason||'no momentum'}${m.changePct!==undefined?` (${m.changePct.toFixed(2)}%)`:''}`);
+              log('MOMENTUM',`⏭️ Skip ${info.symbol} (${mint.slice(0,8)}...) — ${m.reason||'no momentum'}`);
+              // Only Discord-notify momentum fails, not "no price" (reduces spam)
+              if(m.reason !== 'no_price' && m.reason !== 'price_disappeared') {
+                await discord(`⏭️ **SKIP** ${info.name} (${info.symbol})\n**Mint:** \`${mint}\`\n**Momentum:** ${m.changePct?.toFixed(2)||'?'}% — not enough`);
+              }
             }
           }
         }
