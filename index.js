@@ -32,12 +32,12 @@ const CONFIG = {
   MAX_RETRIES: 3,
 
   // Normal fees for buys
-  MAX_SLIPPAGE_BPS: 300,
-  PRIORITY_FEE_LAMPORTS: 30000,    // 0.00003 SOL
+  MAX_SLIPPAGE_BPS: 2000,               // Changed to 20% to survive volatility 
+  PRIORITY_FEE_LAMPORTS: 2000000,       // 0.002 SOL (~$0.30) to bypass network lag
 
   // EMERGENCY fees for panic sells (whale dumping)
-  EMERGENCY_SLIPPAGE_BPS: 1000,    // 10% slippage — get out at any cost
-  EMERGENCY_PRIORITY_LAMPORTS: 500000,  // 0.0005 SOL — land in same block
+  EMERGENCY_SLIPPAGE_BPS: 2000,         // 20% slippage — get out at any cost
+  EMERGENCY_PRIORITY_LAMPORTS: 5000000, // 0.005 SOL (~$0.80) — absolute max priority
 
   // Exit strategy — Single-shot whale front-run
   WHALE_TP_MIN: 40,                // Sell when ROI hits +40%
