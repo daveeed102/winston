@@ -27,7 +27,7 @@ const CONFIG = {
 
   // Sizing: 1 SOL he spends = $2 for us = 0.024 SOL
   RATIO: 0.024,
-  MIN_BUY_SOL: 0.03,
+  MIN_BUY_SOL: 0.02,
   MAX_BUY_PCT: 0.60,
   MAX_RETRIES: 3,
 
@@ -60,6 +60,7 @@ const IGNORE = new Set([
 const state = {
   wallet: null, connection: null, lastSig: null, isRunning: false,
   positions: new Map(), // mint -> {time, sol, sym, soldPct}
+  tradedMints: new Set(), // session-level blacklist — never re-buy a token we've already traded
   stats: { buys:0, sells:0, errors:0, retries:0, startBal:0 },
 };
 
@@ -160,10 +161,11 @@ function calcSize(targetSol, ourBal) {
 }
 
 // === EXECUTION: BUY (unchanged from v11) ===
-async function execBuy(mint, sol, targetSol, attempt=1) {
+async function execBuy(mint, sol, targetSol) {
+  state.tradedMints.add(mint); // blacklist immediately — no retries, no FOMO re-buys, no DCA traps
   const info = await tokenInfo(mint);
   const lamports = Math.floor(sol * 1e9);
-  log('EXEC', `🛒 BUY ${info.sym} ${sol.toFixed(4)} SOL (attempt ${attempt})`, {mint:mint.slice(0,12)});
+  log('EXEC', `🛒 BUY ${info.sym} ${sol.toFixed(4)} SOL`, {mint:mint.slice(0,12)});
 
   try {
     const qr = await fetch(`${CONFIG.JUPITER_QUOTE}?inputMint=${CONFIG.SOL}&outputMint=${mint}&amount=${lamports}&slippageBps=${CONFIG.MAX_SLIPPAGE_BPS}`);
@@ -192,13 +194,8 @@ async function execBuy(mint, sol, targetSol, attempt=1) {
       return true;
     } else { throw new Error('Confirm timeout'); }
   } catch(e) {
-    log('ERROR', `Buy fail: ${e.message}`, {attempt});
-    if(attempt < CONFIG.MAX_RETRIES) {
-      state.stats.retries++;
-      await sleep(2000);
-      return execBuy(mint, sol, targetSol, attempt+1);
-    }
     state.stats.errors++;
+    log('ERROR', `Buy fail (no retry): ${e.message}`, {mint:mint.slice(0,12)});
     await discord(`❌ Buy failed: ${info.sym} \`${mint}\` — ${e.message}`);
     return false;
   }
@@ -447,7 +444,7 @@ async function poll() {
 
           // Buys — mirror all target buys unconditionally
           for(const t of trades.filter(t=>t.dir==='buy')) {
-            if(state.positions.has(t.mint)) continue;
+            if(state.tradedMints.has(t.mint) || state.positions.has(t.mint)) continue;
             const bal = await solBal();
             const size = calcSize(t.sol, bal);
             if(size <= 0) { log('INFO', `Low bal (${bal.toFixed(4)})`); break; }
