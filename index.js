@@ -2,7 +2,7 @@
 // WINSTON v11.1 — Anti-Rug Mirror Bot
 // ============================================================
 // Beat the whale to the exit. We sell BEFORE he dumps.
-// TP: +25% sell 40%, +50% sell 40%, +70% sell all
+// TP: Single-shot sell at +40-45% (front-run whale's +50% dump)
 // SL: -20% instant dump
 // Stall: 3min timer → dump everything
 // Emergency: If whale sells, max priority fee sell
@@ -39,10 +39,9 @@ const CONFIG = {
   EMERGENCY_SLIPPAGE_BPS: 1000,    // 10% slippage — get out at any cost
   EMERGENCY_PRIORITY_LAMPORTS: 500000,  // 0.0005 SOL — land in same block
 
-  // Exit strategy
-  TP1_PCT: 25,  TP1_SELL: 40,     // +25% → sell 40%
-  TP2_PCT: 50,  TP2_SELL: 40,     // +50% → sell 40%
-  TP3_PCT: 70,  TP3_SELL: 100,    // +70% → sell remaining
+  // Exit strategy — Single-shot whale front-run
+  WHALE_TP_MIN: 40,                // Sell when ROI hits +40%
+  WHALE_TP_MAX: 45,                // Hard sell at +45% no matter what
   STOP_LOSS_PCT: -20,              // -20% → dump everything
   STALL_MINUTES: 3,                // 3 min stall → dump everything
   EXIT_CHECK_MS: 2000,             // Check exits every 2s
@@ -289,17 +288,22 @@ async function confirm(sig, timeout=60000) {
 }
 
 // ============================================================
-// EXIT MANAGER — Beat the whale to the exit
-// Checks every 2s using Jupiter quotes for real-time value
+// EXIT MANAGER — Single-Shot Whale Front-Run
+// ============================================================
+// The whale dumps at ~+50%. We sell at +40-45% to beat him.
+// One sell, one fee, maximum profit retained.
+// Live console shows whale PnL approaching dump zone.
+// Safety nets: -20% SL, 3min stall, emergency eject unchanged.
 // ============================================================
 async function exitManager() {
-  log('INFO', `🎯 Exit manager active | TP: +${CONFIG.TP1_PCT}%/${CONFIG.TP2_PCT}%/${CONFIG.TP3_PCT}% | SL: ${CONFIG.STOP_LOSS_PCT}% | Stall: ${CONFIG.STALL_MINUTES}min`);
+  log('INFO', `🎯 Whale Tracker active | Sell zone: +${CONFIG.WHALE_TP_MIN}% to +${CONFIG.WHALE_TP_MAX}% | SL: ${CONFIG.STOP_LOSS_PCT}% | Stall: ${CONFIG.STALL_MINUTES}min`);
 
   while(state.isRunning) {
     await sleep(CONFIG.EXIT_CHECK_MS);
 
     for(const [mint, pos] of state.positions) {
       if(!pos.sol || pos.sol <= 0) continue;
+      if((pos.soldPct||0) >= 100) continue;
 
       try {
         // Get current position value via Jupiter quote
@@ -318,41 +322,37 @@ async function exitManager() {
 
         const currentValSol = parseFloat(q.outAmount) / 1e9;
         const originalInvest = pos.sol;
-        const returnPct = ((currentValSol / originalInvest) - 1) * 100;
+        const roiPct = ((currentValSol / originalInvest) - 1) * 100;
         const ageMin = (Date.now() - pos.time) / 60000;
+        const ageSec = ((Date.now() - pos.time) / 1000).toFixed(0);
+
+        // Live console log — show whale approaching dump zone
+        const bar = roiPct >= 0
+          ? '█'.repeat(Math.min(Math.floor(roiPct / 2), 25)) + '░'.repeat(Math.max(25 - Math.floor(roiPct / 2), 0))
+          : '▓'.repeat(Math.min(Math.floor(Math.abs(roiPct) / 2), 25));
+        const danger = roiPct >= 35 ? ' ⚠️ DUMP ZONE APPROACHING' : roiPct >= CONFIG.WHALE_TP_MIN ? ' 🔥 SELLING NOW' : '';
+        console.log(`  [WATCHING] ${pos.sym} | Whale/Bot PnL: ${roiPct>=0?'+':''}${roiPct.toFixed(1)}% [${bar}] | Target: +${CONFIG.WHALE_TP_MIN}% | ${ageSec}s${danger}`);
 
         // === 1. STOP LOSS: -20% → dump everything ===
-        if(returnPct <= CONFIG.STOP_LOSS_PCT) {
-          log('EXIT', `⛔ STOP LOSS ${pos.sym} at ${returnPct.toFixed(1)}% — dumping`);
-          await execSell(mint, 100, `SL_${returnPct.toFixed(0)}%`, false);
+        if(roiPct <= CONFIG.STOP_LOSS_PCT) {
+          log('EXIT', `⛔ STOP LOSS ${pos.sym} at ${roiPct.toFixed(1)}% — dumping 100%`);
+          await execSell(mint, 100, `SL_${roiPct.toFixed(0)}%`, false);
           continue;
         }
 
         // === 2. STALL TIMER: 3 min → dump everything ===
-        if(ageMin >= CONFIG.STALL_MINUTES && (pos.soldPct||0) < 100) {
-          log('EXIT', `⏰ STALL ${pos.sym} — ${ageMin.toFixed(1)}min, dumping before whale`);
-          await execSell(mint, 100, `stall_${ageMin.toFixed(0)}min`, false);
+        if(ageMin >= CONFIG.STALL_MINUTES) {
+          log('EXIT', `⏰ STALL ${pos.sym} — ${ageMin.toFixed(1)}min with ${roiPct.toFixed(1)}% ROI — dumping before whale`);
+          await execSell(mint, 100, `stall_${ageMin.toFixed(0)}min_${roiPct.toFixed(0)}%`, false);
           continue;
         }
 
-        // === 3. TP3: +70% → sell ALL remaining ===
-        if(returnPct >= CONFIG.TP3_PCT && (pos.soldPct||0) < 100) {
-          log('EXIT', `🚀 TP3 ${pos.sym} at +${returnPct.toFixed(0)}% — selling all remaining`);
-          await execSell(mint, 100, `TP3_+${returnPct.toFixed(0)}%`, false);
-          continue;
-        }
-
-        // === 4. TP2: +50% → sell 40% ===
-        if(returnPct >= CONFIG.TP2_PCT && (pos.soldPct||0) < (CONFIG.TP1_SELL + CONFIG.TP2_SELL)) {
-          log('EXIT', `📈 TP2 ${pos.sym} at +${returnPct.toFixed(0)}% — selling ${CONFIG.TP2_SELL}%`);
-          await execSell(mint, CONFIG.TP2_SELL, `TP2_+${returnPct.toFixed(0)}%`, false);
-          continue;
-        }
-
-        // === 5. TP1: +25% → sell 40% ===
-        if(returnPct >= CONFIG.TP1_PCT && (pos.soldPct||0) < CONFIG.TP1_SELL) {
-          log('EXIT', `📈 TP1 ${pos.sym} at +${returnPct.toFixed(0)}% — selling ${CONFIG.TP1_SELL}%`);
-          await execSell(mint, CONFIG.TP1_SELL, `TP1_+${returnPct.toFixed(0)}%`, false);
+        // === 3. WHALE TRACKER: +40% to +45% → SINGLE-SHOT 100% SELL ===
+        // Front-run the whale's +50% dump zone
+        if(roiPct >= CONFIG.WHALE_TP_MIN) {
+          log('EXIT', `🎯🔥 WHALE TRACKER ${pos.sym} at +${roiPct.toFixed(1)}% — FRONT-RUNNING WHALE DUMP — selling 100%`);
+          await execSell(mint, 100, `WHALE_FRONTRUN_+${roiPct.toFixed(0)}%`, false);
+          await discord(`🎯🔥 **WHALE FRONT-RUN** ${pos.sym}\n\`${mint}\`\nROI: +${roiPct.toFixed(1)}% | Sold 100% BEFORE whale dump zone (+50%)`);
           continue;
         }
 
@@ -442,7 +442,7 @@ async function health() {
     console.log(`  💰 ${bal.toFixed(4)} SOL | PnL: ${pnl>=0?'+':''}${pnl.toFixed(4)}`);
     console.log(`  🛒 ${state.stats.buys}B 🚪 ${state.stats.sells}S ❌ ${state.stats.errors}E 🔄 ${state.stats.retries}R`);
     console.log(`  📦 ${state.positions.size} positions`);
-    console.log(`  🎯 TP: +${CONFIG.TP1_PCT}%(${CONFIG.TP1_SELL}%) / +${CONFIG.TP2_PCT}%(${CONFIG.TP2_SELL}%) / +${CONFIG.TP3_PCT}%(all)`);
+    console.log(`  🎯 Whale Tracker: sell 100% at +${CONFIG.WHALE_TP_MIN}% (whale dumps at +50%)`);
     console.log(`  ⛔ SL: ${CONFIG.STOP_LOSS_PCT}% | ⏰ Stall: ${CONFIG.STALL_MINUTES}min`);
     for(const [m,p] of state.positions) {
       const age = ((Date.now()-p.time)/60000).toFixed(1);
@@ -481,10 +481,10 @@ async function main() {
 
   state.isRunning = true;
   log('INFO', `📐 Ratio: ${(CONFIG.RATIO*100).toFixed(1)}% | Min: ${CONFIG.MIN_BUY_SOL} SOL`);
-  log('INFO', `🎯 TP: +${CONFIG.TP1_PCT}% sell ${CONFIG.TP1_SELL}% → +${CONFIG.TP2_PCT}% sell ${CONFIG.TP2_SELL}% → +${CONFIG.TP3_PCT}% sell all`);
+  log('INFO', `🎯 Whale Tracker: single-shot 100% sell at +${CONFIG.WHALE_TP_MIN}% to +${CONFIG.WHALE_TP_MAX}% (whale dumps at +50%)`);
   log('INFO', `⛔ SL: ${CONFIG.STOP_LOSS_PCT}% | ⏰ Stall: ${CONFIG.STALL_MINUTES}min | 🚨 Emergency: ${CONFIG.EMERGENCY_SLIPPAGE_BPS/100}% slip, ${CONFIG.EMERGENCY_PRIORITY_LAMPORTS/1e9} SOL priority`);
 
-  await discord(`🪞 **Winston v11.1 — Anti-Rug Mirror**\nTarget: \`${CONFIG.TARGET}\`\nBalance: ${state.stats.startBal.toFixed(4)} SOL\n**TP:** +${CONFIG.TP1_PCT}%(${CONFIG.TP1_SELL}%) → +${CONFIG.TP2_PCT}%(${CONFIG.TP2_SELL}%) → +${CONFIG.TP3_PCT}%(all)\n**SL:** ${CONFIG.STOP_LOSS_PCT}% | **Stall:** ${CONFIG.STALL_MINUTES}min\n**Emergency sells:** 10% slippage, max priority`);
+  await discord(`🪞 **Winston v11.1 — Whale Tracker Mirror**\nTarget: \`${CONFIG.TARGET}\`\nBalance: ${state.stats.startBal.toFixed(4)} SOL\n**Whale Tracker:** sell 100% at +${CONFIG.WHALE_TP_MIN}% (whale dumps at +50%)\n**SL:** ${CONFIG.STOP_LOSS_PCT}% | **Stall:** ${CONFIG.STALL_MINUTES}min\n**Emergency:** 10% slippage, 16x priority`);
 
   const shutdown = async () => {
     state.isRunning = false;
