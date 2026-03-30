@@ -23,10 +23,10 @@ const CONFIG = {
 
   TARGET: 'Fw8Cwufb3ELmS5pVN6SaZGVy9KsfZ35zrRp2WrUFvSDg',
 
-  // His $990, ours $25 → 2.5% ratio, boost to 4% to be slightly more aggressive
-  // He buys 5 SOL → we buy 0.20 SOL (~$16). He buys 6 SOL → we buy 0.24 SOL
-  RATIO: 0.04,
-  MIN_BUY_SOL: 0.04,      // Don't trade less than ~$3
+  // 1 SOL he spends = $2 for us = 0.024 SOL at $83/SOL
+  // 5 SOL = 0.12 SOL (~$10), 8 SOL = 0.192 SOL (~$16), 12 SOL = 0.288 SOL (~$24)
+  RATIO: 0.024,
+  MIN_BUY_SOL: 0.02,      // Don't trade less than ~$1.66
   MAX_BUY_PCT: 0.60,      // Never use more than 60% of balance
   MAX_RETRIES: 3,          // Retry failed trades 3 times
 
@@ -34,7 +34,7 @@ const CONFIG = {
   MAX_SLIPPAGE_BPS: 300,         // 3% for pump.fun tokens
   PRIORITY_FEE_LAMPORTS: 30000,  // 0.00003 SOL — bare minimum
 
-  POLL_MS: 3000,
+  POLL_MS: 1000,
   HEALTH_MS: 120000,
   SOL: 'So11111111111111111111111111111111111111112',
 };
@@ -270,27 +270,24 @@ async function poll() {
           const trades = extractTrades(tx);
           if(!trades) continue;
 
-          // Process sells first
+          // Process sells INSTANTLY — no delays
           for(const t of trades.filter(t=>t.dir==='sell')) {
             if(state.positions.has(t.mint)) {
-              log('MIRROR', `🎯 Target SELL ${t.mint.slice(0,8)}...`);
+              log('MIRROR', `🎯 INSTANT SELL ${t.mint.slice(0,8)}...`);
               await execSell(t.mint, 'target_sold');
-              await sleep(500);
             } else {
-              // Check if we have leftover tokens
               try {
                 const a = await state.connection.getParsedTokenAccountsByOwner(state.wallet.publicKey,{mint:new PublicKey(t.mint)});
                 const b = parseFloat(a?.value?.[0]?.account?.data?.parsed?.info?.tokenAmount?.uiAmount||0);
                 if(b > 0) {
                   state.positions.set(t.mint, {time:0, sol:0, sym:'?'});
                   await execSell(t.mint, 'target_sold_leftover');
-                  await sleep(500);
                 }
               } catch(e){}
             }
           }
 
-          // Then buys
+          // Then buys (small delay ok)
           for(const t of trades.filter(t=>t.dir==='buy')) {
             if(state.positions.has(t.mint)) continue;
 
@@ -303,7 +300,7 @@ async function poll() {
 
             log('MIRROR', `🎯 Target BUY ${t.mint.slice(0,8)}... ${t.sol.toFixed(2)} SOL → us: ${size.toFixed(4)} SOL`);
             await execBuy(t.mint, size, t.sol);
-            await sleep(500);
+            await sleep(300);
           }
         }
       }
