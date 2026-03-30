@@ -331,7 +331,7 @@ async function exitManager() {
         const dec = acct.account.data.parsed.info.tokenAmount.decimals;
         const raw = BigInt(Math.floor(bal * Math.pow(10, dec)));
 
-        const qr = await fetch(`${CONFIG.JUPITER_QUOTE}?inputMint=${mint}&outputMint=${CONFIG.SOL}&amount=${raw.toString()}&slippageBps=500`);
+        const qr = await fetch(`${CONFIG.JUPITER_QUOTE}?inputMint=${mint}&outputMint=${CONFIG.SOL}&amount=${raw.toString()}&slippageBps=3000`);
         if(!qr.ok) continue;
         const q = await qr.json();
         if(!q.outAmount) continue;
@@ -411,7 +411,7 @@ async function poll() {
     cycle++;
     try {
       const r = await fetch(CONFIG.HELIUS_RPC,{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({jsonrpc:'2.0',id:1,method:'getSignaturesForAddress',params:[CONFIG.TARGET,{limit:5}]})});
+        body:JSON.stringify({jsonrpc:'2.0',id:1,method:'getSignaturesForAddress',params:[CONFIG.TARGET,{limit:40}]})});
       const d = await r.json();
       const sigs = d?.result || [];
       const newSigs = [];
@@ -445,21 +445,14 @@ async function poll() {
             }
           }
 
-          // Buys — with holder count check
+          // Buys — mirror all target buys unconditionally
           for(const t of trades.filter(t=>t.dir==='buy')) {
             if(state.positions.has(t.mint)) continue;
             const bal = await solBal();
             const size = calcSize(t.sol, bal);
             if(size <= 0) { log('INFO', `Low bal (${bal.toFixed(4)})`); break; }
 
-            // Check holder count — skip if <10 holders
-            const holders = await getHolderCount(t.mint);
-            if(holders < 10) {
-              log('INFO', `⏭️ Skip ${t.mint.slice(0,8)}... — only ${holders} holders (need 10+)`);
-              continue;
-            }
-
-            log('MIRROR', `🎯 BUY ${t.mint.slice(0,8)}... ${t.sol.toFixed(2)} SOL → us: ${size.toFixed(4)} SOL (${holders} holders)`);
+            log('MIRROR', `🎯 BUY ${t.mint.slice(0,8)}... ${t.sol.toFixed(2)} SOL → us: ${size.toFixed(4)} SOL`);
             await execBuy(t.mint, size, t.sol);
             await sleep(300);
           }
