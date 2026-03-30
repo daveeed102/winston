@@ -38,28 +38,26 @@ const CONFIG = {
   // ============================================================
   // EXIT STRATEGY — Smart multi-layer exit
   // ============================================================
-  // Stop loss: dump everything if down this much
-  STOP_LOSS_PCT: -12,
+  // Stop loss: only dump if down 50%
+  STOP_LOSS_PCT: -50,
 
-  // Take profit ladder:
-  //   TP1: sell 40% at +15%
-  //   TP2: sell another 30% at +30%
-  //   TP3: sell remaining at +50%
-  TP1_PCT: 15,   TP1_SELL: 40,
-  TP2_PCT: 30,   TP2_SELL: 30,
-  TP3_PCT: 50,   TP3_SELL: 100,  // Sell all remaining
+  // NO take profit ladder — let it ride until timer
+  // These are set very high so they never trigger
+  TP1_PCT: 999,  TP1_SELL: 0,
+  TP2_PCT: 999,  TP2_SELL: 0,
+  TP3_PCT: 999,  TP3_SELL: 0,
 
-  // Trailing stop: once we're up 10%+, if price drops 8% from peak → sell all
-  TRAILING_ACTIVATE_PCT: 10,  // Activate trailing stop after +10%
-  TRAILING_DROP_PCT: 8,       // Sell if drops 8% from highest seen price
+  // NO trailing stop — let it ride
+  TRAILING_ACTIVATE_PCT: 999,
+  TRAILING_DROP_PCT: 999,
 
-  // Time safety net: force sell everything after 15 min no matter what
-  MAX_HOLD_MINUTES: 15,
+  // Time safety net: force sell everything after 8 min
+  MAX_HOLD_MINUTES: 8,
 
   // How often to check positions for exit conditions
-  EXIT_CHECK_MS: 5000,  // Every 5 seconds
+  EXIT_CHECK_MS: 3000,  // Every 3 seconds (faster for pump.fun)
 
-  POLL_INTERVAL_MS: 2000,
+  POLL_INTERVAL_MS: 3000,
   HEALTH_LOG_INTERVAL_MS: 60000,
   SOL_MINT: 'So11111111111111111111111111111111111111112',
 };
@@ -94,53 +92,38 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 async function getSOLBalance() {
   try{return(await state.connection.getBalance(state.wallet.publicKey))/1e9;}catch(e){return 0;}
 }
+// Price cache to avoid hammering the API
+const priceCache = new Map(); // mint -> { price, time }
+const PRICE_CACHE_MS = 2000;  // Cache for 2s
+
 async function getTokenPrice(mint) {
-  // Source 1: Jupiter Price API (works for established tokens)
+  // Check cache first
+  const cached = priceCache.get(mint);
+  if (cached && Date.now() - cached.time < PRICE_CACHE_MS) return cached.price;
+
+  // Method 1: Jupiter Price API
   try {
     const r = await fetch(`${CONFIG.JUPITER_PRICE}?ids=${mint}`);
     if (r.ok) {
       const d = await r.json();
       const p = parseFloat(d?.data?.[mint]?.price || 0);
-      if (p > 0) return p;
+      if (p > 0) { priceCache.set(mint, { price: p, time: Date.now() }); return p; }
     }
+    if (r.status === 429) await sleep(1000); // Rate limited — back off
   } catch(e) {}
 
-  // Source 2: Get price via Jupiter quote (works for ANY tradeable token including pump.fun)
-  // Ask "how much SOL would I get for 1M units of this token?" and derive price
+  // Method 2: Quote-based price (ask how many tokens for 0.01 SOL)
   try {
-    const testAmount = '1000000000'; // 1 billion raw units (covers most decimals)
-    const r = await fetch(`${CONFIG.JUPITER_QUOTE}?inputMint=${mint}&outputMint=${CONFIG.SOL_MINT}&amount=${testAmount}&slippageBps=500`);
-    if (r.ok) {
-      const q = await r.json();
-      if (q.outAmount && q.outAmount !== '0') {
-        const solOut = parseFloat(q.outAmount) / 1e9;
-        const inputDecimals = q.inputMint === mint ? (q.routePlan?.[0]?.swapInfo?.inputMint === mint ? 9 : 6) : 9;
-        // outAmount is in lamports, inAmount is in raw token units
-        const inAmount = parseFloat(q.inAmount || testAmount);
-        if (inAmount > 0 && solOut > 0) {
-          // Price per token in SOL, then we'd need SOL price to get USD
-          // But for momentum comparison, SOL-denominated price works fine
-          const solPrice = solOut / (inAmount / Math.pow(10, 9)); // approximate
-          return solPrice; // Returns price in SOL terms — good enough for momentum
-        }
-      }
-    }
-  } catch(e) {}
-
-  // Source 3: Try with a smaller amount (some tokens have very different decimals)
-  try {
+    await sleep(200); // Small delay to avoid back-to-back rate limits
     const r = await fetch(`${CONFIG.JUPITER_QUOTE}?inputMint=${CONFIG.SOL_MINT}&outputMint=${mint}&amount=10000000&slippageBps=500`);
     if (r.ok) {
       const q = await r.json();
       if (q.outAmount && q.outAmount !== '0') {
-        // We're asking "how many tokens for 0.01 SOL?"
-        // If we get tokens back, the token is tradeable — return a synthetic price
-        const tokensOut = parseFloat(q.outAmount);
-        if (tokensOut > 0) {
-          return 10000000 / tokensOut; // lamports per token unit — consistent for momentum
-        }
+        const p = 10000000 / parseFloat(q.outAmount); // lamports per token unit
+        if (p > 0) { priceCache.set(mint, { price: p, time: Date.now() }); return p; }
       }
     }
+    if (r.status === 429) await sleep(1000);
   } catch(e) {}
 
   return 0;
@@ -160,13 +143,14 @@ async function discord(msg) {
 async function hasMomentum(mint) {
   const price1 = await getTokenPrice(mint);
   if(!price1 || price1 <= 0) {
-    log('MOMENTUM', `${mint.slice(0,8)}... — no price data, skipping`);
     return { pass: false, reason: 'no_price' };
   }
 
-  log('MOMENTUM', `${mint.slice(0,8)}... price1: $${price1.toFixed(10)} — waiting ${CONFIG.MOMENTUM_DELAY_MS/1000}s...`);
+  log('MOMENTUM', `${mint.slice(0,8)}... p1: ${price1.toFixed(10)} — waiting ${CONFIG.MOMENTUM_DELAY_MS/1000}s`);
   await sleep(CONFIG.MOMENTUM_DELAY_MS);
 
+  // Clear cache so we get a fresh price
+  priceCache.delete(mint);
   const price2 = await getTokenPrice(mint);
   if(!price2 || price2 <= 0) {
     return { pass: false, reason: 'price_disappeared' };
@@ -454,41 +438,44 @@ async function pollTarget() {
             }
           }
 
-          // Buys — only with momentum
+          // Buys — only with momentum (max 2 checks per cycle to avoid rate limits)
+          let momentumChecksThisCycle = 0;
           for(const trade of trades.filter(t=>t.direction==='buy')){
             const mint=trade.tokenMint;
 
+            // Skip stables inline
+            if(STABLES.has(mint)) continue;
             // Skip if full
             if(state.positions.size>=CONFIG.MAX_POSITIONS){state.stats.skipped++;continue;}
             // Skip if already holding
             if(state.positions.has(mint))continue;
-            // Skip if we just checked this mint in last 30s
+            // Skip if we just checked this mint in last 60s
             const lastCheck=state.recentlyChecked.get(mint)||0;
-            if(Date.now()-lastCheck<30000)continue;
+            if(Date.now()-lastCheck<60000)continue;
             state.recentlyChecked.set(mint,Date.now());
+            // Max 2 momentum checks per cycle
+            if(momentumChecksThisCycle >= 2) continue;
+            momentumChecksThisCycle++;
 
             // Check balance
             const bal=await getSOLBalance();
             if(bal<CONFIG.TRADE_AMOUNT_SOL+0.003){
               log('WARN',`Balance low (${bal.toFixed(4)}) — waiting`);
-              break; // Stop trying buys this cycle
+              break;
             }
 
             // MOMENTUM CHECK
-            log('MOMENTUM',`🔎 Checking momentum for ${mint.slice(0,8)}...`);
+            log('MOMENTUM',`🔎 Checking ${mint.slice(0,8)}...`);
             const m=await hasMomentum(mint);
 
             if(m.pass){
               const size=Math.min(CONFIG.TRADE_AMOUNT_SOL, bal-0.003);
               await executeBuy(mint, size, m);
-              await sleep(300);
+              await sleep(500);
             }else{
               state.stats.momentumFails++;
-              const info=await getTokenInfo(mint);
-              log('MOMENTUM',`⏭️ Skip ${info.symbol} (${mint.slice(0,8)}...) — ${m.reason||'no momentum'}`);
-              // Only Discord-notify momentum fails, not "no price" (reduces spam)
               if(m.reason !== 'no_price' && m.reason !== 'price_disappeared') {
-                await discord(`⏭️ **SKIP** ${info.name} (${info.symbol})\n**Mint:** \`${mint}\`\n**Momentum:** ${m.changePct?.toFixed(2)||'?'}% — not enough`);
+                log('MOMENTUM',`⏭️ Skip ${mint.slice(0,8)}... ${m.changePct?.toFixed(2)||'?'}%`);
               }
             }
           }
