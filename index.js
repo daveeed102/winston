@@ -44,7 +44,7 @@ const CONFIG = {
   WHALE_TP_MAX: 45,                // Hard sell at +45% no matter what
   STOP_LOSS_PCT: -20,              // -20% → dump everything
   STALL_MINUTES: 3,                // 3 min stall → dump everything
-  EXIT_CHECK_MS: 1000,             // Check exits every 1s
+  EXIT_CHECK_MS: 2500,             // Check exits every 2.5s
 
   POLL_MS: 1000,
   HEALTH_MS: 60000,
