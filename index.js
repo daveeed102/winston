@@ -28,7 +28,7 @@ const CONFIG = {
   // Sizing: 1 SOL he spends = $2 for us = 0.024 SOL
   RATIO: 0.024,
   MIN_BUY_SOL: 0.02,
-  MAX_BUY_PCT: 0.60,
+  MAX_BUY_PCT: 0.06,
   MAX_RETRIES: 3,
 
   // Normal fees for buys
@@ -44,7 +44,7 @@ const CONFIG = {
   WHALE_TP_MAX: 45,                // Hard sell at +45% no matter what
   STOP_LOSS_PCT: -20,              // -20% → dump everything
   STALL_MINUTES: 3,                // 3 min stall → dump everything
-  EXIT_CHECK_MS: 2000,             // Check exits every 2s
+  EXIT_CHECK_MS: 1000,             // Check exits every 1s
 
   POLL_MS: 1000,
   HEALTH_MS: 60000,
@@ -184,7 +184,7 @@ async function execBuy(mint, sol, targetSol, attempt=1) {
     const sig = await state.connection.sendRawTransaction(tx.serialize(),{skipPreflight:true,maxRetries:3});
 
     if(await confirm(sig)) {
-      state.positions.set(mint, {time:Date.now(), sol, sym:info.sym, soldPct:0});
+      state.positions.set(mint, {time:Date.now(), sol, sym:info.sym, soldPct:0, isSelling:false, highestRoi:-Infinity});
       state.stats.buys++;
       const msg = `🪞🟢 **BUY** ${info.name} (${info.sym})\n\`${mint}\`\n${sol.toFixed(4)} SOL (target: ${targetSol.toFixed(2)} SOL)\nhttps://solscan.io/tx/${sig}`;
       log('BUY', `✅ ${info.sym} ${sol.toFixed(4)} SOL`);
@@ -304,6 +304,7 @@ async function exitManager() {
     for(const [mint, pos] of state.positions) {
       if(!pos.sol || pos.sol <= 0) continue;
       if((pos.soldPct||0) >= 100) continue;
+      if(pos.isSelling) continue; // Sell lock: emergency poll already handling this position
 
       try {
         // Get current position value via Jupiter quote
@@ -326,33 +327,44 @@ async function exitManager() {
         const ageMin = (Date.now() - pos.time) / 60000;
         const ageSec = ((Date.now() - pos.time) / 1000).toFixed(0);
 
+        // === TRAILING STOP: Update highestRoi and adjust dynamic SL ===
+        if(roiPct > (pos.highestRoi ?? -Infinity)) pos.highestRoi = roiPct;
+        let dynamicSL = CONFIG.STOP_LOSS_PCT; // default: -20%
+        if(pos.highestRoi >= 25) dynamicSL = 10;       // Peak hit +25% → SL moves to +10%
+        else if(pos.highestRoi >= 15) dynamicSL = 0;   // Peak hit +15% → SL moves to 0% (break-even)
+
         // Live console log — show whale approaching dump zone
         const bar = roiPct >= 0
           ? '█'.repeat(Math.min(Math.floor(roiPct / 2), 25)) + '░'.repeat(Math.max(25 - Math.floor(roiPct / 2), 0))
           : '▓'.repeat(Math.min(Math.floor(Math.abs(roiPct) / 2), 25));
         const danger = roiPct >= 35 ? ' ⚠️ DUMP ZONE APPROACHING' : roiPct >= CONFIG.WHALE_TP_MIN ? ' 🔥 SELLING NOW' : '';
-        console.log(`  [WATCHING] ${pos.sym} | Whale/Bot PnL: ${roiPct>=0?'+':''}${roiPct.toFixed(1)}% [${bar}] | Target: +${CONFIG.WHALE_TP_MIN}% | ${ageSec}s${danger}`);
+        const slLabel = dynamicSL !== CONFIG.STOP_LOSS_PCT ? ` | TSL:${dynamicSL>=0?'+':''}${dynamicSL}%` : '';
+        console.log(`  [WATCHING] ${pos.sym} | Whale/Bot PnL: ${roiPct>=0?'+':''}${roiPct.toFixed(1)}% [${bar}] | Peak: ${pos.highestRoi>-Infinity?(pos.highestRoi>=0?'+':'')+pos.highestRoi.toFixed(1)+'%':'--'}${slLabel} | Target: +${CONFIG.WHALE_TP_MIN}% | ${ageSec}s${danger}`);
 
-        // === 1. STOP LOSS: -20% → dump everything ===
-        if(roiPct <= CONFIG.STOP_LOSS_PCT) {
-          log('EXIT', `⛔ STOP LOSS ${pos.sym} at ${roiPct.toFixed(1)}% — dumping 100%`);
-          await execSell(mint, 100, `SL_${roiPct.toFixed(0)}%`, false);
+        // === 1. STOP LOSS: dynamic trailing SL → dump everything ===
+        if(roiPct <= dynamicSL) {
+          const slType = dynamicSL !== CONFIG.STOP_LOSS_PCT ? 'TRAILING SL' : 'STOP LOSS';
+          log('EXIT', `⛔ ${slType} ${pos.sym} at ${roiPct.toFixed(1)}% (SL: ${dynamicSL>=0?'+':''}${dynamicSL}%) — dumping 100%`);
+          pos.isSelling = true;
+          await execSell(mint, 100, `${slType}_${roiPct.toFixed(0)}%`, false);
           continue;
         }
 
         // === 2. STALL TIMER: 3 min → dump everything ===
         if(ageMin >= CONFIG.STALL_MINUTES) {
           log('EXIT', `⏰ STALL ${pos.sym} — ${ageMin.toFixed(1)}min with ${roiPct.toFixed(1)}% ROI — dumping before whale`);
+          pos.isSelling = true;
           await execSell(mint, 100, `stall_${ageMin.toFixed(0)}min_${roiPct.toFixed(0)}%`, false);
           continue;
         }
 
-        // === 3. WHALE TRACKER: +40% to +45% → SINGLE-SHOT 100% SELL ===
+        // === 3. WHALE TRACKER: +40% → SINGLE-SHOT 100% SELL ===
         // Front-run the whale's +50% dump zone
         if(roiPct >= CONFIG.WHALE_TP_MIN) {
           log('EXIT', `🎯🔥 WHALE TRACKER ${pos.sym} at +${roiPct.toFixed(1)}% — FRONT-RUNNING WHALE DUMP — selling 100%`);
+          pos.isSelling = true;
           await execSell(mint, 100, `WHALE_FRONTRUN_+${roiPct.toFixed(0)}%`, false);
-          await discord(`🎯🔥 **WHALE FRONT-RUN** ${pos.sym}\n\`${mint}\`\nROI: +${roiPct.toFixed(1)}% | Sold 100% BEFORE whale dump zone (+50%)`);
+          await discord(`🎯🔥 **WHALE FRONT-RUN** ${pos.sym}\n\`${mint}\`\nROI: +${roiPct.toFixed(1)}% | Peak: +${pos.highestRoi.toFixed(1)}% | Sold 100% BEFORE whale dump zone (+50%)`);
           continue;
         }
 
@@ -387,14 +399,17 @@ async function poll() {
           // WHALE SELLING → EMERGENCY SELL with max priority
           for(const t of trades.filter(t=>t.dir==='sell')) {
             if(state.positions.has(t.mint)) {
+              const pos = state.positions.get(t.mint);
+              if(pos.isSelling) continue; // Sell lock: exitManager already handling this position
               log('EMERGENCY', `🚨 WHALE DUMPING ${t.mint.slice(0,8)}... — EMERGENCY SELL`);
+              pos.isSelling = true;
               await execSell(t.mint, 100, 'WHALE_DUMP', true); // emergency=true → max fees
             } else {
               try {
                 const a = await state.connection.getParsedTokenAccountsByOwner(state.wallet.publicKey,{mint:new PublicKey(t.mint)});
                 const b = parseFloat(a?.value?.[0]?.account?.data?.parsed?.info?.tokenAmount?.uiAmount||0);
                 if(b > 0) {
-                  state.positions.set(t.mint, {time:0, sol:0, sym:'?', soldPct:0});
+                  state.positions.set(t.mint, {time:0, sol:0, sym:'?', soldPct:0, isSelling:true, highestRoi:-Infinity});
                   await execSell(t.mint, 100, 'WHALE_DUMP_leftover', true);
                 }
               } catch(e){}
