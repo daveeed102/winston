@@ -86,6 +86,24 @@ async function discord(msg) {
   try { await fetch(CONFIG.DISCORD_WEBHOOK,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:msg.slice(0,1990)})}); } catch(e){}
 }
 
+async function getHolderCount(mint) {
+  try {
+    // Use getTokenLargestAccounts — returns up to 20 holders, fast and free
+    const r = await fetch(CONFIG.HELIUS_RPC, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({jsonrpc:'2.0',id:1,method:'getTokenLargestAccounts',params:[mint]})
+    });
+    if(!r.ok) return 999; // If API fails, don't block the buy
+    const d = await r.json();
+    const accounts = d?.result?.value || [];
+    // Filter out zero-balance accounts
+    const active = accounts.filter(a => parseFloat(a.uiAmount || a.amount || 0) > 0);
+    return active.length;
+  } catch(e) {
+    return 999; // On error, assume enough holders so we don't miss trades
+  }
+}
+
 // === HELIUS PARSE ===
 async function heliusParse(sigs) {
   try {
@@ -383,13 +401,21 @@ async function poll() {
             }
           }
 
-          // Buys — unchanged from v11
+          // Buys — with holder count check
           for(const t of trades.filter(t=>t.dir==='buy')) {
             if(state.positions.has(t.mint)) continue;
             const bal = await solBal();
             const size = calcSize(t.sol, bal);
             if(size <= 0) { log('INFO', `Low bal (${bal.toFixed(4)})`); break; }
-            log('MIRROR', `🎯 BUY ${t.mint.slice(0,8)}... ${t.sol.toFixed(2)} SOL → us: ${size.toFixed(4)} SOL`);
+
+            // Check holder count — skip if <10 holders
+            const holders = await getHolderCount(t.mint);
+            if(holders < 10) {
+              log('INFO', `⏭️ Skip ${t.mint.slice(0,8)}... — only ${holders} holders (need 10+)`);
+              continue;
+            }
+
+            log('MIRROR', `🎯 BUY ${t.mint.slice(0,8)}... ${t.sol.toFixed(2)} SOL → us: ${size.toFixed(4)} SOL (${holders} holders)`);
             await execBuy(t.mint, size, t.sol);
             await sleep(300);
           }
