@@ -147,7 +147,7 @@ async function execBuy(mint, sol, targetSol, attempt=1) {
     const sig = await state.connection.sendRawTransaction(tx.serialize(),{skipPreflight:true,maxRetries:3});
 
     if(await confirm(sig)) {
-      state.positions.set(mint, {time:Date.now(), sol, sym:info.sym});
+      state.positions.set(mint, {time:Date.now(), sol, sym:info.sym, soldPct:0});
       state.stats.buys++;
       const msg = `🪞🟢 **BUY** ${info.name} (${info.sym})\n\`${mint}\`\n${sol.toFixed(4)} SOL (target: ${targetSol.toFixed(2)} SOL)\nhttps://solscan.io/tx/${sig}`;
       log('BUY', `✅ ${info.sym} ${sol.toFixed(4)} SOL`);
@@ -168,9 +168,14 @@ async function execBuy(mint, sol, targetSol, attempt=1) {
   }
 }
 
-async function execSell(mint, reason, attempt=1) {
+async function execSell(mint, pct, reason, attempt=1) {
   const info = await tokenInfo(mint);
-  log('EXEC', `🚪 SELL ${info.sym} — ${reason} (attempt ${attempt})`, {mint:mint.slice(0,12)});
+  const pos = state.positions.get(mint);
+  const remain = pos ? (100 - (pos.soldPct||0)) : 100;
+  const sellPct = Math.min(pct, remain);
+  if(sellPct <= 0) { state.positions.delete(mint); return false; }
+
+  log('EXEC', `🚪 SELL ${sellPct}% ${info.sym} — ${reason} (attempt ${attempt})`, {mint:mint.slice(0,12)});
 
   try {
     const accts = await state.connection.getParsedTokenAccountsByOwner(state.wallet.publicKey,{mint:new PublicKey(mint)});
@@ -179,7 +184,8 @@ async function execSell(mint, reason, attempt=1) {
     const bal = parseFloat(acct.account.data.parsed.info.tokenAmount.uiAmount||0);
     if(bal<=0) { state.positions.delete(mint); return false; }
     const dec = acct.account.data.parsed.info.tokenAmount.decimals;
-    const raw = BigInt(Math.floor(bal * Math.pow(10, dec)));
+    const sellBal = bal * (sellPct / 100);
+    const raw = BigInt(Math.floor(sellBal * Math.pow(10, dec)));
     if(raw<=0n) { state.positions.delete(mint); return false; }
 
     const qr = await fetch(`${CONFIG.JUPITER_QUOTE}?inputMint=${mint}&outputMint=${CONFIG.SOL}&amount=${raw.toString()}&slippageBps=${CONFIG.MAX_SLIPPAGE_BPS}`);
@@ -201,12 +207,16 @@ async function execSell(mint, reason, attempt=1) {
 
     if(await confirm(sig)) {
       const solBack = parseFloat(q.outAmount)/1e9;
-      const entry = state.positions.get(mint);
-      const pnl = entry ? (solBack - entry.sol) : 0;
+      const pnlPortion = pos?.sol ? (solBack - (pos.sol * sellPct / 100)) : 0;
       state.stats.sells++;
-      state.positions.delete(mint);
-      const msg = `🪞🔴 **SELL** ${info.name} (${info.sym})\n\`${mint}\`\n${solBack.toFixed(4)} SOL back | PnL: ${pnl>=0?'+':''}${pnl.toFixed(4)} SOL\n${reason}\nhttps://solscan.io/tx/${sig}`;
-      log('SELL', `✅ ${info.sym} → ${solBack.toFixed(4)} SOL (${pnl>=0?'+':''}${pnl.toFixed(4)})`);
+
+      if(pos) pos.soldPct = (pos.soldPct||0) + sellPct;
+      if(!pos || pos.soldPct >= 100) {
+        state.positions.delete(mint);
+      }
+
+      const msg = `🪞🔴 **SELL ${sellPct}%** ${info.name} (${info.sym})\n\`${mint}\`\n${solBack.toFixed(4)} SOL back | PnL: ${pnlPortion>=0?'+':''}${pnlPortion.toFixed(4)} SOL\n${reason}\nhttps://solscan.io/tx/${sig}`;
+      log('SELL', `✅ ${info.sym} ${sellPct}% → ${solBack.toFixed(4)} SOL (${pnlPortion>=0?'+':''}${pnlPortion.toFixed(4)})`);
       await discord(msg);
       return true;
     } else { throw new Error('Confirm timeout'); }
@@ -216,7 +226,7 @@ async function execSell(mint, reason, attempt=1) {
       state.stats.retries++;
       log('RETRY', `Retry sell in 2s... (${attempt}/${CONFIG.MAX_RETRIES})`);
       await sleep(2000);
-      return execSell(mint, reason, attempt+1);
+      return execSell(mint, pct, reason, attempt+1);
     }
     state.stats.errors++;
     await discord(`❌ Sell failed after ${CONFIG.MAX_RETRIES} tries: ${info.sym} \`${mint}\` — ${e.message}`);
@@ -236,6 +246,85 @@ async function confirm(sig, timeout=60000) {
     await sleep(2000);
   }
   return false;
+}
+
+// === PRICE CHECK (for exit manager) ===
+async function getPrice(mint) {
+  try {
+    const r = await fetch(`${CONFIG.JUPITER_QUOTE}?inputMint=${CONFIG.SOL}&outputMint=${mint}&amount=10000000&slippageBps=500`);
+    if(r.ok) {
+      const q = await r.json();
+      if(q.outAmount && q.outAmount!=='0') return 10000000 / parseFloat(q.outAmount);
+    }
+  } catch(e){}
+  return 0;
+}
+
+// === EXIT MANAGER ===
+// +25% → sell 30% (lock profit, keep riding)
+// +50% → sell another 20%
+// +100% → sell another 20%
+// +200% (3x) → sell everything
+// He sells → we sell 100% instantly (handled in poll loop)
+async function exitManager() {
+  log('INFO', '🎯 Exit manager: +25% sell 30%, +50% sell 20%, +100% sell 20%, 3x sell all');
+  while(state.isRunning) {
+    await sleep(3000);
+
+    for(const [mint, pos] of state.positions) {
+      if(!pos.sol || pos.sol <= 0) continue;
+
+      // Get current value of our FULL original position in SOL terms
+      try {
+        const accts = await state.connection.getParsedTokenAccountsByOwner(state.wallet.publicKey,{mint:new PublicKey(mint)});
+        const acct = accts?.value?.[0];
+        if(!acct) continue;
+        const bal = parseFloat(acct.account.data.parsed.info.tokenAmount.uiAmount||0);
+        if(bal <= 0) { state.positions.delete(mint); continue; }
+        const dec = acct.account.data.parsed.info.tokenAmount.decimals;
+        const raw = BigInt(Math.floor(bal * Math.pow(10, dec)));
+
+        // Get quote for selling everything to see current value
+        const qr = await fetch(`${CONFIG.JUPITER_QUOTE}?inputMint=${mint}&outputMint=${CONFIG.SOL}&amount=${raw.toString()}&slippageBps=500`);
+        if(!qr.ok) continue;
+        const q = await qr.json();
+        if(!q.outAmount) continue;
+
+        const currentValSol = parseFloat(q.outAmount) / 1e9;
+        const originalInvest = pos.sol; // What we originally put in
+        const totalReturnPct = ((currentValSol / originalInvest) - 1) * 100;
+
+        // +200% (3x) → sell ALL
+        if(totalReturnPct >= 200 && (pos.soldPct||0) < 100) {
+          log('SELL', `🚀 3X! ${pos.sym} at +${totalReturnPct.toFixed(0)}% — selling ALL`);
+          await execSell(mint, 100, `3x_+${totalReturnPct.toFixed(0)}%`);
+          continue;
+        }
+
+        // +100% (2x) → sell 20% if we haven't sold 70% yet
+        if(totalReturnPct >= 100 && (pos.soldPct||0) < 70) {
+          log('SELL', `💰 2X! ${pos.sym} at +${totalReturnPct.toFixed(0)}% — selling 20%`);
+          await execSell(mint, 20, `2x_+${totalReturnPct.toFixed(0)}%`);
+          continue;
+        }
+
+        // +50% → sell 20% if we haven't sold 50% yet
+        if(totalReturnPct >= 50 && (pos.soldPct||0) < 50) {
+          log('SELL', `📈 +50%! ${pos.sym} — selling 20%`);
+          await execSell(mint, 20, `tp_+${totalReturnPct.toFixed(0)}%`);
+          continue;
+        }
+
+        // +25% → sell 30% if we haven't sold anything yet
+        if(totalReturnPct >= 25 && (pos.soldPct||0) < 30) {
+          log('SELL', `📈 +25%! ${pos.sym} — selling 30%`);
+          await execSell(mint, 30, `tp_+${totalReturnPct.toFixed(0)}%`);
+          continue;
+        }
+
+      } catch(e) { /* skip this position */ }
+    }
+  }
 }
 
 // === SIZING ===
@@ -274,14 +363,14 @@ async function poll() {
           for(const t of trades.filter(t=>t.dir==='sell')) {
             if(state.positions.has(t.mint)) {
               log('MIRROR', `🎯 INSTANT SELL ${t.mint.slice(0,8)}...`);
-              await execSell(t.mint, 'target_sold');
+              await execSell(t.mint, 100, 'target_sold');
             } else {
               try {
                 const a = await state.connection.getParsedTokenAccountsByOwner(state.wallet.publicKey,{mint:new PublicKey(t.mint)});
                 const b = parseFloat(a?.value?.[0]?.account?.data?.parsed?.info?.tokenAmount?.uiAmount||0);
                 if(b > 0) {
                   state.positions.set(t.mint, {time:0, sol:0, sym:'?'});
-                  await execSell(t.mint, 'target_sold_leftover');
+                  await execSell(t.mint, 100, 'target_sold_leftover');
                 }
               } catch(e){}
             }
@@ -376,7 +465,7 @@ async function main() {
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-  await Promise.all([poll(), health()]);
+  await Promise.all([poll(), exitManager(), health()]);
 }
 
 main().catch(e => { log('ERROR','Fatal',{err:e.message}); process.exit(1); });
