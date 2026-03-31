@@ -48,7 +48,7 @@ const CONFIG = {
   MAX_RETRIES: 3,
 
   // ── Exit ─────────────────────────────────────────────────
-  HOLD_SECONDS:  20,    // hard exit at 12s — no exceptions
+  HOLD_SECONDS:  25,    // hard exit at 25s — no exceptions
   SL_PCT:       -10,    // stop loss, checked every 500ms
   EXIT_CHECK_MS: 500,
 
@@ -349,15 +349,7 @@ async function exitManager() {
           : '▓'.repeat(Math.min(Math.floor(Math.abs(roiPct) * 2), 20));
         console.log(`  [${pos.sym}] ${roiPct>=0?'+':''}${roiPct.toFixed(1)}% [${bar}] | ${ageSec.toFixed(1)}s / ${CONFIG.HOLD_SECONDS}s | SL:${CONFIG.SL_PCT}%`);
 
-        // 1. STOP LOSS
-        if(roiPct <= CONFIG.SL_PCT) {
-          log('EXIT', `⛔ STOP LOSS ${pos.sym} at ${roiPct.toFixed(1)}% after ${ageSec.toFixed(1)}s`);
-          pos.isSelling = true;
-          await execSell(mint, 100, `SL_${roiPct.toFixed(0)}%`, false);
-          continue;
-        }
-
-        // 2. HARD 10s EXIT
+        // ── HARD 25s EXIT — only exit, no early sells ────────
         if(ageSec >= CONFIG.HOLD_SECONDS) {
           log('EXIT', `⏱ 10s HARD EXIT ${pos.sym} at ${roiPct>=0?'+':''}${roiPct.toFixed(1)}%`);
           pos.isSelling = true;
