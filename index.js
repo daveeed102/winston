@@ -1,17 +1,13 @@
 // ============================================================
-// WINSTON v12 — Multi-Wallet Momentum Sniper
+// WINSTON v13 — Single-Wallet 10s Momentum Scalper
 // ============================================================
-// New approach: Watch 8 wallets simultaneously.
-// Only buy when 2+ wallets buy the SAME token within 60s.
-// That's real consensus signal — not one guy pumping his bags.
-//
-// Exit strategy (tight, capital-preserving):
-//   TP:    +20% → sell 100% fast
-//   SL:    -10% → cut and run
-//   Stall: 90s  → dump if going nowhere
-//   TSL:   If peak hits +12%, floor moves to +5% (lock profit)
-//
-// All sell/confirm/Jupiter infrastructure unchanged from v11.
+// Watch ONE wallet. When it buys:
+//   1. Grab Jupiter price snapshot
+//   2. Wait 3 seconds
+//   3. Check price again — if token pumped (fewer tokens per SOL
+//      = costs more = price up) → BUY 0.11 SOL
+//   4. Hard exit at exactly 10 seconds
+//   5. Stop loss at -10% active the whole time
 // ============================================================
 
 require('dotenv').config();
@@ -22,54 +18,39 @@ const fetch = require('node-fetch');
 const CONFIG = {
   HELIUS_API_KEY: process.env.HELIUS_API_KEY || '',
   get HELIUS_RPC() { return `https://mainnet.helius-rpc.com/?api-key=${this.HELIUS_API_KEY}`; },
-  get HELIUS_TX() { return `https://api-mainnet.helius-rpc.com/v0/transactions?api-key=${this.HELIUS_API_KEY}`; },
-  PRIVATE_KEY: process.env.WALLET_PRIVATE_KEY || process.env.PRIVATE_KEY || '',
+  get HELIUS_TX()  { return `https://api-mainnet.helius-rpc.com/v0/transactions?api-key=${this.HELIUS_API_KEY}`; },
+  PRIVATE_KEY:     process.env.WALLET_PRIVATE_KEY || process.env.PRIVATE_KEY || '',
   DISCORD_WEBHOOK: process.env.DISCORD_WEBHOOK_URL || process.env.DISCORD_WEBHOOK || '',
-  JUPITER_QUOTE: 'https://lite-api.jup.ag/swap/v1/quote',
-  JUPITER_SWAP: 'https://lite-api.jup.ag/swap/v1/swap',
+  JUPITER_QUOTE:   'https://lite-api.jup.ag/swap/v1/quote',
+  JUPITER_SWAP:    'https://lite-api.jup.ag/swap/v1/swap',
 
-  // ── Multi-wallet watch list ──────────────────────────────
-  // The bot only fires when MIN_WALLETS_AGREE of these buy
-  // the same token within CONSENSUS_WINDOW_MS of each other.
-  // Replace wallets 3-8 with better targets as you find them.
-  TARGETS: [
-    'Fw8Cwufb3ELmS5pVN6SaZGVy9KsfZ35zrRp2WrUFvSDg', // original (signal only now)
-    '37CSyh86jYGdQSrEmdQAhNnudJmbFNXYMFWVPB5ZbBpn', // Grok suggestion
-    'HCMtCCpCAnFgoRdVSsVnXnBZEfFMNWTtQdN6LMND24a',  // active trader
-    'DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh',  // active trader
-    '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM',  // active trader
-    'AVmoTthRFEFECmaHjRJSHgBpHmjc8DGBKWrfBEPGMhF',   // active trader
-    'CuieVDEDtLo7FypjBxv4HkbVqBCMr8xv1yBBuAgRBrMr',  // active trader
-    'J2HkHqNkJrVKzYyAbJBL3fBnMnX7DdXvqjR1JJpvWPzX',  // active trader
-  ],
+  // ── The one wallet we watch ──────────────────────────────
+  TARGET: 'Fw8Cwufb3ELmS5pVN6SaZGVy9KsfZ35zrRp2WrUFvSDg',
 
-  // Signal logic
-  CONSENSUS_WINDOW_MS: 60000,  // Both wallets must buy within this window
-  MIN_WALLETS_AGREE:   2,      // How many must co-buy to trigger entry
-  MIN_BUY_SOL_SIGNAL:  0.5,    // Ignore wallet buys smaller than this (filters dust)
+  // ── Entry filter ─────────────────────────────────────────
+  MIN_BUY_SOL_SIGNAL: 2.01,  // skip whale buys ≤ 2 SOL, only mirror 2.01+ SOL
 
-  // ── Momentum confirmation ─────────────────────────────────
-  // After consensus, wait this long then re-check price.
-  // Only buy if price is still moving up (quote improved).
-  MOMENTUM_WAIT_MS:    3000,   // 3 second momentum confirmation window
+  // ── Momentum confirmation ────────────────────────────────
+  MOMENTUM_WAIT_MS: 3000,    // wait 3s then re-check price
+  // After 3s, if token costs MORE sol per token (price pumped)
+  // = fewer tokens per SOL out = quoteAfter < quoteBefore → BUY
+  // If token got cheaper (dump) = more tokens per SOL = SKIP
 
-  // Position sizing
-  BUY_SOL:     0.11,   // Fixed 0.11 SOL per trade
-  MAX_BUY_PCT: 0.80,   // safety cap — never more than 80% of balance
+  // ── Position sizing ──────────────────────────────────────
+  BUY_SOL:     0.11,
+  MAX_BUY_PCT: 0.80,         // safety cap
 
-  // Fees
-  MAX_SLIPPAGE_BPS:          1500,
-  PRIORITY_FEE_LAMPORTS:     1500000,
-  EMERGENCY_SLIPPAGE_BPS:    2500,
+  // ── Fees ─────────────────────────────────────────────────
+  MAX_SLIPPAGE_BPS:            1500,
+  PRIORITY_FEE_LAMPORTS:       1500000,
+  EMERGENCY_SLIPPAGE_BPS:      2500,
   EMERGENCY_PRIORITY_LAMPORTS: 4000000,
   MAX_RETRIES: 3,
 
-  // ── Exit strategy — 10 second scalp ──────────────────────
-  // Hold for exactly 10 seconds, then sell everything.
-  // Stop loss (-10%) still active during the 10s window.
-  HOLD_SECONDS:   10,   // hard exit at 10s after confirmed buy
-  SL_PCT:        -10,   // stop loss — always active
-  EXIT_CHECK_MS:  500,  // check every 500ms so we catch the 10s precisely
+  // ── Exit ─────────────────────────────────────────────────
+  HOLD_SECONDS:  10,    // hard exit at 10s — no exceptions
+  SL_PCT:       -10,    // stop loss, checked every 500ms
+  EXIT_CHECK_MS: 500,
 
   POLL_MS:    1200,
   HEALTH_MS: 60000,
@@ -86,11 +67,12 @@ const IGNORE = new Set([
 ]);
 
 const state = {
-  wallet: null, connection: null, isRunning: false,
-  lastSigs:  new Map(), // target address → last seen signature
-  signals:   new Map(), // mint → [{wallet, time, sol}]  (consensus tracker)
-  positions: new Map(), // mint → position object
-  tradedMints: new Set(),
+  wallet:      null,
+  connection:  null,
+  isRunning:   false,
+  lastSig:     null,          // single cursor for the one target
+  positions:   new Map(),     // mint → position object
+  tradedMints: new Set(),     // session blacklist
   stats: { buys:0, sells:0, errors:0, retries:0, startBal:0 },
 };
 
@@ -139,12 +121,12 @@ async function heliusParse(sigs) {
   } catch(e) { return []; }
 }
 
-function extractTrades(tx, watchedWallet) {
+function extractTrades(tx) {
   if(tx.transactionError) return null;
-  const w = watchedWallet;
-  const tfers = tx.tokenTransfers || [];
+  const w = CONFIG.TARGET;
+  const tfers  = tx.tokenTransfers  || [];
   const native = tx.nativeTransfers || [];
-  const desc = (tx.description||'').toLowerCase();
+  const desc   = (tx.description||'').toLowerCase();
 
   let solOut = 0, solIn = 0;
   for(const t of native) {
@@ -159,6 +141,7 @@ function extractTrades(tx, watchedWallet) {
     if(t.fromUserAccount === w && t.tokenAmount > 0) sells.push({ mint: t.mint, amt: t.tokenAmount });
   }
 
+  // Aggregator fallback
   if(buys.length === 0 && sells.length === 0 && tfers.length > 0) {
     const mints = new Set();
     for(const t of tfers) {
@@ -173,38 +156,9 @@ function extractTrades(tx, watchedWallet) {
   }
 
   const trades = [];
-  for(const b of buys)  trades.push({ mint: b.mint, dir: 'buy',  sol: solOut||0.01, sig: tx.signature });
-  for(const s of sells) trades.push({ mint: s.mint, dir: 'sell', sol: solIn||0.01,  sig: tx.signature });
+  for(const b of buys)  trades.push({ mint: b.mint, dir: 'buy',  sol: solOut||0.01 });
+  for(const s of sells) trades.push({ mint: s.mint, dir: 'sell', sol: solIn||0.01  });
   return trades.length > 0 ? trades : null;
-}
-
-// ── CONSENSUS ENGINE ─────────────────────────────────────────
-
-function recordSignal(wallet, mint, sol) {
-  const now = Date.now();
-
-  // Evict expired signals
-  for(const [m, sigs] of state.signals) {
-    const fresh = sigs.filter(s => now - s.time < CONFIG.CONSENSUS_WINDOW_MS);
-    if(fresh.length === 0) state.signals.delete(m);
-    else state.signals.set(m, fresh);
-  }
-
-  if(!state.signals.has(mint)) state.signals.set(mint, []);
-  const existing = state.signals.get(mint);
-
-  // Don't double-count same wallet in same window
-  if(existing.find(s => s.wallet === wallet)) return null;
-  existing.push({ wallet, time: now, sol });
-
-  const uniqueWallets = new Set(existing.map(s => s.wallet)).size;
-  log('SIGNAL', `${mint.slice(0,10)}... | ${uniqueWallets}/${CONFIG.MIN_WALLETS_AGREE} wallets | from ${wallet.slice(0,8)}...`);
-
-  if(uniqueWallets >= CONFIG.MIN_WALLETS_AGREE) {
-    const avgSol = existing.reduce((a, s) => a + s.sol, 0) / existing.length;
-    return { mint, wallets: uniqueWallets, avgSol };
-  }
-  return null;
 }
 
 // ── BUY ──────────────────────────────────────────────────────
@@ -243,17 +197,22 @@ async function execBuy(mint, sol, context) {
     if(await confirm(sig)) {
       state.positions.set(mint, {
         time: Date.now(), sol, sym: info.sym,
-        soldPct: 0, isSelling: false, highestRoi: -Infinity, lastBarStep: 0
+        soldPct: 0, isSelling: false, highestRoi: -Infinity
       });
       state.stats.buys++;
-      log('BUY', `✅ ${info.sym} ${sol.toFixed(4)} SOL`);
-      await discord(`🟢  **BUY** \`${mint}\`\n💸  **${sol.toFixed(4)} SOL**  ·  signal: ${context}\n🎯  TP: **+${CONFIG.TP_PCT}%**  |  SL: **${CONFIG.SL_PCT}%**  |  Stall: **${CONFIG.STALL_SECONDS}s**\n🔗  https://solscan.io/tx/${sig}`);
+      log('BUY', `✅ ${info.sym} ${sol.toFixed(4)} SOL — exits in ${CONFIG.HOLD_SECONDS}s`);
+      await discord(
+        `🟢  **BUY** \`${mint}\`\n` +
+        `💸  **${sol.toFixed(4)} SOL**  ·  ${context}\n` +
+        `⏱  Hard exit in **${CONFIG.HOLD_SECONDS}s**  |  SL: **${CONFIG.SL_PCT}%**\n` +
+        `🔗  https://solscan.io/tx/${sig}`
+      );
       return true;
     } else { throw new Error('Confirm timeout'); }
   } catch(e) {
     state.stats.errors++;
     log('ERROR', `Buy fail (no retry): ${e.message}`, { mint: mint.slice(0,12) });
-    await discord(`❌ Buy failed: ${info.sym} \`${mint}\` — ${e.message}`);
+    await discord(`❌ Buy failed: \`${mint.slice(0,16)}\` — ${e.message}`);
     return false;
   }
 }
@@ -313,11 +272,11 @@ async function execSell(mint, pct, reason, emergency=false, attempt=1) {
       if(pos) pos.soldPct = (pos.soldPct||0) + sellPct;
       if(!pos || pos.soldPct >= 100) state.positions.delete(mint);
 
-      const pnlSign = pnlPortion >= 0 ? '+' : '';
+      const pnlSign  = pnlPortion >= 0 ? '+' : '';
       const pnlEmoji = pnlPortion >= 0 ? '📈' : '📉';
-      const label = emergency ? '⚠️🚨 **EMERGENCY**'
-        : reason.startsWith('SL') || reason.startsWith('STOP') ? '🛑 **STOP LOSS**'
-        : reason.startsWith('stall') ? '⏰ **STALL EXIT**'
+      const label = emergency          ? '⚠️🚨 **EMERGENCY**'
+        : reason.startsWith('SL')      ? '🛑 **STOP LOSS**'
+        : reason.startsWith('10s')     ? (pnlPortion >= 0 ? '✅ **10s EXIT (profit)**' : '⏱ **10s EXIT (loss)**')
         : '🔴 **SELL**';
       await discord(`${label} \`${mint}\`\n💰  **${solBack.toFixed(4)} SOL** back  ·  ${pnlEmoji} **${pnlSign}${pnlPortion.toFixed(4)} SOL**\n📋  ${reason}\n🔗  https://solscan.io/tx/${sig}`);
       log('SELL', `✅ ${info.sym} ${sellPct}% → ${solBack.toFixed(4)} SOL (${pnlPortion>=0?'+':''}${pnlPortion.toFixed(4)})${emergency?' EMERGENCY':''}`);
@@ -350,10 +309,7 @@ async function confirm(sig, timeout=60000) {
   return false;
 }
 
-// ── EXIT MANAGER — 10 second scalp ───────────────────────────
-// Two rules only:
-//   1. Stop loss at -10% (always watching, every 500ms)
-//   2. Hard exit at exactly 10 seconds — no exceptions
+// ── EXIT MANAGER — 10s scalp ─────────────────────────────────
 
 async function exitManager() {
   log('INFO', `🎯 Exit manager | Hard exit: ${CONFIG.HOLD_SECONDS}s | SL: ${CONFIG.SL_PCT}%`);
@@ -368,9 +324,8 @@ async function exitManager() {
 
       try {
         const ageSec = (Date.now() - pos.time) / 1000;
-        const msLeft = (CONFIG.HOLD_SECONDS * 1000) - (Date.now() - pos.time);
 
-        // ── Get current value via Jupiter quote ──────────────
+        // Get current value
         const accts = await state.connection.getParsedTokenAccountsByOwner(state.wallet.publicKey, { mint: new PublicKey(mint) });
         const acct = accts?.value?.[0];
         if(!acct) { state.positions.delete(mint); continue; }
@@ -388,28 +343,29 @@ async function exitManager() {
         const roiPct = ((currentVal / pos.sol) - 1) * 100;
         if(roiPct > (pos.highestRoi ?? -Infinity)) pos.highestRoi = roiPct;
 
-        // Live console — compact countdown
+        // Console bar
         const bar = roiPct >= 0
           ? '█'.repeat(Math.min(Math.floor(roiPct * 2), 20)) + '░'.repeat(Math.max(20 - Math.floor(roiPct * 2), 0))
           : '▓'.repeat(Math.min(Math.floor(Math.abs(roiPct) * 2), 20));
-        console.log(`  [${pos.sym}] ${roiPct>=0?'+':''}${roiPct.toFixed(1)}% [${bar}] | ${ageSec.toFixed(1)}s/${CONFIG.HOLD_SECONDS}s | SL:${CONFIG.SL_PCT}%`);
+        console.log(`  [${pos.sym}] ${roiPct>=0?'+':''}${roiPct.toFixed(1)}% [${bar}] | ${ageSec.toFixed(1)}s / ${CONFIG.HOLD_SECONDS}s | SL:${CONFIG.SL_PCT}%`);
 
-        // ── 1. STOP LOSS ─────────────────────────────────────
+        // 1. STOP LOSS
         if(roiPct <= CONFIG.SL_PCT) {
           log('EXIT', `⛔ STOP LOSS ${pos.sym} at ${roiPct.toFixed(1)}% after ${ageSec.toFixed(1)}s`);
           pos.isSelling = true;
           await execSell(mint, 100, `SL_${roiPct.toFixed(0)}%`, false);
-          await discord(`🛑  **STOP LOSS** \`${mint.slice(0,16)}...\`\n📊  **${roiPct.toFixed(1)}%** after **${ageSec.toFixed(1)}s**`);
           continue;
         }
 
-        // ── 2. HARD 10s EXIT ─────────────────────────────────
+        // 2. HARD 10s EXIT
         if(ageSec >= CONFIG.HOLD_SECONDS) {
-          const exitLabel = roiPct >= 0 ? '✅ TIMED EXIT (profit)' : '⏱ TIMED EXIT (loss)';
-          log('EXIT', `⏱ 10s HARD EXIT ${pos.sym} at ${roiPct.toFixed(1)}%`);
+          log('EXIT', `⏱ 10s HARD EXIT ${pos.sym} at ${roiPct>=0?'+':''}${roiPct.toFixed(1)}%`);
           pos.isSelling = true;
           await execSell(mint, 100, `10s_exit_${roiPct.toFixed(0)}%`, false);
-          await discord(`⏱  **10s HARD EXIT**\n\`${mint}\`\n📊  ROI: **${roiPct>=0?'+':''}${roiPct.toFixed(1)}%**  ·  Peak: **${pos.highestRoi>-Infinity?(pos.highestRoi>=0?'+':'')+pos.highestRoi.toFixed(1)+'%':'--'}**\n${exitLabel}`);
+          await discord(
+            `⏱  **10s HARD EXIT**\n\`${mint}\`\n` +
+            `📊  ROI: **${roiPct>=0?'+':''}${roiPct.toFixed(1)}%**  ·  Peak: **${pos.highestRoi>-Infinity?(pos.highestRoi>=0?'+':'')+pos.highestRoi.toFixed(1)+'%':'--'}**`
+          );
           continue;
         }
 
@@ -418,113 +374,121 @@ async function exitManager() {
   }
 }
 
-// ── POLL (one per target wallet, all run in parallel) ────────
+// ── POLL — single target wallet ───────────────────────────────
 
-async function pollWallet(target) {
+async function poll() {
+  log('INFO', `👀 Watching ${CONFIG.TARGET.slice(0,16)}... every ${CONFIG.POLL_MS/1000}s`);
+
   while(state.isRunning) {
     try {
       const r = await fetch(CONFIG.HELIUS_RPC, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'getSignaturesForAddress', params:[target,{limit:10}] })
+        body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'getSignaturesForAddress', params:[CONFIG.TARGET,{limit:10}] })
       });
       const d = await r.json();
       const sigs = d?.result || [];
-      const lastSig = state.lastSigs.get(target);
       const newSigs = [];
-      for(const s of sigs) { if(s.signature === lastSig) break; if(!s.err) newSigs.push(s); }
+      for(const s of sigs) { if(s.signature === state.lastSig) break; if(!s.err) newSigs.push(s); }
 
       if(newSigs.length > 0) {
-        state.lastSigs.set(target, newSigs[0].signature);
+        state.lastSig = newSigs[0].signature;
         const parsed = await heliusParse(newSigs.map(s => s.signature));
 
         for(const tx of parsed) {
-          const trades = extractTrades(tx, target);
+          const trades = extractTrades(tx);
           if(!trades) continue;
 
-          // Emergency sell if watched wallet dumps something we hold
+          // Emergency sell if whale dumps something we hold
           for(const t of trades.filter(t => t.dir === 'sell')) {
             if(state.positions.has(t.mint)) {
               const pos = state.positions.get(t.mint);
               if(pos.isSelling) continue;
-              log('EMERGENCY', `🚨 ${target.slice(0,8)} DUMPING ${t.mint.slice(0,8)}... — EMERGENCY SELL`);
+              log('EMERGENCY', `🚨 WHALE DUMPING ${t.mint.slice(0,8)}... — EMERGENCY SELL`);
               pos.isSelling = true;
               await execSell(t.mint, 100, 'WALLET_DUMP', true);
             }
           }
 
-          // Consensus buy signals
+          // Buy signals — one wallet, no consensus needed
           for(const t of trades.filter(t => t.dir === 'buy')) {
             if(IGNORE.has(t.mint)) continue;
             if(state.tradedMints.has(t.mint)) continue;
             if(state.positions.has(t.mint)) continue;
             if(t.sol < CONFIG.MIN_BUY_SOL_SIGNAL) continue;
 
-            const consensus = recordSignal(target, t.mint, t.sol);
-            if(!consensus) continue;
+            log('SIGNAL', `👀 ${CONFIG.TARGET.slice(0,8)} bought ${t.mint.slice(0,10)}... for ${t.sol.toFixed(2)} SOL — checking momentum...`);
 
-            // ── MOMENTUM CONFIRMATION ─────────────────────────────
-            // Get price snapshot before waiting
-            const mintLamports = Math.floor(CONFIG.BUY_SOL * 1e9);
+            // ── MOMENTUM CONFIRMATION ─────────────────────────
+            // Snapshot 1: how many tokens do we get right now?
+            const lamports = Math.floor(CONFIG.BUY_SOL * 1e9);
             let quoteBefore = null;
             try {
-              const qb = await fetch(`${CONFIG.JUPITER_QUOTE}?inputMint=${CONFIG.SOL}&outputMint=${t.mint}&amount=${mintLamports}&slippageBps=${CONFIG.MAX_SLIPPAGE_BPS}`);
+              const qb = await fetch(`${CONFIG.JUPITER_QUOTE}?inputMint=${CONFIG.SOL}&outputMint=${t.mint}&amount=${lamports}&slippageBps=${CONFIG.MAX_SLIPPAGE_BPS}`);
               if(qb.ok) { const qbd = await qb.json(); quoteBefore = parseFloat(qbd.outAmount||0); }
             } catch(e) {}
 
             if(!quoteBefore || quoteBefore === 0) {
-              log('SIGNAL', `⚠️ No initial quote for ${t.mint.slice(0,10)}... — skipping`);
-              state.signals.delete(t.mint);
+              log('SIGNAL', `⚠️ No route for ${t.mint.slice(0,10)}... — skipping`);
               state.tradedMints.add(t.mint);
               continue;
             }
 
-            log('SIGNAL', `⏳ Consensus on ${t.mint.slice(0,10)}... — waiting ${CONFIG.MOMENTUM_WAIT_MS/1000}s to confirm momentum...`);
+            // Wait 3 seconds
+            log('SIGNAL', `⏳ Waiting 3s to confirm momentum on ${t.mint.slice(0,10)}...`);
             await sleep(CONFIG.MOMENTUM_WAIT_MS);
 
-            // Re-check: still not traded/positioned?
+            // Guard: still valid?
             if(state.tradedMints.has(t.mint) || state.positions.has(t.mint)) continue;
 
-            // Get price snapshot after waiting
+            // Snapshot 2: how many tokens now?
             let quoteAfter = null;
             try {
-              const qa = await fetch(`${CONFIG.JUPITER_QUOTE}?inputMint=${CONFIG.SOL}&outputMint=${t.mint}&amount=${mintLamports}&slippageBps=${CONFIG.MAX_SLIPPAGE_BPS}`);
+              const qa = await fetch(`${CONFIG.JUPITER_QUOTE}?inputMint=${CONFIG.SOL}&outputMint=${t.mint}&amount=${lamports}&slippageBps=${CONFIG.MAX_SLIPPAGE_BPS}`);
               if(qa.ok) { const qad = await qa.json(); quoteAfter = parseFloat(qad.outAmount||0); }
             } catch(e) {}
 
             if(!quoteAfter || quoteAfter === 0) {
-              log('SIGNAL', `⚠️ No post-wait quote for ${t.mint.slice(0,10)}... — skipping`);
-              state.signals.delete(t.mint);
+              log('SIGNAL', `⚠️ Lost route for ${t.mint.slice(0,10)}... — skipping`);
               state.tradedMints.add(t.mint);
               continue;
             }
 
-            // Momentum check: price must have held or improved (tokens out ≥ before)
-            const momentumPct = ((quoteAfter - quoteBefore) / quoteBefore) * 100;
-            if(quoteAfter < quoteBefore) {
-              log('SIGNAL', `📉 MOMENTUM FAIL ${t.mint.slice(0,10)}... price dropped ${momentumPct.toFixed(1)}% in 3s — SKIP`);
-              await discord(`📉  **MOMENTUM FAIL** — skipped entry\n\`${t.mint}\`\nPrice dropped **${momentumPct.toFixed(1)}%** in 3s after consensus. Good save.`);
-              state.signals.delete(t.mint);
-              state.tradedMints.add(t.mint); // blacklist — don't retry
+            // UPWARD momentum = token price went UP = costs more SOL per token
+            // = we receive FEWER tokens for same SOL = quoteAfter < quoteBefore
+            // DOWNWARD / dump = token got cheaper = MORE tokens = quoteAfter > quoteBefore
+            const tokenChangePct = ((quoteAfter - quoteBefore) / quoteBefore) * 100;
+            const priceChangePct = -tokenChangePct; // invert: fewer tokens = higher price
+
+            if(quoteAfter >= quoteBefore * 1.02) {
+              // Getting ≥2% more tokens = token price dropped ≥2% = dump — SKIP
+              log('SIGNAL', `📉 NO MOMENTUM ${t.mint.slice(0,10)}... price down ${Math.abs(priceChangePct).toFixed(1)}% in 3s — skipping`);
+              await discord(`📉  **SKIP** \`${t.mint.slice(0,16)}...\`\nPrice dropped **${Math.abs(priceChangePct).toFixed(1)}%** in 3s — no momentum.`);
+              state.tradedMints.add(t.mint);
               continue;
             }
 
-            log('SIGNAL', `✅ MOMENTUM CONFIRMED ${t.mint.slice(0,10)}... +${momentumPct.toFixed(1)}% in 3s — BUYING`);
-            // ─────────────────────────────────────────────────────
+            // Price held or pumped — confirmed upward momentum → BUY
+            log('SIGNAL', `✅ MOMENTUM UP ${t.mint.slice(0,10)}... price +${priceChangePct.toFixed(1)}% in 3s — BUYING`);
 
             const bal = await solBal();
             const size = Math.min(CONFIG.BUY_SOL, bal * CONFIG.MAX_BUY_PCT, bal - 0.005);
-            if(size < 0.01) { log('INFO', `💸 Balance too low (${bal.toFixed(4)} SOL)`); continue; }
+            if(size < 0.01) {
+              log('INFO', `💸 Balance too low (${bal.toFixed(4)} SOL)`);
+              continue;
+            }
 
-            state.signals.delete(t.mint);
-            const ctx = `${consensus.wallets} wallets, avg ${consensus.avgSol.toFixed(2)} SOL, momentum +${momentumPct.toFixed(1)}%`;
-            log('SIGNAL', `🚀 BUYING ${t.mint.slice(0,10)}... | ${ctx} → ${size.toFixed(4)} SOL`);
-            await discord(`📶🚀  **MOMENTUM CONFIRMED — BUYING**\n\`${t.mint}\`\n👥  **${consensus.wallets} wallets** agreed · price **+${momentumPct.toFixed(1)}%** in 3s\n💰  Entry: **${size.toFixed(4)} SOL** · exit in **${CONFIG.HOLD_SECONDS}s**`);
+            const ctx = `whale ${t.sol.toFixed(2)} SOL · price +${priceChangePct.toFixed(1)}% in 3s`;
+            await discord(
+              `📶✅  **MOMENTUM CONFIRMED — BUYING**\n\`${t.mint}\`\n` +
+              `🐋  Whale bought **${t.sol.toFixed(2)} SOL** · price **+${priceChangePct.toFixed(1)}%** in 3s\n` +
+              `💰  Entry: **${size.toFixed(4)} SOL** · exit in **${CONFIG.HOLD_SECONDS}s**`
+            );
             await execBuy(t.mint, size, ctx);
           }
         }
       }
     } catch(e) {
-      log('ERROR', `pollWallet [${target.slice(0,8)}]: ${e.message}`);
+      log('ERROR', `Poll error: ${e.message}`);
     }
     await sleep(CONFIG.POLL_MS);
   }
@@ -536,26 +500,19 @@ async function health() {
   while(state.isRunning) {
     const bal = await solBal();
     const pnl = bal - state.stats.startBal;
-    console.log('\n' + '═'.repeat(62));
-    console.log('  🚀 WINSTON v12.1 — 10s Momentum Scalper');
-    console.log('═'.repeat(62));
-    console.log(`  👥 ${CONFIG.TARGETS.length} wallets | fire on ${CONFIG.MIN_WALLETS_AGREE}+ agree within ${CONFIG.CONSENSUS_WINDOW_MS/1000}s`);
+    console.log('\n' + '═'.repeat(58));
+    console.log('  ⚡ WINSTON v13 — 10s Momentum Scalper');
+    console.log('═'.repeat(58));
+    console.log(`  👀 Target: ${CONFIG.TARGET.slice(0,20)}...`);
     console.log(`  💰 ${bal.toFixed(4)} SOL | PnL: ${pnl>=0?'+':''}${pnl.toFixed(4)} SOL`);
     console.log(`  🛒 ${state.stats.buys}B  🚪 ${state.stats.sells}S  ❌ ${state.stats.errors}E`);
     console.log(`  📦 ${state.positions.size} open | 🚫 ${state.tradedMints.size} blacklisted`);
-    console.log(`  🎯 Entry: 3s momentum confirm | Hold: ${CONFIG.HOLD_SECONDS}s hard exit | SL: ${CONFIG.SL_PCT}% | Buy: ${CONFIG.BUY_SOL} SOL`);
-    if(state.signals.size > 0) {
-      console.log(`  📶 Live signals:`);
-      for(const [mint, sigs] of state.signals) {
-        const w = new Set(sigs.map(s => s.wallet)).size;
-        const age = Math.round((Date.now() - Math.min(...sigs.map(s=>s.time)))/1000);
-        console.log(`     ${mint.slice(0,12)}... | ${w}/${CONFIG.MIN_WALLETS_AGREE} wallets | ${age}s old`);
-      }
-    }
+    console.log(`  🎯 Buy: ${CONFIG.BUY_SOL} SOL | 3s momentum check | ${CONFIG.HOLD_SECONDS}s exit | SL: ${CONFIG.SL_PCT}%`);
     for(const [m, p] of state.positions) {
-      console.log(`     ${p.sym} ${m.slice(0,8)}... | ${((Date.now()-p.time)/1000).toFixed(0)}s | ${p.sol.toFixed(4)} SOL in`);
+      const age = ((Date.now()-p.time)/1000).toFixed(1);
+      console.log(`     ${p.sym} ${m.slice(0,8)}... | ${age}s | ${p.sol.toFixed(4)} SOL in`);
     }
-    console.log('═'.repeat(62) + '\n');
+    console.log('═'.repeat(58) + '\n');
     await sleep(CONFIG.HEALTH_MS);
   }
 }
@@ -563,10 +520,10 @@ async function health() {
 // ── MAIN ─────────────────────────────────────────────────────
 
 async function main() {
-  console.log('\n╔════════════════════════════════════════════════════════════╗');
-  console.log('║  🚀 WINSTON v12.1 — 10s Momentum Scalper                  ║');
-  console.log('║  Consensus → 3s momentum check → buy → hard 10s exit      ║');
-  console.log('╚════════════════════════════════════════════════════════════╝\n');
+  console.log('\n╔══════════════════════════════════════════════════════╗');
+  console.log('║  ⚡ WINSTON v13 — 10s Momentum Scalper               ║');
+  console.log('║  1 wallet · 3s momentum check · 10s hard exit        ║');
+  console.log('╚══════════════════════════════════════════════════════╝\n');
 
   if(!CONFIG.HELIUS_API_KEY) { log('ERROR', 'HELIUS_API_KEY missing'); process.exit(1); }
   if(!CONFIG.PRIVATE_KEY)    { log('ERROR', 'WALLET_PRIVATE_KEY missing'); process.exit(1); }
@@ -579,31 +536,33 @@ async function main() {
   state.stats.startBal = await solBal();
   log('INFO', `Balance: ${state.stats.startBal.toFixed(4)} SOL`);
 
-  if(state.stats.startBal < 0.02) {
-    log('ERROR', 'Balance too low. Need at least 0.02 SOL to trade.');
+  if(state.stats.startBal < 0.015) {
+    log('ERROR', 'Balance too low to trade safely.');
     process.exit(1);
   }
 
-  // Set cursor for each target so we don't replay old history
-  log('INFO', `Bootstrapping ${CONFIG.TARGETS.length} wallet cursors...`);
-  for(const target of CONFIG.TARGETS) {
-    try {
-      const r = await fetch(CONFIG.HELIUS_RPC, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'getSignaturesForAddress', params:[target,{limit:1}] })
-      });
-      const d = await r.json();
-      state.lastSigs.set(target, d?.result?.[0]?.signature || null);
-      log('INFO', `  ✓ ${target.slice(0,16)}...`);
-    } catch(e) {
-      log('ERROR', `  ✗ ${target.slice(0,16)}... (${e.message})`);
-    }
-    await sleep(150);
-  }
+  // Bootstrap cursor — don't replay old history
+  try {
+    const r = await fetch(CONFIG.HELIUS_RPC, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'getSignaturesForAddress', params:[CONFIG.TARGET,{limit:1}] })
+    });
+    const d = await r.json();
+    state.lastSig = d?.result?.[0]?.signature || null;
+    log('INFO', `Cursor set: ${state.lastSig ? state.lastSig.slice(0,16)+'...' : 'none'}`);
+  } catch(e) { log('ERROR', `Cursor init failed: ${e.message}`); process.exit(1); }
 
   state.isRunning = true;
-  log('INFO', `🚀 Running | ${CONFIG.TARGETS.length} wallets | consensus ${CONFIG.MIN_WALLETS_AGREE}+/${CONFIG.CONSENSUS_WINDOW_MS/1000}s | 3s momentum check | buy ${CONFIG.BUY_SOL} SOL | hold ${CONFIG.HOLD_SECONDS}s | SL:${CONFIG.SL_PCT}%`);
-  await discord(`▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🚀  **WINSTON v12.1 ONLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n👥  Watching **${CONFIG.TARGETS.length} wallets**\n🎯  Buy when **${CONFIG.MIN_WALLETS_AGREE}+** agree + **3s momentum confirmed**\n💰  Balance: **${state.stats.startBal.toFixed(4)} SOL** | Entry: **${CONFIG.BUY_SOL} SOL**\n⏱  Hold: **${CONFIG.HOLD_SECONDS}s hard exit** | SL: **${CONFIG.SL_PCT}%**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬`);
+  log('INFO', `⚡ Live | target: ${CONFIG.TARGET.slice(0,16)}... | buy: ${CONFIG.BUY_SOL} SOL | 3s momentum | ${CONFIG.HOLD_SECONDS}s exit | SL: ${CONFIG.SL_PCT}%`);
+  await discord(
+    `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
+    `⚡  **WINSTON v13 ONLINE**\n` +
+    `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
+    `👀  Target: \`${CONFIG.TARGET}\`\n` +
+    `💰  Balance: **${state.stats.startBal.toFixed(4)} SOL** | Entry: **${CONFIG.BUY_SOL} SOL**\n` +
+    `⏱  3s momentum check → **${CONFIG.HOLD_SECONDS}s hard exit** | SL: **${CONFIG.SL_PCT}%**\n` +
+    `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬`
+  );
 
   let shuttingDown = false;
   const shutdown = async () => {
@@ -611,17 +570,20 @@ async function main() {
     shuttingDown = true;
     state.isRunning = false;
     const f = await solBal(); const p = f - state.stats.startBal;
-    await discord(`▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON v12.1 OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n💰  **${f.toFixed(4)} SOL**  ·  PnL: **${p>=0?'+':''}${p.toFixed(4)} SOL**\n🛒  ${state.stats.buys}B  🚪 ${state.stats.sells}S  ❌ ${state.stats.errors}E\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬`);
+    await discord(
+      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
+      `🔴  **WINSTON v13 OFFLINE**\n` +
+      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
+      `💰  **${f.toFixed(4)} SOL**  ·  PnL: **${p>=0?'+':''}${p.toFixed(4)} SOL**\n` +
+      `🛒  ${state.stats.buys}B  🚪 ${state.stats.sells}S  ❌ ${state.stats.errors}E\n` +
+      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬`
+    );
     process.exit(0);
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-  await Promise.all([
-    ...CONFIG.TARGETS.map(t => pollWallet(t)),
-    exitManager(),
-    health(),
-  ]);
+  await Promise.all([poll(), exitManager(), health()]);
 }
 
 main().catch(e => { log('ERROR', 'Fatal', { err: e.message }); process.exit(1); });
