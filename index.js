@@ -37,7 +37,7 @@ const CONFIG = {
   // If token got cheaper (dump) = more tokens per SOL = SKIP
 
   // ── Position sizing ──────────────────────────────────────
-  BUY_SOL:     0.11,
+  BUY_SOL:     0.033,  // ~$5 at current SOL price
   MAX_BUY_PCT: 0.80,         // safety cap
 
   // ── Fees ─────────────────────────────────────────────────
