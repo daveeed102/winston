@@ -23,7 +23,7 @@ const CONFIG = {
   JUPITER_SWAP:    'https://lite-api.jup.ag/swap/v1/swap',
 
   // ── The one wallet we mirror ─────────────────────────────
-  TARGET: 'AiaPyUYJZwc2TTmYXG1RbzwaZoTR6ituPqZVqzkF82JB',
+  TARGET: 'pwZ5jRsFKyPGhgcS5uC9SrV3CxdsDptQuLQYiVhGz31',
 
   // ── Position sizing ──────────────────────────────────────
   BUY_SOL: 0.050,  // fixed $4 equivalent per trade
