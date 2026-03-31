@@ -31,13 +31,13 @@ const CONFIG = {
   MIN_BUY_SOL_SIGNAL: 2.01,  // skip whale buys ≤ 2 SOL, only mirror 2.01+ SOL
 
   // ── Momentum confirmation ────────────────────────────────
-  MOMENTUM_WAIT_MS: 3000,    // wait 3s then re-check price
-  // After 3s, if token costs MORE sol per token (price pumped)
+  MOMENTUM_WAIT_MS: 25000,   // wait 25s then re-check price
+  // After 25s, if token costs MORE sol per token (price pumped)
   // = fewer tokens per SOL out = quoteAfter < quoteBefore → BUY
   // If token got cheaper (dump) = more tokens per SOL = SKIP
 
   // ── Position sizing ──────────────────────────────────────
-  BUY_SOL:     0.033,  // ~$5 at current SOL price
+  BUY_SOL:     0.060,  // fixed 0.060 SOL per trade — always
   MAX_BUY_PCT: 0.80,         // safety cap
 
   // ── Fees ─────────────────────────────────────────────────
@@ -48,7 +48,7 @@ const CONFIG = {
   MAX_RETRIES: 3,
 
   // ── Exit ─────────────────────────────────────────────────
-  HOLD_SECONDS:  10,    // hard exit at 10s — no exceptions
+  HOLD_SECONDS:  12,    // hard exit at 12s — no exceptions
   SL_PCT:       -10,    // stop loss, checked every 500ms
   EXIT_CHECK_MS: 500,
 
@@ -434,7 +434,7 @@ async function poll() {
             }
 
             // Wait 3 seconds
-            log('SIGNAL', `⏳ Waiting 3s to confirm momentum on ${t.mint.slice(0,10)}...`);
+            log('SIGNAL', `⏳ Waiting 25s to confirm momentum on ${t.mint.slice(0,10)}...`);
             await sleep(CONFIG.MOMENTUM_WAIT_MS);
 
             // Guard: still valid?
@@ -462,13 +462,13 @@ async function poll() {
             if(quoteAfter >= quoteBefore * 1.02) {
               // Getting ≥2% more tokens = token price dropped ≥2% = dump — SKIP
               log('SIGNAL', `📉 NO MOMENTUM ${t.mint.slice(0,10)}... price down ${Math.abs(priceChangePct).toFixed(1)}% in 3s — skipping`);
-              await discord(`📉  **SKIP** \`${t.mint.slice(0,16)}...\`\nPrice dropped **${Math.abs(priceChangePct).toFixed(1)}%** in 3s — no momentum.`);
+              await discord(`📉  **SKIP** \`${t.mint.slice(0,16)}...\`\nPrice dropped **${Math.abs(priceChangePct).toFixed(1)}%** in 25s — no momentum.`);
               state.tradedMints.add(t.mint);
               continue;
             }
 
             // Price held or pumped — confirmed upward momentum → BUY
-            log('SIGNAL', `✅ MOMENTUM UP ${t.mint.slice(0,10)}... price +${priceChangePct.toFixed(1)}% in 3s — BUYING`);
+            log('SIGNAL', `✅ MOMENTUM UP ${t.mint.slice(0,10)}... price +${priceChangePct.toFixed(1)}% in 25s — BUYING`);
 
             const bal = await solBal();
             const size = Math.min(CONFIG.BUY_SOL, bal * CONFIG.MAX_BUY_PCT, bal - 0.005);
@@ -477,10 +477,10 @@ async function poll() {
               continue;
             }
 
-            const ctx = `whale ${t.sol.toFixed(2)} SOL · price +${priceChangePct.toFixed(1)}% in 3s`;
+            const ctx = `whale ${t.sol.toFixed(2)} SOL · price +${priceChangePct.toFixed(1)}% in 25s`;
             await discord(
               `📶✅  **MOMENTUM CONFIRMED — BUYING**\n\`${t.mint}\`\n` +
-              `🐋  Whale bought **${t.sol.toFixed(2)} SOL** · price **+${priceChangePct.toFixed(1)}%** in 3s\n` +
+              `🐋  Whale bought **${t.sol.toFixed(2)} SOL** · price **+${priceChangePct.toFixed(1)}%** in 25s\n` +
               `💰  Entry: **${size.toFixed(4)} SOL** · exit in **${CONFIG.HOLD_SECONDS}s**`
             );
             await execBuy(t.mint, size, ctx);
