@@ -431,8 +431,8 @@ async function main() {
   state.stats.startBal = await solBal();
   log('INFO', `Balance: ${state.stats.startBal.toFixed(4)} SOL`);
 
-  if(state.stats.startBal < 0.06) {
-    log('ERROR', `Balance too low. Need at least 0.06 SOL (buy + fees).`);
+  if(state.stats.startBal < 0.05) {
+    log('ERROR', `Balance too low. Need at least 0.05 SOL (buy + fees).`);
     process.exit(1);
   }
 
