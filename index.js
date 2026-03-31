@@ -48,7 +48,7 @@ const CONFIG = {
   MAX_RETRIES: 3,
 
   // ── Exit ─────────────────────────────────────────────────
-  HOLD_SECONDS:  12,    // hard exit at 12s — no exceptions
+  HOLD_SECONDS:  20,    // hard exit at 12s — no exceptions
   SL_PCT:       -10,    // stop loss, checked every 500ms
   EXIT_CHECK_MS: 500,
 
