@@ -26,7 +26,11 @@ const CONFIG = {
   TARGET: 'pwZ5jRsFKyPGhgcS5uC9SrV3CxdsDptQuLQYiVhGz31',
 
   // ── Position sizing ──────────────────────────────────────
-  BUY_SOL: 0.050,  // fixed $4 equivalent per trade
+  BUY_SOL: 0.026,  // ~$4 at current SOL price
+
+  // ── Auto exit ────────────────────────────────────────────
+  HOLD_SECONDS:  25,    // sell after 25s no matter what
+  EXIT_CHECK_MS: 500,   // check every 500ms
 
   // ── Speed fees — we pay to move first ───────────────────
   // Buy: high priority to snipe entry with him
@@ -294,6 +298,26 @@ async function execSell(mint, reason, attempt=1) {
   }
 }
 
+// ── EXIT MANAGER — 25s hard exit ─────────────────────────────
+
+async function exitManager() {
+  log('INFO', `⏱ Exit manager active | hard exit at ${CONFIG.HOLD_SECONDS}s`);
+  while(state.isRunning) {
+    await sleep(CONFIG.EXIT_CHECK_MS);
+    for(const [mint, pos] of state.positions) {
+      if(pos.isSelling) continue;
+      const ageSec = (Date.now() - pos.time) / 1000;
+      if(ageSec >= CONFIG.HOLD_SECONDS) {
+        log('EXIT', `⏱ 25s AUTO-EXIT ${pos.sym} — selling now`);
+        pos.isSelling = true;
+        execSell(mint, `25s_auto_exit`).catch(e =>
+          log('ERROR', `Auto-exit sell error: ${e.message}`)
+        );
+      }
+    }
+  }
+}
+
 // ── POLL — single tight loop, 500ms ─────────────────────────
 
 async function poll() {
@@ -433,7 +457,7 @@ async function main() {
     `👀  Mirroring: \`${CONFIG.TARGET}\`\n` +
     `💸  **${CONFIG.BUY_SOL} SOL** per trade (~$4)\n` +
     `⚡  Priority: **${CONFIG.BUY_PRIORITY_LAMPORTS/1e6}M lamports** buy & sell\n` +
-    `🔁  He buys → we buy. He sells → we sell.\n` +
+    `🔁  He buys → we buy. Auto-exit at **25s**.\n` +
     `💰  Balance: **${state.stats.startBal.toFixed(4)} SOL**\n` +
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬`
   );
@@ -457,7 +481,7 @@ async function main() {
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-  await Promise.all([poll(), health()]);
+  await Promise.all([poll(), exitManager(), health()]);
 }
 
 main().catch(e => { log('ERROR', 'Fatal', { err: e.message }); process.exit(1); });
