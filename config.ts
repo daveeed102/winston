@@ -13,10 +13,6 @@ function optionalEnv(key: string, fallback?: string): string | undefined {
   return process.env[key] ?? fallback;
 }
 
-// ── Calculate the SOL amount once on startup ─────────────────────────────
-// Defaults to 0.1813 if you don't provide it in your .env or Railway variables
-const buyAmountSol = parseFloat(optionalEnv('BUY_AMOUNT_SOL', '0.1813') ?? '0.1813');
-
 export const config = {
   // ── Grok (Actor) ────────────────────────────────────────────────────────
   GROK_API_KEY: requireEnv('GROK_API_KEY'),
@@ -29,9 +25,9 @@ export const config = {
   HELIUS_RPC_URL:     requireEnv('HELIUS_RPC_URL'),
 
   // ── Trading Parameters ───────────────────────────────────────────────────
-  BUY_AMOUNT_SOL:      buyAmountSol,
-  BUY_AMOUNT_LAMPORTS: Math.floor(buyAmountSol * 1_000_000_000), // Auto-calculated!
-  SLIPPAGE_BPS:        parseInt(optionalEnv('SLIPPAGE_BPS', '500') ?? '500', 10),
+  BUY_AMOUNT_SOL:      parseFloat(optionalEnv('BUY_AMOUNT_SOL',  '0.1')  ?? '0.1'),
+  BUY_AMOUNT_LAMPORTS: parseInt(  optionalEnv('BUY_AMOUNT_LAMPORTS', '100000000') ?? '100000000', 10),
+  SLIPPAGE_BPS:        parseInt(  optionalEnv('SLIPPAGE_BPS',    '500')   ?? '500', 10),
 
   // ── Rugcheck (Critic) ────────────────────────────────────────────────────
   // Risk score threshold — tokens AT or ABOVE this score are rejected.
