@@ -1,16 +1,17 @@
 'use strict';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CONFIG
+// CONFIG — set all of these in Railway Variables tab
 // ─────────────────────────────────────────────────────────────────────────────
 
 const GROK_API_KEY        = process.env.GROK_API_KEY        || null;
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || null;
 const HELIUS_RPC_URL      = process.env.HELIUS_RPC_URL      || null;
 const WALLET_PRIVATE_KEY  = process.env.WALLET_PRIVATE_KEY  || null;
+const JUPITER_API_KEY     = process.env.JUPITER_API_KEY     || null;
 
-const BUY_AMOUNT_SOL      = 0.1813;       // FIXED
-const BUY_AMOUNT_LAMPORTS = 181300000;    // 0.1813 SOL in lamports
+const BUY_AMOUNT_SOL      = 0.1813;    // FIXED — do not change
+const BUY_AMOUNT_LAMPORTS = 181300000; // 0.1813 SOL in lamports
 const SLIPPAGE_BPS        = parseInt(process.env.SLIPPAGE_BPS || '500', 10);
 const RUGCHECK_THRESHOLD  = parseInt(process.env.RUGCHECK_RISK_THRESHOLD || '500', 10);
 const SOL_MINT            = 'So11111111111111111111111111111111111111112';
@@ -28,11 +29,12 @@ if (!WALLET_PRIVATE_KEY) missing.push('WALLET_PRIVATE_KEY');
 
 if (missing.length > 0) {
   console.error(`\n❌ Missing required Railway environment variables:\n  ${missing.join('\n  ')}`);
-  console.error('\nGo to your Railway service → Variables tab and add them.\n');
+  console.error('\nAdd them in Railway → your service → Variables tab.\n');
   process.exit(1);
 }
 
 if (!DISCORD_WEBHOOK_URL) console.warn('[WARN] DISCORD_WEBHOOK_URL not set — alerts disabled.');
+if (!JUPITER_API_KEY)     console.warn('[WARN] JUPITER_API_KEY not set — Jupiter token search unavailable as fallback.');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HELPERS
@@ -62,13 +64,13 @@ async function discordSend(embed) {
 
 async function alertStartup() {
   await discordSend({
-    title: '🤖 Winston Online',
-    description: 'Actor-Critic bot started. 2-hour cycles running.',
+    title: '🤖 Winston Online — v4',
+    description: 'Actor-Critic bot started. Running 2-hour cycles.',
     color: COLORS.BLUE,
     fields: [
-      { name: 'Buy Size',    value: `${BUY_AMOUNT_SOL} SOL`, inline: true },
-      { name: 'Hold Window', value: '120 minutes',           inline: true },
-      { name: 'Address Source', value: 'DexScreener (real on-chain)', inline: true },
+      { name: 'Buy Size',       value: `${BUY_AMOUNT_SOL} SOL (fixed)`, inline: true },
+      { name: 'Hold Window',    value: '120 minutes',                    inline: true },
+      { name: 'Address Source', value: 'DexScreener + Jupiter fallback', inline: true },
     ],
     timestamp: nowISO(),
   });
@@ -77,16 +79,16 @@ async function alertStartup() {
 async function alertBuy({ symbol, tokenAddress, txSig, confidence, reasoning, rugcheckStatus, dexUrl }) {
   await discordSend({
     title: `🟢 BUY — ${symbol}`,
-    description: `Bought **${symbol}** for **${BUY_AMOUNT_SOL} SOL**. Holding 120 min.`,
+    description: `Bought **${symbol}** for **${BUY_AMOUNT_SOL} SOL**. Holding 120 minutes.`,
     color: COLORS.GREEN,
     fields: [
-      { name: 'Amount',     value: `${BUY_AMOUNT_SOL} SOL`, inline: true },
-      { name: 'Confidence', value: `${confidence}/100`,      inline: true },
-      { name: '🧠 Grok\'s Reasoning', value: reasoning,      inline: false },
-      { name: 'Mint Address', value: `\`${tokenAddress}\``,  inline: false },
-      { name: rugcheckStatus.icon + ' Rugcheck', value: rugcheckStatus.text, inline: false },
-      ...(dexUrl    ? [{ name: 'Chart',       value: `[DexScreener](${dexUrl})`,              inline: true }] : []),
-      ...(txSig     ? [{ name: 'Transaction', value: `[Solscan](https://solscan.io/tx/${txSig})`, inline: true }] : []),
+      { name: 'Amount',               value: `${BUY_AMOUNT_SOL} SOL`,   inline: true  },
+      { name: 'Confidence',           value: `${confidence}/100`,        inline: true  },
+      { name: '🧠 Grok\'s Reasoning', value: reasoning,                  inline: false },
+      { name: 'Mint Address',         value: `\`${tokenAddress}\``,      inline: false },
+      { name: `${rugcheckStatus.icon} Rugcheck`, value: rugcheckStatus.text, inline: false },
+      ...(dexUrl ? [{ name: 'Chart', value: `[DexScreener](${dexUrl})`, inline: true }] : []),
+      ...(txSig  ? [{ name: 'Tx',    value: `[Solscan](https://solscan.io/tx/${txSig})`, inline: true }] : []),
     ],
     timestamp: nowISO(),
   });
@@ -96,11 +98,11 @@ async function alertSell({ symbol, tokenAddress, buyTimestamp, txSig }) {
   const mins = Math.round((Date.now() - new Date(buyTimestamp).getTime()) / 60000);
   await discordSend({
     title: `🔴 SELL — ${symbol}`,
-    description: `Sold **${symbol}** → SOL after **${mins}m**.`,
+    description: `Sold **${symbol}** → SOL after **${mins}m** hold.`,
     color: COLORS.RED,
     fields: [
-      { name: 'Hold Time', value: `${mins} minutes`,     inline: true },
-      { name: 'Mint',      value: `\`${tokenAddress}\``, inline: false },
+      { name: 'Hold Time',   value: `${mins} minutes`,      inline: true  },
+      { name: 'Mint',        value: `\`${tokenAddress}\``,  inline: false },
       ...(txSig ? [{ name: 'Tx', value: `[Solscan](https://solscan.io/tx/${txSig})`, inline: false }] : []),
     ],
     timestamp: nowISO(),
@@ -136,8 +138,7 @@ async function alertError(message) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GROK — The Actor
-// Asks for SYMBOL ONLY — never trusts Grok for a token address
+// GROK — The Actor (returns symbol only — never trusts Grok for addresses)
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function grokPick(timestamp, rejectedPicks) {
@@ -147,13 +148,13 @@ Pick ONE token that will be profitable at the EXACT 2-hour mark.
 
 Rules:
 - HIGH social buzz and momentum RIGHT NOW on Twitter/X, Telegram, DEX screeners
-- NOT a 5-minute pump-and-dump — must sustain for 120 minutes
-- NOT a slow "safe" bluechip — needs real upside
-- SWEET SPOT: early-to-mid pump phase, building momentum not peaked
-- Must be a real Solana token actively trading on DEXes like Raydium or Orca
+- NOT a 5-minute pump-and-dump — must sustain momentum for 120 minutes
+- NOT a slow "safe" bluechip — needs real upside potential
+- SWEET SPOT: early-to-mid pump phase with building momentum
+- Must be a real Solana token actively trading on Raydium, Orca, or Meteora
 
-CRITICAL: Do NOT invent or guess token mint addresses. Only provide the symbol/ticker.
-The system will look up the real on-chain address from DexScreener automatically.
+CRITICAL: Do NOT include a token address. The system resolves real addresses from DexScreener.
+Only provide the ticker symbol.
 
 Respond ONLY with valid JSON, no markdown, no backticks:
 {"symbol":"<ticker>","confidence_score_out_of_100":<0-100>,"short_reasoning":"<1-2 sentences>"}`;
@@ -163,7 +164,7 @@ Respond ONLY with valid JSON, no markdown, no backticks:
 Pick a Solana memecoin to hold for EXACTLY 120 minutes. Find the sweet spot of high buzz and 2-hour survivability.`;
 
   if (rejectedPicks.length > 0) {
-    userPrompt += `\n\nDO NOT pick these — they were already rejected this session:`;
+    userPrompt += `\n\nDO NOT pick these — already rejected this session:`;
     for (const r of rejectedPicks) {
       userPrompt += `\n- ${r.symbol}: ${r.reason}`;
     }
@@ -213,48 +214,98 @@ Pick a Solana memecoin to hold for EXACTLY 120 minutes. Find the sweet spot of h
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DEXSCREENER — Real On-Chain Address Lookup
-// Searches by symbol, filters to Solana, picks highest-volume pair
+// TOKEN ADDRESS LOOKUP
+// Chain: DexScreener → Jupiter token search → fail with clear message
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function lookupTokenAddress(symbol) {
-  const url = `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(symbol)}`;
-
-  const res = await fetch(url, {
-    headers: { 'Accept': 'application/json' },
-    signal: AbortSignal.timeout(10000),
-  });
-
+// Source 1: DexScreener search
+async function lookupViaDexScreener(symbol) {
+  const res = await fetch(
+    `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(symbol)}`,
+    { headers: { 'Accept': 'application/json' }, signal: AbortSignal.timeout(10000) }
+  );
   if (!res.ok) throw new Error(`DexScreener HTTP ${res.status}`);
 
-  const data = await res.json();
+  const data  = await res.json();
   const pairs = (data.pairs || []).filter(p =>
     p.chainId === 'solana' &&
     p.baseToken?.symbol?.toUpperCase() === symbol.toUpperCase() &&
     p.baseToken?.address
   );
 
-  if (pairs.length === 0) {
-    throw new Error(`No Solana pairs found for symbol "${symbol}" on DexScreener`);
-  }
+  if (pairs.length === 0) throw new Error(`Symbol "${symbol}" not found on DexScreener`);
 
-  // Sort by 24h volume descending — pick the most liquid pair
   pairs.sort((a, b) => (b.volume?.h24 || 0) - (a.volume?.h24 || 0));
   const best = pairs[0];
 
-  console.log(`[DEXSCREENER] ${symbol} → ${best.baseToken.address} (vol $${Math.round(best.volume?.h24 || 0).toLocaleString()})`);
-
   return {
-    address: best.baseToken.address,
-    name:    best.baseToken.name || symbol,
-    dexUrl:  best.url || null,
+    address:   best.baseToken.address,
+    name:      best.baseToken.name || symbol,
+    dexUrl:    best.url || null,
     volume24h: best.volume?.h24 || 0,
-    priceUsd:  best.priceUsd || null,
+    source:    'DexScreener',
   };
 }
 
+// Source 2: Jupiter token search API
+async function lookupViaJupiter(symbol) {
+  if (!JUPITER_API_KEY) throw new Error('JUPITER_API_KEY not configured');
+
+  const headers = { 'Accept': 'application/json', 'x-api-key': JUPITER_API_KEY };
+
+  // Jupiter v2 token search
+  const res = await fetch(
+    `https://api.jup.ag/tokens/v1/search?query=${encodeURIComponent(symbol)}`,
+    { headers, signal: AbortSignal.timeout(10000) }
+  );
+
+  if (!res.ok) throw new Error(`Jupiter token search HTTP ${res.status}`);
+
+  const data = await res.json();
+  // Response is an array of token objects
+  const tokens = Array.isArray(data) ? data : (data.tokens || data.data || []);
+
+  const match = tokens.find(t =>
+    t.symbol?.toUpperCase() === symbol.toUpperCase() && t.address
+  );
+
+  if (!match) throw new Error(`Symbol "${symbol}" not found on Jupiter token list`);
+
+  return {
+    address:   match.address,
+    name:      match.name || symbol,
+    dexUrl:    `https://jup.ag/swap/SOL-${match.address}`,
+    volume24h: 0,
+    source:    'Jupiter',
+  };
+}
+
+// Main lookup — tries DexScreener first, falls back to Jupiter
+async function lookupTokenAddress(symbol) {
+  // Try DexScreener first
+  try {
+    const result = await lookupViaDexScreener(symbol);
+    console.log(`[LOOKUP] ${symbol} → ${result.address} via DexScreener (vol $${Math.round(result.volume24h).toLocaleString()})`);
+    return result;
+  } catch (e) {
+    console.warn(`[LOOKUP] DexScreener failed for ${symbol}: ${e.message}`);
+  }
+
+  // Fallback: Jupiter token search
+  try {
+    const result = await lookupViaJupiter(symbol);
+    console.log(`[LOOKUP] ${symbol} → ${result.address} via Jupiter fallback`);
+    return result;
+  } catch (e) {
+    console.warn(`[LOOKUP] Jupiter failed for ${symbol}: ${e.message}`);
+  }
+
+  throw new Error(`Could not find "${symbol}" on DexScreener or Jupiter — token may not exist or symbol may be wrong`);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// RUGCHECK — The Critic / Security Bouncer
+// RUGCHECK — The Critic
+// 400/404 = too new to audit → pass through. Real flags = reject.
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function rugcheckAudit(tokenAddress) {
@@ -264,10 +315,10 @@ async function rugcheckAudit(tokenAddress) {
   });
 
   if (!res.ok) {
-    // 400/404 = token too new to have a report — pass through with warning
     if (res.status === 400 || res.status === 404) {
-      console.warn(`[CRITIC] Rugcheck HTTP ${res.status} — token unverified, passing through.`);
-      return { approved: true, warning: `Rugcheck couldn't audit this token (HTTP ${res.status}) — unverified` };
+      // Token too new for Rugcheck — very common for fresh memecoins. Pass through.
+      console.warn(`[CRITIC] Rugcheck HTTP ${res.status} — too new to audit, passing through.`);
+      return { approved: true, warning: 'Token too new for Rugcheck to audit — trade at your own risk' };
     }
     throw new Error(`Rugcheck HTTP ${res.status}`);
   }
@@ -275,64 +326,58 @@ async function rugcheckAudit(tokenAddress) {
   const report  = await res.json();
   const reasons = [];
 
-  // Mint authority check
-  const mintKeys = ['mintAuthorityEnabled', 'mintAuthority', 'mint_authority'];
-  for (const key of mintKeys) {
+  // Mint authority
+  for (const key of ['mintAuthorityEnabled', 'mintAuthority', 'mint_authority']) {
     if (report?.[key] === true || report?.tokenMeta?.[key] === true) {
-      reasons.push('Mint authority still active (dev can print tokens)');
+      reasons.push('Mint authority still active');
       break;
     }
   }
 
-  // Freeze authority check
-  const freezeKeys = ['freezeAuthorityEnabled', 'freezeAuthority', 'freeze_authority'];
-  for (const key of freezeKeys) {
+  // Freeze authority
+  for (const key of ['freezeAuthorityEnabled', 'freezeAuthority', 'freeze_authority']) {
     if (report?.[key] === true || report?.tokenMeta?.[key] === true) {
-      reasons.push('Freeze authority still active (dev can freeze wallets)');
+      reasons.push('Freeze authority still active');
       break;
     }
   }
 
-  // Risk score check
+  // Risk score
   const score = report?.score ?? report?.riskScore ?? 0;
-  if (score >= RUGCHECK_THRESHOLD) reasons.push(`Risk score ${score} >= threshold ${RUGCHECK_THRESHOLD}`);
+  if (score >= RUGCHECK_THRESHOLD) reasons.push(`Risk score ${score} >= ${RUGCHECK_THRESHOLD}`);
 
-  // Danger-level risk flags
+  // Danger flags
   for (const risk of (report?.risks ?? [])) {
-    const level = (risk?.level ?? '').toLowerCase();
-    if (level === 'danger' || level === 'critical') {
-      reasons.push(`Critical risk flag: ${risk.name}`);
+    if (['danger', 'critical'].includes((risk?.level ?? '').toLowerCase())) {
+      reasons.push(`Critical: ${risk.name}`);
     }
   }
 
-  if (reasons.length > 0) {
-    return { approved: false, reason: reasons.join('; ') };
-  }
-
+  if (reasons.length > 0) return { approved: false, reason: reasons.join('; ') };
   return { approved: true, warning: null };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// JUPITER — Swap Execution (stubs — replace with your existing logic)
+// JUPITER — Swap Execution
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function sellTokenForSol(tokenAddress) {
   // ── REPLACE with your Jupiter sell swap ──────────────────────────────────
-  // Get full token balance, swap → SOL, return tx signature string
-  throw new Error('sellTokenForSol() not implemented — add your Jupiter swap code here');
+  // Get token balance → swap → SOL → return tx signature string
+  throw new Error('sellTokenForSol() not implemented — plug in your Jupiter swap here');
 }
 
 async function buySolForToken(tokenAddress) {
   // ── REPLACE with your Jupiter buy swap ───────────────────────────────────
-  // Swap BUY_AMOUNT_LAMPORTS (181300000) of SOL → token, return tx signature
-  throw new Error('buySolForToken() not implemented — add your Jupiter swap code here');
+  // Swap BUY_AMOUNT_LAMPORTS (181300000) SOL → token → return tx signature
+  throw new Error('buySolForToken() not implemented — plug in your Jupiter swap here');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TRADING CYCLE
 // ─────────────────────────────────────────────────────────────────────────────
 
-let currentHolding = null; // { tokenAddress, symbol, buyTimestamp }
+let currentHolding = null;
 
 async function sellPhase() {
   if (!currentHolding) { console.log('[SELL] Nothing held. Skipping.'); return; }
@@ -355,13 +400,13 @@ async function pickPhase() {
   console.log(`[PICK] Starting pick session at ${timestamp}`);
 
   for (let attempt = 1; attempt <= MAX_PICK_ATTEMPTS; attempt++) {
-    console.log(`[PICK] Attempt ${attempt}/${MAX_PICK_ATTEMPTS}...`);
+    console.log(`\n[PICK] Attempt ${attempt}/${MAX_PICK_ATTEMPTS}`);
 
-    // ── STEP 1: Grok picks a symbol ───────────────────────────────────────
+    // Step 1: Grok picks a symbol
     let grokResult;
     try {
       grokResult = await grokPick(timestamp, rejectedPicks);
-      console.log(`[ACTOR] Grok picked symbol: ${grokResult.symbol} — ${grokResult.confidence_score_out_of_100}/100`);
+      console.log(`[ACTOR] Symbol: ${grokResult.symbol} | Confidence: ${grokResult.confidence_score_out_of_100}/100`);
       console.log(`[ACTOR] Reasoning: ${grokResult.short_reasoning}`);
     } catch (e) {
       console.error(`[ACTOR] Grok error:`, e.message);
@@ -370,21 +415,20 @@ async function pickPhase() {
       continue;
     }
 
-    // ── STEP 2: DexScreener resolves real on-chain address ─────────────────
+    // Step 2: Resolve real on-chain address
     let tokenInfo;
     try {
       tokenInfo = await lookupTokenAddress(grokResult.symbol);
-      console.log(`[DEXSCREENER] Resolved ${grokResult.symbol} → ${tokenInfo.address}`);
     } catch (e) {
-      console.warn(`[DEXSCREENER] ❌ Could not find ${grokResult.symbol}: ${e.message}`);
-      const reason = `Not found on DexScreener: ${e.message}`;
+      const reason = `Address lookup failed: ${e.message}`;
+      console.warn(`[LOOKUP] ❌ ${grokResult.symbol}: ${reason}`);
       await alertRejection({ attempt, symbol: grokResult.symbol, reason, confidence: grokResult.confidence_score_out_of_100 });
       rejectedPicks.push({ symbol: grokResult.symbol, reason });
       await sleep(2000);
       continue;
     }
 
-    // ── STEP 3: Rugcheck security audit ───────────────────────────────────
+    // Step 3: Rugcheck security audit
     let rugResult;
     try {
       rugResult = await rugcheckAudit(tokenInfo.address);
@@ -394,9 +438,10 @@ async function pickPhase() {
     }
 
     if (!rugResult.approved) {
-      console.warn(`[CRITIC] ❌ Rejected ${grokResult.symbol}: ${rugResult.reason}`);
-      await alertRejection({ attempt, symbol: grokResult.symbol, reason: rugResult.reason, confidence: grokResult.confidence_score_out_of_100 });
-      rejectedPicks.push({ symbol: grokResult.symbol, reason: rugResult.reason });
+      const reason = rugResult.reason;
+      console.warn(`[CRITIC] ❌ Rejected ${grokResult.symbol}: ${reason}`);
+      await alertRejection({ attempt, symbol: grokResult.symbol, reason, confidence: grokResult.confidence_score_out_of_100 });
+      rejectedPicks.push({ symbol: grokResult.symbol, reason });
       await sleep(2000);
       continue;
     }
@@ -407,38 +452,38 @@ async function pickPhase() {
       console.log(`[CRITIC] ✅ ${grokResult.symbol} passed Rugcheck.`);
     }
 
-    // ── APPROVED ──────────────────────────────────────────────────────────
+    // Approved — return full pick
     return {
-      symbol:       grokResult.symbol,
-      token_address: tokenInfo.address,
+      symbol:                      grokResult.symbol,
+      token_address:               tokenInfo.address,
       confidence_score_out_of_100: grokResult.confidence_score_out_of_100,
-      short_reasoning: grokResult.short_reasoning,
-      dexUrl:       tokenInfo.dexUrl,
+      short_reasoning:             grokResult.short_reasoning,
+      dexUrl:                      tokenInfo.dexUrl,
+      source:                      tokenInfo.source,
       rugcheckStatus: rugResult.warning
-        ? { icon: '⚠️', text: `Unverified — ${rugResult.warning}` }
-        : { icon: '✅', text: 'Passed security audit' },
+        ? { icon: '⚠️', text: rugResult.warning }
+        : { icon: '✅', text: 'Passed Rugcheck security audit' },
     };
   }
 
-  // Circuit breaker
   console.warn('[CIRCUIT BREAKER] All picks exhausted. Holding SOL.');
   await alertCircuitBreaker(rejectedPicks);
   return null;
 }
 
 async function buyPhase(pick) {
-  console.log(`[BUY] Buying ${pick.symbol} (${pick.token_address}) for ${BUY_AMOUNT_SOL} SOL...`);
+  console.log(`[BUY] ${pick.symbol} | ${pick.token_address} | Source: ${pick.source}`);
   try {
     const txSig = await buySolForToken(pick.token_address);
     currentHolding = { tokenAddress: pick.token_address, symbol: pick.symbol, buyTimestamp: nowISO() };
     await alertBuy({
-      symbol:       pick.symbol,
-      tokenAddress: pick.token_address,
+      symbol:         pick.symbol,
+      tokenAddress:   pick.token_address,
       txSig,
-      confidence:   pick.confidence_score_out_of_100,
-      reasoning:    pick.short_reasoning,
+      confidence:     pick.confidence_score_out_of_100,
+      reasoning:      pick.short_reasoning,
       rugcheckStatus: pick.rugcheckStatus,
-      dexUrl:       pick.dexUrl,
+      dexUrl:         pick.dexUrl,
     });
     console.log(`[BUY] ✅ Done. Tx: ${txSig}`);
   } catch (e) {
@@ -449,20 +494,20 @@ async function buyPhase(pick) {
 }
 
 async function runCycle() {
-  console.log(`\n${'═'.repeat(50)}`);
+  console.log(`\n${'═'.repeat(52)}`);
   console.log(`[CYCLE] Starting at ${nowISO()}`);
-  console.log('═'.repeat(50));
+  console.log('═'.repeat(52));
 
   await sellPhase();
   const pick = await pickPhase();
 
   if (pick) {
     await buyPhase(pick);
-    console.log(`[CYCLE] Holding ${pick.symbol} for 2 hours.`);
+    console.log(`\n[CYCLE] ✅ Holding ${pick.symbol} for 2 hours.`);
   } else {
-    console.log('[CYCLE] Holding SOL for 2 hours.');
+    console.log('\n[CYCLE] Holding SOL for 2 hours.');
   }
-  console.log(`[CYCLE] Next cycle: ${new Date(Date.now() + TWO_HOURS_MS).toISOString()}`);
+  console.log(`[CYCLE] Next cycle: ${new Date(Date.now() + TWO_HOURS_MS).toISOString()}\n`);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -471,10 +516,10 @@ async function runCycle() {
 
 async function main() {
   console.log('🤖 Winston Actor-Critic Bot v4 starting...');
-  console.log(`   Buy amount:  ${BUY_AMOUNT_SOL} SOL (fixed)`);
-  console.log(`   Cycle:       2 hours`);
-  console.log(`   Addresses:   DexScreener (real on-chain only)`);
-  console.log(`   Discord:     ${DISCORD_WEBHOOK_URL ? 'enabled' : 'disabled'}\n`);
+  console.log(`   Buy:     ${BUY_AMOUNT_SOL} SOL fixed`);
+  console.log(`   Cycle:   2 hours`);
+  console.log(`   Lookup:  DexScreener → Jupiter fallback`);
+  console.log(`   Discord: ${DISCORD_WEBHOOK_URL ? 'enabled' : 'disabled'}\n`);
 
   await alertStartup();
   await runCycle();
