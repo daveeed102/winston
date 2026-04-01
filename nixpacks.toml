@@ -1,8 +1,8 @@
-[phases.build]
-cmds = ["npm install", "npm run build"]
+[phases.install]
+cmds = ["npm install"]
 
 [phases.deploy]
-cmd = "node dist/index.js"
+cmd = "npx ts-node index.ts"
 
 [variables]
 NODE_ENV = "production"
