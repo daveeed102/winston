@@ -1,0 +1,24 @@
+{
+  "name": "winston-actor-critic",
+  "version": "2.0.0",
+  "description": "Solana Actor-Critic trading bot — Grok hype hunter + Rugcheck security bouncer",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "railway": "npm run build && npm run start"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.4",
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
