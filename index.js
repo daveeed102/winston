@@ -26,7 +26,7 @@ const CONFIG = {
   TARGET: 'pwZ5jRsFKyPGhgcS5uC9SrV3CxdsDptQuLQYiVhGz31',
 
   // ── Position sizing ──────────────────────────────────────
-  BUY_SOL: 0.026,  // ~$4 at current SOL price
+  BUY_SOL: 0.018,  // ~$4 at current SOL price
 
   // ── Auto exit ────────────────────────────────────────────
   HOLD_SECONDS:  25,    // sell after 25s no matter what
