@@ -2,7 +2,7 @@
 cmds = ["npm install", "npm run build"]
 
 [phases.deploy]
-cmd = "npm run start"
+cmd = "node dist/index.js"
 
 [variables]
 NODE_ENV = "production"

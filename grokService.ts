@@ -4,7 +4,7 @@
  * Includes timestamp injection and rejection feedback loop prompting.
  */
 
-import { config } from '../config';
+import { config } from './config';
 
 export interface GrokPick {
   token_address: string;
@@ -107,7 +107,7 @@ You are picking a token to hold for EXACTLY 120 minutes. You must pick a coin th
       throw new Error(`Grok API HTTP ${response.status}: ${body.slice(0, 200)}`);
     }
 
-    const data = await response.json();
+    const data = await response.json() as any;
     const raw: string = data?.choices?.[0]?.message?.content ?? '';
 
     if (!raw) {

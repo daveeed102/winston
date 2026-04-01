@@ -8,7 +8,7 @@
  *   - Overall risk score >= RISK_SCORE_THRESHOLD
  */
 
-import { config } from '../config';
+import { config } from './config';
 
 export class RugcheckService {
   private readonly baseUrl   = 'https://api.rugcheck.xyz/v1/tokens';

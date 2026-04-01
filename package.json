@@ -4,19 +4,16 @@
   "description": "Solana Actor-Critic trading bot — Grok hype hunter + Rugcheck security bouncer",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc",
+    "build": "npx tsc --skipLibCheck",
     "start": "node dist/index.js",
-    "dev": "ts-node src/index.ts",
-    "railway": "npm run build && npm run start"
+    "dev": "npx ts-node index.ts"
   },
   "dependencies": {
     "@solana/web3.js": "^1.95.4",
-    "node-fetch": "^3.3.2"
-  },
-  "devDependencies": {
-    "@types/node": "^20.0.0",
+    "node-fetch": "^3.3.2",
+    "typescript": "^5.3.3",
     "ts-node": "^10.9.2",
-    "typescript": "^5.3.3"
+    "@types/node": "^20.0.0"
   },
   "engines": {
     "node": ">=18.0.0"

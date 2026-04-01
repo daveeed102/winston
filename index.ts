@@ -4,10 +4,10 @@
  * Cycle: 2-hour hold windows with strict sell → pick → buy loop
  */
 
-import { GrokService, GrokPick } from './services/grokService';
-import { RugcheckService } from './services/rugcheckService';
-import { JupiterService } from './services/jupiterService';
-import { DiscordService } from './services/discordService';
+import { GrokService, GrokPick } from './grokService';
+import { RugcheckService } from './rugcheckService';
+import { JupiterService } from './jupiterService';
+import { DiscordService } from './discordService';
 import { config } from './config';
 
 // ─────────────────────────────────────────────

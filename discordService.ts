@@ -3,7 +3,7 @@
  * Covers: Startup, Buy, Sell, Rejection, Circuit Breaker, and Errors.
  */
 
-import { config } from '../config';
+import { config } from './config';
 
 // Discord embed color constants
 const COLORS = {

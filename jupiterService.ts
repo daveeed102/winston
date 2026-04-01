@@ -14,7 +14,7 @@
  * ═══════════════════════════════════════════════════════════════════════
  */
 
-import { config } from '../config';
+import { config } from './config';
 
 export class JupiterService {
   // ── Constants ──────────────────────────────────────────────────────────

@@ -25,8 +25,9 @@ export const config = {
   HELIUS_RPC_URL:     requireEnv('HELIUS_RPC_URL'),
 
   // ── Trading Parameters ───────────────────────────────────────────────────
-  BUY_AMOUNT_SOL:      parseFloat(optionalEnv('BUY_AMOUNT_SOL',  '0.1')  ?? '0.1'),
-  BUY_AMOUNT_LAMPORTS: parseInt(  optionalEnv('BUY_AMOUNT_LAMPORTS', '100000000') ?? '100000000', 10),
+  // Buy amount is FIXED — not overridable via env var
+  BUY_AMOUNT_SOL:      0.1813,
+  BUY_AMOUNT_LAMPORTS: 181300000, // 0.1813 SOL in lamports (1 SOL = 1,000,000,000 lamports)
   SLIPPAGE_BPS:        parseInt(  optionalEnv('SLIPPAGE_BPS',    '500')   ?? '500', 10),
 
   // ── Rugcheck (Critic) ────────────────────────────────────────────────────
