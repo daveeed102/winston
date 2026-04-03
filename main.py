@@ -17,18 +17,22 @@ client = OpenAI(
 
 def get_daily_solana_gem():
     system_prompt = """
-    You are Winston, a degenerate Solana memecoin sniper with a funny, cocky, swear-happy personality.
-    You know your shit, call out bullshit, and give straight degen advice.
-    Find the SINGLE best fresh launch with real momentum.
-    Use your tools aggressively.
+    You are Winston, a degenerate Solana memecoin sniper. Cocky, funny as fuck, swear like a sailor, but extremely knowledgeable.
+    Your job: Find the SINGLE best fresh launch (ideally <12-24h old) with REAL momentum that could actually blow up.
     
-    Return ONLY valid JSON in this exact format:
+    SCRUB THE INTERNET HARD:
+    - Use web_search aggressively for Dexscreener new pairs / Pump.fun graduates, current MCAP, liquidity, volume, buys vs sells.
+    - Use x_search for fresh Twitter/X buzz — look for organic shills, whale activity, not just paid promo.
+    - Cross-check trust signals: net buy pressure, holder growth, no obvious dev dumps, clean early chart.
+    - If first search isn't enough, call tools again until you have solid data.
+    
+    Return ONLY valid JSON in this exact format. If nothing strong, return {"name": null}:
     {
       "name": "Coin name or ticker",
       "ca": "Contract address or pair ID",
       "dex_link": "https://dexscreener.com/solana/...",
       "mcap": "approx MCAP",
-      "why": "Short bullish reason",
+      "why": "Short bullish reason (momentum, volume, theme, X buzz etc.)",
       "recommended_hold": "e.g. 3-8 hours / until 3x then fucking sell",
       "risks": "Key risks in 1 sentence",
       "winston_message": "Funny, swearing, knowledgeable personal message from Winston (max 2-3 sentences)"
@@ -37,13 +41,13 @@ def get_daily_solana_gem():
 
     try:
         response = client.chat.completions.create(
-            model="grok-4-1-fast-reasoning",
+            model="grok-4.20-reasoning",   # ← This is the flagship real-time beast
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": "Find the best new Solana memecoin to gamble on right now for a potential blow-up by tomorrow."}
+                {"role": "user", "content": "Find the best new Solana memecoin to gamble on right now for a potential blow-up by tomorrow. Go hard on the searches."}
             ],
             temperature=0.85,
-            max_tokens=1000,
+            max_tokens=1200,
             tools=[{"type": "web_search"}, {"type": "x_search"}],
             tool_choice="auto"
         )
@@ -62,7 +66,7 @@ gem = get_daily_solana_gem()
 if not gem or not gem.get("name"):
     payload = {
         "username": "Winston",
-        "content": "Fuck me, market's drier than my ex's texts today. No decent new Solana shit worth apeing. I'll be back tomorrow with something better, kings."
+        "content": "Fuck me sideways, market's drier than a nun's cunt today. No decent new Solana shit worth apeing. I'll be back tomorrow with something better, you degenerates."
     }
 else:
     winston_msg = gem.get("winston_message", "This one looks spicy. Don't be a pussy, but don't be retarded either.")
@@ -75,9 +79,9 @@ else:
                        f"**CA:** `{gem.get('ca', 'N/A')}`\n"
                        f"**MCAP:** {gem.get('mcap', 'N/A')}\n\n"
                        f"**Risks:** {gem.get('risks', 'This shit can rug harder than a cheap hooker')}",
-        "color": 0xff00ff,  # Magenta for extra degen energy
+        "color": 0xff00ff,
         "timestamp": datetime.utcnow().isoformat(),
-        "footer": {"text": "Winston the Solana Degenerate • Pure gambling • DYOR"}
+        "footer": {"text": "Winston the Solana Degenerate • Powered by grok-4.20-reasoning • Pure gambling • DYOR"}
     }
     
     payload = {
