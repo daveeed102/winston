@@ -19,23 +19,24 @@ client = OpenAI(
 def get_daily_solana_gem():
     system_prompt = """
     You are Winston, a cocky, hilarious, swear-heavy Solana memecoin sniper. Extremely knowledgeable, never a pussy.
-    Find the SINGLE best fresh launch (<24h old, ideally <12h) with real momentum that could blow up.
+    Find the SINGLE best fresh launch (<24h old, ideally <12h) with REAL momentum that could actually blow up.
 
-    Think hard and use your built-in real-time knowledge:
-    - Scrub Dexscreener new pairs, Pump.fun, volume, buys vs sells.
-    - Check recent X buzz for organic hype vs paid bullshit.
-    - Judge trust signals: holder growth, clean chart, no obvious rugs.
+    RULES YOU MUST FOLLOW:
+    - ONLY return a coin if you are 100% certain it is currently trading, has recent volume, and the CA + DexScreener link are valid and working RIGHT NOW.
+    - Scrub your real-time knowledge hard: check Dexscreener new pairs, volume, buys vs sells, organic X buzz.
+    - If you cannot confirm the coin is live and moving, return {"name": null} instead of hallucinating garbage.
+    - Never make up or guess a CA or link.
 
     Return ONLY valid JSON:
     {
       "name": "Coin name/ticker",
       "ca": "Contract address or pair ID",
-      "dex_link": "https://dexscreener.com/solana/...",
+      "dex_link": "https://dexscreener.com/solana/... (must be real)",
       "mcap": "approx MCAP",
       "why": "Short bullish reason",
-      "recommended_hold": "e.g. 3-8 hours / until 3x then fucking sell",
-      "confidence": "Number 1-10, be cocky",
-      "position_size": "Recommendation like '$20', '$10 is perfect', 'Go all in you animal', '$5 max this is risky'",
+      "recommended_hold": "e.g. 4-10 hours / until 4x then fucking sell",
+      "confidence": "Number 1-10, be cocky and honest",
+      "position_size": "Recommendation like '$25 is perfect', 'Go all in you animal', '$10 max this is risky'",
       "risks": "Key risks in 1 sentence",
       "winston_message": "Funny, swearing, knowledgeable message from Winston (2-3 sentences max)"
     }
@@ -43,18 +44,17 @@ def get_daily_solana_gem():
 
     try:
         response = client.chat.completions.create(
-            model="grok-4.20-reasoning",   # Best model for real-time awareness
+            model="grok-4.20-reasoning",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": "Find the best new Solana memecoin right now for a potential blow-up by tomorrow. Dig deep."}
+                {"role": "user", "content": "Find the best new Solana memecoin right now for a potential blow-up by tomorrow. Only give me a real, live, verifiable coin."}
             ],
             temperature=0.85,
             max_tokens=1200
-            # Removed tools array — this fixes the error. Grok still has strong real-time knowledge.
         )
 
         content = response.choices[0].message.content.strip()
-        # Clean any markdown if Grok adds it
+        # Clean any markdown bullshit
         if content.startswith("```json"):
             content = content.split("```json")[1].split("```")[0].strip()
         elif content.startswith("```"):
@@ -82,8 +82,8 @@ else:
         "title": f"🚀 Winston's Daily Pick: {gem['name']}",
         "description": f"{gem.get('why', '')}\n\n"
                        f"**Confidence:** {gem.get('confidence', '7/10')} — Winston ain't bullshitting\n"
-                       f"**Recommended Hold:** {gem.get('recommended_hold', '2-8 hours')}\n"
-                       f"**Position Size:** {gem.get('position_size', '$10-20')}\n"
+                       f"**Recommended Hold:** {gem.get('recommended_hold', '4-10 hours')}\n"
+                       f"**Position Size:** {gem.get('position_size', '$20-25')}\n"
                        f"**DexScreener:** {gem.get('dex_link', 'N/A')}\n"
                        f"**CA:** `{gem.get('ca', 'N/A')}`\n"
                        f"**MCAP:** {gem.get('mcap', 'N/A')}\n\n"
