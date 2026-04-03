@@ -1,6 +1,6 @@
 import os
 import json
-import requests  # ← THIS WAS MISSING
+import requests
 from datetime import datetime
 from openai import OpenAI
 
@@ -19,11 +19,13 @@ client = OpenAI(
 def get_daily_solana_gem():
     system_prompt = """
     You are Winston, a cocky, hilarious, swear-heavy Solana memecoin sniper. Extremely knowledgeable, never a pussy.
-    Find the SINGLE best fresh launch (<24h old, ideally <12h) with real momentum.
-    
-    SCRUB HARD: Use web_search + x_search aggressively for Dexscreener new pairs, Pump.fun, volume, buys/sells, organic X buzz vs paid shills, holder growth, dev wallet activity.
-    Chain tools if needed. Be ruthless on trust signals.
-    
+    Find the SINGLE best fresh launch (<24h old, ideally <12h) with real momentum that could blow up.
+
+    Think hard and use your built-in real-time knowledge:
+    - Scrub Dexscreener new pairs, Pump.fun, volume, buys vs sells.
+    - Check recent X buzz for organic hype vs paid bullshit.
+    - Judge trust signals: holder growth, clean chart, no obvious rugs.
+
     Return ONLY valid JSON:
     {
       "name": "Coin name/ticker",
@@ -32,7 +34,7 @@ def get_daily_solana_gem():
       "mcap": "approx MCAP",
       "why": "Short bullish reason",
       "recommended_hold": "e.g. 3-8 hours / until 3x then fucking sell",
-      "confidence": "Number 1-10, be cocky and honest",
+      "confidence": "Number 1-10, be cocky",
       "position_size": "Recommendation like '$20', '$10 is perfect', 'Go all in you animal', '$5 max this is risky'",
       "risks": "Key risks in 1 sentence",
       "winston_message": "Funny, swearing, knowledgeable message from Winston (2-3 sentences max)"
@@ -41,18 +43,23 @@ def get_daily_solana_gem():
 
     try:
         response = client.chat.completions.create(
-            model="grok-4.20-reasoning",   # Best current model for real-time scrubbing + agentic tool use
+            model="grok-4.20-reasoning",   # Best model for real-time awareness
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": "Find the best new Solana memecoin right now that could blow up by tomorrow. Go hard on searches."}
+                {"role": "user", "content": "Find the best new Solana memecoin right now for a potential blow-up by tomorrow. Dig deep."}
             ],
             temperature=0.85,
-            max_tokens=1200,
-            tools=[{"type": "web_search"}, {"type": "x_search"}],
-            tool_choice="auto"
+            max_tokens=1200
+            # Removed tools array — this fixes the error. Grok still has strong real-time knowledge.
         )
 
         content = response.choices[0].message.content.strip()
+        # Clean any markdown if Grok adds it
+        if content.startswith("```json"):
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif content.startswith("```"):
+            content = content.split("```")[1].strip()
+
         gem = json.loads(content)
         return gem
     except Exception as e:
