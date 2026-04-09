@@ -98,15 +98,14 @@ async function enterPosition(candidate, confidenceScore, grokScore) {
     return null;
   }
 
-  // Calculate position size
-  const allocation = getAllocation(confidenceScore);
-  if (allocation <= 0) {
+  // Calculate position size — fixed USD amounts per confidence tier
+  const sizeUsdRaw = getAllocation(confidenceScore);
+  if (sizeUsdRaw <= 0) {
     log.info(`Zero allocation for ${ticker} at confidence ${confidenceScore}`);
     return null;
   }
 
-  let sizeUsd = config.PORTFOLIO_SIZE_USD * allocation;
-  sizeUsd = Math.min(sizeUsd, config.MAX_POSITION_USD);
+  let sizeUsd = Math.min(sizeUsdRaw, config.MAX_POSITION_USD);
 
   log.info(`Attempting entry: ${ticker} | confidence=${confidenceScore} | size=$${sizeUsd.toFixed(2)}`);
 
@@ -153,7 +152,7 @@ async function enterPosition(candidate, confidenceScore, grokScore) {
       trailingStopPrice: null,
       partialTpDone: false,
       confidenceScore,
-      allocationPct: allocation,
+      allocationPct: sizeUsd,
       grokSnapshot: grokScore,
       allWalletResults: result.allWalletResults || [],  // per-wallet tx results for Discord
       status: 'open',
