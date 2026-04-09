@@ -125,8 +125,9 @@ async function buyToken(tokenAddress, sizeUsd) {
     const label = `Wallet ${i + 1}`;
     // Stagger wallet executions by 1.5s each to avoid Jupiter 429 rate limits
     await sleep(i * 1500);
-    let lastErr;
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    let buyAttempt = 0;
+    while (true) {
+      buyAttempt++;
       try {
         const solBalance = await getSolBalance(i);
         const solNeeded = sizeUsd / solPrice;
@@ -149,15 +150,11 @@ async function buyToken(tokenAddress, sizeUsd) {
         log.info(`${label} BUY ✅ ${tokenAmount.toFixed(4)} tokens | tx: ${sig}`);
         return { walletIndex: i, success: true, signature: sig, tokenAmount, entryPrice, sizeUsd, solSpent: solNeeded, label };
       } catch (err) {
-        lastErr = err;
-        if (attempt < 3) {
-          log.warn(`${label} BUY attempt ${attempt} failed: ${err.message} — retrying in 2s...`);
-          await sleep(2000);
-        }
+        const delay = Math.min(2000 * buyAttempt, 15000); // 2s, 4s, 6s... max 15s
+        log.warn(`${label} BUY attempt ${buyAttempt} failed: ${err.message} — retrying in ${delay/1000}s...`);
+        await sleep(delay);
       }
     }
-    log.error(`${label} BUY ❌ all attempts failed: ${lastErr.message}`);
-    return { walletIndex: i, success: false, reason: lastErr.message, label };
   });
 
   const allResults = (await Promise.allSettled(walletPromises)).map((r) =>
@@ -181,8 +178,9 @@ async function sellToken(tokenAddress, fraction = 1.0) {
     const label = `Wallet ${i + 1}`;
     // Stagger wallet executions by 1.5s each to avoid Jupiter 429 rate limits
     await sleep(i * 1500);
-    let lastSellErr;
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    let sellAttempt = 0;
+    while (true) {
+      sellAttempt++;
       try {
         const tokenBalance = await getTokenBalance(tokenAddress, i);
         if (tokenBalance <= 0) {
@@ -208,15 +206,11 @@ async function sellToken(tokenAddress, fraction = 1.0) {
         log.info(`${label} SELL ✅ $${usdReceived.toFixed(2)} | tx: ${sig}`);
         return { walletIndex: i, success: true, signature: sig, tokensSold, usdReceived, exitPrice, solReceived, label };
       } catch (err) {
-        lastSellErr = err;
-        if (attempt < 3) {
-          log.warn(`${label} SELL attempt ${attempt} failed: ${err.message} — retrying in 2s...`);
-          await sleep(2000);
-        }
+        const delay = Math.min(2000 * sellAttempt, 15000); // 2s, 4s, 6s... max 15s
+        log.warn(`${label} SELL attempt ${sellAttempt} failed: ${err.message} — retrying in ${delay/1000}s...`);
+        await sleep(delay);
       }
     }
-    log.error(`${label} SELL ❌ all attempts failed: ${lastSellErr.message}`);
-    return { walletIndex: i, success: false, reason: lastSellErr.message, label };
   });
 
   const allResults = (await Promise.allSettled(walletPromises)).map((r) =>
