@@ -1,0 +1,10 @@
+# FILE: railway.toml
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "node src/index.js"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10

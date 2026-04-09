@@ -1,0 +1,22 @@
+{
+  "name": "winston-solana-bot",
+  "version": "3.0.0",
+  "description": "Winston – Solana continuation hunter. Finds already-hot coins, scores them, trades them.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "NODE_ENV=development node src/index.js"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.91.0",
+    "axios": "^1.6.7",
+    "better-sqlite3": "^9.4.3",
+    "bs58": "^5.0.0",
+    "dotenv": "^16.4.4",
+    "express": "^4.18.3",
+    "node-cron": "^3.0.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
