@@ -59,10 +59,17 @@ async function checkPosition(position) {
   const peakPnlPct = ((peak - entry) / entry) * 100;
 
   // ── 1. Hard stop loss ──────────────────────────────────────────────────────
+  // Minimum 60 second hold before stop loss can fire — prevents immediate
+  // exits caused by stale entry price data from DexScreener
+  const holdTimeSec = holdTimeMs / 1000;
   if (currentPrice <= position.stopLossPrice) {
-    log.info(`🛑 Stop loss hit: ${position.ticker} @ ${currentPrice.toFixed(8)} (stop: ${position.stopLossPrice.toFixed(8)})`);
-    await executeExit(position, currentPrice, 'STOP_LOSS', 1.0, peakPnlPct);
-    return;
+    if (holdTimeSec < 60) {
+      log.warn(`⏳ Stop loss would trigger for ${position.ticker} but minimum hold (60s) not elapsed (${holdTimeSec.toFixed(0)}s) — waiting`);
+    } else {
+      log.info(`🛑 Stop loss hit: ${position.ticker} @ ${currentPrice.toFixed(8)} (stop: ${position.stopLossPrice.toFixed(8)})`);
+      await executeExit(position, currentPrice, 'STOP_LOSS', 1.0, peakPnlPct);
+      return;
+    }
   }
 
   // ── 2. Trailing stop ───────────────────────────────────────────────────────
