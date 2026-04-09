@@ -73,7 +73,7 @@ async function getQuote(inputMint, outputMint, amountLamports) {
     onlyDirectRoutes: 'false',
     asLegacyTransaction: 'false',
   });
-  const res = await axios.get(`https://api.jup.ag/v6/quote?${params}`, { timeout: 15000 });
+  const res = await axios.get(`https://api.jup.ag/swap/v1/quote?${params}`, { timeout: 15000 });
   return res.data;
 }
 
@@ -81,7 +81,7 @@ async function getQuote(inputMint, outputMint, amountLamports) {
 
 async function executeSwapForWallet(quote, wallet) {
   const swapRes = await axios.post(
-    `https://api.jup.ag/v6/swap`,
+    `https://api.jup.ag/swap/v1/swap`,
     {
       quoteResponse: quote,
       userPublicKey: wallet.publicKey.toBase58(),
