@@ -75,7 +75,7 @@ const config = {
 
   // ─── Exit strategy ────────────────────────────────────────────────────────
   EXIT: {
-    STOP_LOSS_PCT: parseFloat(process.env.STOP_LOSS_PCT || '6'),                   // -6% hard stop
+    STOP_LOSS_PCT: parseFloat(process.env.STOP_LOSS_PCT || '15'),                   // -6% hard stop
     TRAILING_ACTIVATE_PCT: parseFloat(process.env.TRAIL_ACTIVATE || '6'),          // trail starts at +6%
     TRAILING_DISTANCE_PCT: parseFloat(process.env.TRAIL_DISTANCE || '4'),          // trails 4% below peak
     PARTIAL_TP_PCT: parseFloat(process.env.PARTIAL_TP || '9'),                     // take 50% at +9%
