@@ -39,10 +39,10 @@ const config = {
 
   // Confidence-based allocation (% of portfolio)
   SIZING: {
-    ELITE: 0.20,    // 90–100 confidence
-    STRONG: 0.12,   // 85–89
-    GOOD: 0.08,     // 80–84
-    SMALL: 0.05,    // 75–79
+    ELITE: 0.75,    // 90–100 confidence
+    STRONG: 0.50,   // 85–89
+    GOOD: 0.40,     // 80–84
+    SMALL: 0.35,    // 75–79
   },
 
   // ─── Confidence thresholds ────────────────────────────────────────────────
