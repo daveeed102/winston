@@ -37,12 +37,12 @@ const config = {
   PORTFOLIO_SIZE_USD: parseFloat(process.env.PORTFOLIO_SIZE_USD || '200'),
   MAX_POSITION_USD: parseFloat(process.env.MAX_POSITION_USD || '40'),
 
-  // Confidence-based allocation (% of portfolio)
+  // Confidence-based allocation (fixed USD per trade)
   SIZING: {
-    ELITE: 0.75,    // 90–100 confidence
-    STRONG: 0.50,   // 85–89
-    GOOD: 0.40,     // 80–84
-    SMALL: 0.35,    // 75–79
+    ELITE: 50,    // 90–100 confidence
+    STRONG: 40,   // 85–89
+    GOOD: 30,     // 80–84
+    SMALL: 20,    // 75–79
   },
 
   // ─── Confidence thresholds ────────────────────────────────────────────────
