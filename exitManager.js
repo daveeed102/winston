@@ -5,7 +5,7 @@
 
 const config = require('./config');
 const db = require('./db');
-const { sellToken } = require('./executor');
+const { sellToken, getSolPriceUsd } = require('./executor');
 const { getCurrentPrice } = require('./dexscreener');
 const discord = require('./discord');
 const { createLogger } = require('./logger');
@@ -146,8 +146,10 @@ async function executeExit(position, exitPrice, reason, fraction, peakPnlPct) {
     const result = await sellToken(position.tokenAddress, fraction, position.entryPrice);
 
     const finalExitPrice = result.exitPrice || exitPrice;
-    const realizedPnlPct = ((finalExitPrice - position.entryPrice) / position.entryPrice) * 100;
-    const realizedPnlUsd = position.sizeUsd * (realizedPnlPct / 100);
+    // Use actual USD received vs USD originally spent for accurate PnL
+    const usdReceived = result.usdReceived || 0;
+    const realizedPnlUsd = usdReceived > 0 ? usdReceived - position.sizeUsd : position.sizeUsd * ((finalExitPrice - position.entryPrice) / position.entryPrice);
+    const realizedPnlPct = (realizedPnlUsd / position.sizeUsd) * 100;
     const holdTimeMs = Date.now() - new Date(position.entryTime).getTime();
 
     const trade = {
