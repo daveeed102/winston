@@ -123,12 +123,12 @@ function getTier(score) {
 function getAllocation(score) {
   const T = config.CONFIDENCE_TIERS;
   const S = config.SIZING;
-  if (score >= T.ELITE)  return S.ELITE;
-  if (score >= T.STRONG) return S.STRONG;
-  if (score >= T.GOOD)   return S.GOOD;
-  if (score >= T.SMALL)  return S.SMALL;
+  if (score >= T.ELITE)  return S.ELITE;   // $50
+  if (score >= T.STRONG) return S.STRONG;  // $40
+  if (score >= T.GOOD)   return S.GOOD;    // $30
+  if (score >= T.SMALL)  return S.SMALL;   // $20
   // Floor tier: covers cases where MIN_CONFIDENCE is set below 75
-  if (score >= config.MIN_CONFIDENCE_TO_TRADE) return 0.25; // 25% floor allocation
+  if (score >= config.MIN_CONFIDENCE_TO_TRADE) return 15; // $15 floor
   return 0;
 }
 
