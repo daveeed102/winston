@@ -123,6 +123,8 @@ async function buyToken(tokenAddress, sizeUsd) {
 
   const walletPromises = wallets.map(async (wallet, i) => {
     const label = `Wallet ${i + 1}`;
+    // Stagger wallet executions by 1.5s each to avoid Jupiter 429 rate limits
+    await sleep(i * 1500);
     try {
       const solBalance = await getSolBalance(i);
       const solNeeded = sizeUsd / solPrice;
@@ -169,6 +171,8 @@ async function sellToken(tokenAddress, fraction = 1.0) {
 
   const walletPromises = wallets.map(async (wallet, i) => {
     const label = `Wallet ${i + 1}`;
+    // Stagger wallet executions by 1.5s each to avoid Jupiter 429 rate limits
+    await sleep(i * 1500);
     try {
       const tokenBalance = await getTokenBalance(tokenAddress, i);
       if (tokenBalance <= 0) {
