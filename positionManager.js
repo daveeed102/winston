@@ -110,6 +110,24 @@ async function enterPosition(candidate, confidenceScore, grokScore) {
 
   log.info(`Attempting entry: ${ticker} | confidence=${confidenceScore} | size=$${sizeUsd.toFixed(2)}`);
 
+  // ── Live price sanity check ───────────────────────────────────────────────
+  // Verify current price is within 20% of what DexScreener reported.
+  // Protects against buying a token that is already crashing.
+  try {
+    const { getCurrentPrice } = require('./dexscreener');
+    const livePrice = await getCurrentPrice(candidate.tokenAddress);
+    if (livePrice && candidate.priceUsd) {
+      const priceDiff = Math.abs(livePrice - candidate.priceUsd) / candidate.priceUsd * 100;
+      if (priceDiff > 20) {
+        log.warn(`Price moved too much since scan for ${ticker}: scanned $${candidate.priceUsd.toFixed(8)}, live $${livePrice.toFixed(8)} (${priceDiff.toFixed(1)}% diff) — skipping entry`);
+        return null;
+      }
+      log.info(`Price check OK for ${ticker}: $${livePrice.toFixed(8)} (${priceDiff.toFixed(1)}% from scan price)`);
+    }
+  } catch (err) {
+    log.warn(`Live price check failed for ${ticker}: ${err.message} — proceeding anyway`);
+  }
+
   try {
     const result = await buyToken(candidate.tokenAddress, sizeUsd);
 
