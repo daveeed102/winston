@@ -125,31 +125,39 @@ async function buyToken(tokenAddress, sizeUsd) {
     const label = `Wallet ${i + 1}`;
     // Stagger wallet executions by 1.5s each to avoid Jupiter 429 rate limits
     await sleep(i * 1500);
-    try {
-      const solBalance = await getSolBalance(i);
-      const solNeeded = sizeUsd / solPrice;
-      if (solBalance < solNeeded + 0.01) {
-        log.warn(`${label}: low SOL — have ${solBalance.toFixed(4)}, need ${solNeeded.toFixed(4)}`);
-        return { walletIndex: i, success: false, reason: 'insufficient_sol', label };
+    let lastErr;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const solBalance = await getSolBalance(i);
+        const solNeeded = sizeUsd / solPrice;
+        if (solBalance < solNeeded + 0.01) {
+          log.warn(`${label}: low SOL — have ${solBalance.toFixed(4)}, need ${solNeeded.toFixed(4)}`);
+          return { walletIndex: i, success: false, reason: 'insufficient_sol', label };
+        }
+
+        const lamports = Math.floor(solNeeded * 1e9);
+        const quote = await getQuote(config.SOL_MINT, tokenAddress, lamports);
+        if (!quote?.outAmount) throw new Error('Invalid quote');
+
+        const sig = await executeSwapForWallet(quote, wallet);
+        const confirmed = await confirmTransaction(sig);
+        if (!confirmed) throw new Error(`Not confirmed: ${sig}`);
+
+        const tokenAmount = parseFloat(quote.outAmount) / Math.pow(10, quote.outputDecimals || 6);
+        const entryPrice = sizeUsd / tokenAmount;
+
+        log.info(`${label} BUY ✅ ${tokenAmount.toFixed(4)} tokens | tx: ${sig}`);
+        return { walletIndex: i, success: true, signature: sig, tokenAmount, entryPrice, sizeUsd, solSpent: solNeeded, label };
+      } catch (err) {
+        lastErr = err;
+        if (attempt < 3) {
+          log.warn(`${label} BUY attempt ${attempt} failed: ${err.message} — retrying in 2s...`);
+          await sleep(2000);
+        }
       }
-
-      const lamports = Math.floor(solNeeded * 1e9);
-      const quote = await getQuote(config.SOL_MINT, tokenAddress, lamports);
-      if (!quote?.outAmount) throw new Error('Invalid quote');
-
-      const sig = await executeSwapForWallet(quote, wallet);
-      const confirmed = await confirmTransaction(sig);
-      if (!confirmed) throw new Error(`Not confirmed: ${sig}`);
-
-      const tokenAmount = parseFloat(quote.outAmount) / Math.pow(10, quote.outputDecimals || 6);
-      const entryPrice = sizeUsd / tokenAmount;
-
-      log.info(`${label} BUY ✅ ${tokenAmount.toFixed(4)} tokens | tx: ${sig}`);
-      return { walletIndex: i, success: true, signature: sig, tokenAmount, entryPrice, sizeUsd, solSpent: solNeeded, label };
-    } catch (err) {
-      log.error(`${label} BUY ❌ ${err.message}`);
-      return { walletIndex: i, success: false, reason: err.message, label };
     }
+    log.error(`${label} BUY ❌ all attempts failed: ${lastErr.message}`);
+    return { walletIndex: i, success: false, reason: lastErr.message, label };
   });
 
   const allResults = (await Promise.allSettled(walletPromises)).map((r) =>
@@ -173,34 +181,42 @@ async function sellToken(tokenAddress, fraction = 1.0) {
     const label = `Wallet ${i + 1}`;
     // Stagger wallet executions by 1.5s each to avoid Jupiter 429 rate limits
     await sleep(i * 1500);
-    try {
-      const tokenBalance = await getTokenBalance(tokenAddress, i);
-      if (tokenBalance <= 0) {
-        log.warn(`${label}: no token balance`);
-        return { walletIndex: i, success: false, reason: 'no_balance', label };
+    let lastSellErr;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const tokenBalance = await getTokenBalance(tokenAddress, i);
+        if (tokenBalance <= 0) {
+          log.warn(`${label}: no token balance`);
+          return { walletIndex: i, success: false, reason: 'no_balance', label };
+        }
+
+        const sellAmount = Math.floor(tokenBalance * fraction * Math.pow(10, decimals));
+        if (sellAmount <= 0) return { walletIndex: i, success: false, reason: 'zero_amount', label };
+
+        const quote = await getQuote(tokenAddress, config.SOL_MINT, sellAmount);
+        if (!quote?.outAmount) throw new Error('Invalid quote');
+
+        const sig = await executeSwapForWallet(quote, wallet);
+        const confirmed = await confirmTransaction(sig);
+        if (!confirmed) throw new Error(`Not confirmed: ${sig}`);
+
+        const solReceived = parseFloat(quote.outAmount) / 1e9;
+        const usdReceived = solReceived * solPrice;
+        const tokensSold = tokenBalance * fraction;
+        const exitPrice = usdReceived / tokensSold;
+
+        log.info(`${label} SELL ✅ $${usdReceived.toFixed(2)} | tx: ${sig}`);
+        return { walletIndex: i, success: true, signature: sig, tokensSold, usdReceived, exitPrice, solReceived, label };
+      } catch (err) {
+        lastSellErr = err;
+        if (attempt < 3) {
+          log.warn(`${label} SELL attempt ${attempt} failed: ${err.message} — retrying in 2s...`);
+          await sleep(2000);
+        }
       }
-
-      const sellAmount = Math.floor(tokenBalance * fraction * Math.pow(10, decimals));
-      if (sellAmount <= 0) return { walletIndex: i, success: false, reason: 'zero_amount', label };
-
-      const quote = await getQuote(tokenAddress, config.SOL_MINT, sellAmount);
-      if (!quote?.outAmount) throw new Error('Invalid quote');
-
-      const sig = await executeSwapForWallet(quote, wallet);
-      const confirmed = await confirmTransaction(sig);
-      if (!confirmed) throw new Error(`Not confirmed: ${sig}`);
-
-      const solReceived = parseFloat(quote.outAmount) / 1e9;
-      const usdReceived = solReceived * solPrice;
-      const tokensSold = tokenBalance * fraction;
-      const exitPrice = usdReceived / tokensSold;
-
-      log.info(`${label} SELL ✅ $${usdReceived.toFixed(2)} | tx: ${sig}`);
-      return { walletIndex: i, success: true, signature: sig, tokensSold, usdReceived, exitPrice, solReceived, label };
-    } catch (err) {
-      log.error(`${label} SELL ❌ ${err.message}`);
-      return { walletIndex: i, success: false, reason: err.message, label };
     }
+    log.error(`${label} SELL ❌ all attempts failed: ${lastSellErr.message}`);
+    return { walletIndex: i, success: false, reason: lastSellErr.message, label };
   });
 
   const allResults = (await Promise.allSettled(walletPromises)).map((r) =>
