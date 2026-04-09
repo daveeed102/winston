@@ -1,8 +1,8 @@
-// FILE: src/persistence/db.js
-// SQLite persistence. Survives Railway restarts.
-// All open positions, trades, cooldowns, and bot state live here.
+// FILE: db.js
+// SQLite persistence using sql.js (pure JS — no native compilation needed).
+// Loads DB from disk on startup, saves back to disk after every write.
 
-const Database = require('better-sqlite3');
+const fs = require('fs');
 const path = require('path');
 const { createLogger } = require('./logger');
 
@@ -10,23 +10,69 @@ const log = createLogger('DB');
 const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'winston.db');
 
 let db;
+let SQL;
 
-function getDb() {
-  if (!db) throw new Error('DB not initialized. Call initDb() first.');
-  return db;
-}
+// ─── Init ─────────────────────────────────────────────────────────────────────
 
-function initDb() {
-  db = new Database(DB_PATH);
-  db.pragma('journal_mode = WAL');
-  db.pragma('synchronous = NORMAL');
-  log.info(`Database opened at ${DB_PATH}`);
+async function initDb() {
+  const initSqlJs = require('sql.js');
+  SQL = await initSqlJs();
+
+  if (fs.existsSync(DB_PATH)) {
+    const fileBuffer = fs.readFileSync(DB_PATH);
+    db = new SQL.Database(fileBuffer);
+    log.info(`Database loaded from ${DB_PATH}`);
+  } else {
+    db = new SQL.Database();
+    log.info(`New database created at ${DB_PATH}`);
+  }
+
   createTables();
+  save(); // write initial state
   return db;
 }
+
+function save() {
+  try {
+    const data = db.export();
+    fs.writeFileSync(DB_PATH, Buffer.from(data));
+  } catch (err) {
+    log.error(`DB save failed: ${err.message}`);
+  }
+}
+
+function run(sql, params = []) {
+  db.run(sql, params);
+  save();
+}
+
+function get(sql, params = []) {
+  const stmt = db.prepare(sql);
+  stmt.bind(params);
+  if (stmt.step()) {
+    const row = stmt.getAsObject();
+    stmt.free();
+    return row;
+  }
+  stmt.free();
+  return null;
+}
+
+function all(sql, params = []) {
+  const stmt = db.prepare(sql);
+  stmt.bind(params);
+  const rows = [];
+  while (stmt.step()) {
+    rows.push(stmt.getAsObject());
+  }
+  stmt.free();
+  return rows;
+}
+
+// ─── Tables ───────────────────────────────────────────────────────────────────
 
 function createTables() {
-  db.exec(`
+  db.run(`
     CREATE TABLE IF NOT EXISTS positions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       token_address TEXT NOT NULL UNIQUE,
@@ -46,8 +92,10 @@ function createTables() {
       grok_snapshot TEXT,
       status TEXT DEFAULT 'open',
       updated_at TEXT DEFAULT (datetime('now'))
-    );
+    )
+  `);
 
+  db.run(`
     CREATE TABLE IF NOT EXISTS trades (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       token_address TEXT NOT NULL,
@@ -67,20 +115,26 @@ function createTables() {
       opened_at TEXT,
       closed_at TEXT,
       tx_signature TEXT
-    );
+    )
+  `);
 
+  db.run(`
     CREATE TABLE IF NOT EXISTS cooldowns (
       token_address TEXT PRIMARY KEY,
       last_trade_time TEXT NOT NULL,
       reason TEXT
-    );
+    )
+  `);
 
+  db.run(`
     CREATE TABLE IF NOT EXISTS bot_state (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL,
       updated_at TEXT DEFAULT (datetime('now'))
-    );
+    )
+  `);
 
+  db.run(`
     CREATE TABLE IF NOT EXISTS candidate_history (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       token_address TEXT NOT NULL,
@@ -90,8 +144,10 @@ function createTables() {
       confidence_score REAL,
       action_taken TEXT,
       snapshot TEXT
-    );
+    )
+  `);
 
+  db.run(`
     CREATE TABLE IF NOT EXISTS daily_summary (
       date TEXT PRIMARY KEY,
       trades_count INTEGER DEFAULT 0,
@@ -100,67 +156,56 @@ function createTables() {
       gross_pnl_usd REAL DEFAULT 0,
       best_trade_pct REAL DEFAULT 0,
       worst_trade_pct REAL DEFAULT 0
-    );
+    )
   `);
+
+  save();
   log.info('Tables ready.');
 }
 
-// ─── Position helpers ─────────────────────────────────────────────────────────
+// ─── Positions ────────────────────────────────────────────────────────────────
 
 function upsertPosition(pos) {
-  const stmt = db.prepare(`
+  db.run(`
     INSERT INTO positions (
       token_address, token_name, ticker, entry_price, entry_time,
       size_usd, size_tokens, stop_loss_price, trailing_active,
       trailing_peak_price, trailing_stop_price, partial_tp_done,
       confidence_score, allocation_pct, grok_snapshot, status, updated_at
-    ) VALUES (
-      @token_address, @token_name, @ticker, @entry_price, @entry_time,
-      @size_usd, @size_tokens, @stop_loss_price, @trailing_active,
-      @trailing_peak_price, @trailing_stop_price, @partial_tp_done,
-      @confidence_score, @allocation_pct, @grok_snapshot, @status, datetime('now')
-    )
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
     ON CONFLICT(token_address) DO UPDATE SET
-      trailing_active = excluded.trailing_active,
-      trailing_peak_price = excluded.trailing_peak_price,
-      trailing_stop_price = excluded.trailing_stop_price,
-      partial_tp_done = excluded.partial_tp_done,
-      stop_loss_price = excluded.stop_loss_price,
-      status = excluded.status,
-      updated_at = datetime('now')
-  `);
-  stmt.run({
-    token_address: pos.tokenAddress,
-    token_name: pos.tokenName || '',
-    ticker: pos.ticker || '',
-    entry_price: pos.entryPrice,
-    entry_time: pos.entryTime || new Date().toISOString(),
-    size_usd: pos.sizeUsd,
-    size_tokens: pos.sizeTokens,
-    stop_loss_price: pos.stopLossPrice,
-    trailing_active: pos.trailingActive ? 1 : 0,
-    trailing_peak_price: pos.trailingPeakPrice || null,
-    trailing_stop_price: pos.trailingStopPrice || null,
-    partial_tp_done: pos.partialTpDone ? 1 : 0,
-    confidence_score: pos.confidenceScore || null,
-    allocation_pct: pos.allocationPct || null,
-    grok_snapshot: pos.grokSnapshot ? JSON.stringify(pos.grokSnapshot) : null,
-    status: pos.status || 'open',
-  });
+      trailing_active=excluded.trailing_active,
+      trailing_peak_price=excluded.trailing_peak_price,
+      trailing_stop_price=excluded.trailing_stop_price,
+      partial_tp_done=excluded.partial_tp_done,
+      stop_loss_price=excluded.stop_loss_price,
+      status=excluded.status,
+      updated_at=datetime('now')
+  `, [
+    pos.tokenAddress, pos.tokenName || '', pos.ticker || '',
+    pos.entryPrice, pos.entryTime || new Date().toISOString(),
+    pos.sizeUsd, pos.sizeTokens, pos.stopLossPrice,
+    pos.trailingActive ? 1 : 0,
+    pos.trailingPeakPrice || null, pos.trailingStopPrice || null,
+    pos.partialTpDone ? 1 : 0,
+    pos.confidenceScore || null, pos.allocationPct || null,
+    pos.grokSnapshot ? JSON.stringify(pos.grokSnapshot) : null,
+    pos.status || 'open',
+  ]);
+  save();
 }
 
 function getOpenPositions() {
-  const rows = db.prepare(`SELECT * FROM positions WHERE status = 'open'`).all();
-  return rows.map(deserializePosition);
+  return all(`SELECT * FROM positions WHERE status = 'open'`).map(deserializePosition);
 }
 
 function getPosition(tokenAddress) {
-  const row = db.prepare(`SELECT * FROM positions WHERE token_address = ?`).get(tokenAddress);
+  const row = get(`SELECT * FROM positions WHERE token_address = ?`, [tokenAddress]);
   return row ? deserializePosition(row) : null;
 }
 
 function closePosition(tokenAddress) {
-  db.prepare(`UPDATE positions SET status = 'closed', updated_at = datetime('now') WHERE token_address = ?`).run(tokenAddress);
+  run(`UPDATE positions SET status='closed', updated_at=datetime('now') WHERE token_address=?`, [tokenAddress]);
 }
 
 function deserializePosition(row) {
@@ -183,82 +228,70 @@ function deserializePosition(row) {
   };
 }
 
-// ─── Trade log ────────────────────────────────────────────────────────────────
+// ─── Trades ───────────────────────────────────────────────────────────────────
 
 function logTrade(trade) {
-  db.prepare(`
+  db.run(`
     INSERT INTO trades (
       token_address, token_name, ticker, direction, entry_price, exit_price,
       size_usd, size_tokens, realized_pnl_usd, realized_pnl_pct,
       hold_time_minutes, exit_reason, peak_unrealized_pct,
       confidence_score, opened_at, closed_at, tx_signature
-    ) VALUES (
-      @token_address, @token_name, @ticker, @direction, @entry_price, @exit_price,
-      @size_usd, @size_tokens, @realized_pnl_usd, @realized_pnl_pct,
-      @hold_time_minutes, @exit_reason, @peak_unrealized_pct,
-      @confidence_score, @opened_at, @closed_at, @tx_signature
-    )
-  `).run({
-    token_address: trade.tokenAddress,
-    token_name: trade.tokenName || '',
-    ticker: trade.ticker || '',
-    direction: trade.direction || 'buy',
-    entry_price: trade.entryPrice || null,
-    exit_price: trade.exitPrice || null,
-    size_usd: trade.sizeUsd || 0,
-    size_tokens: trade.sizeTokens || 0,
-    realized_pnl_usd: trade.realizedPnlUsd || 0,
-    realized_pnl_pct: trade.realizedPnlPct || 0,
-    hold_time_minutes: trade.holdTimeMinutes || 0,
-    exit_reason: trade.exitReason || '',
-    peak_unrealized_pct: trade.peakUnrealizedPct || 0,
-    confidence_score: trade.confidenceScore || null,
-    opened_at: trade.openedAt || '',
-    closed_at: trade.closedAt || new Date().toISOString(),
-    tx_signature: trade.txSignature || '',
-  });
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `, [
+    trade.tokenAddress, trade.tokenName || '', trade.ticker || '',
+    trade.direction || 'buy', trade.entryPrice || null, trade.exitPrice || null,
+    trade.sizeUsd || 0, trade.sizeTokens || 0,
+    trade.realizedPnlUsd || 0, trade.realizedPnlPct || 0,
+    trade.holdTimeMinutes || 0, trade.exitReason || '',
+    trade.peakUnrealizedPct || 0, trade.confidenceScore || null,
+    trade.openedAt || '', trade.closedAt || new Date().toISOString(),
+    trade.txSignature || '',
+  ]);
+  save();
 }
 
 function getTodayTrades() {
   const today = new Date().toISOString().slice(0, 10);
-  return db.prepare(`SELECT * FROM trades WHERE date(closed_at) = ?`).all(today);
+  return all(`SELECT * FROM trades WHERE date(closed_at) = ?`, [today]);
 }
 
 function getDailyPnl() {
   const today = new Date().toISOString().slice(0, 10);
-  const row = db.prepare(`SELECT COALESCE(SUM(realized_pnl_usd), 0) AS total FROM trades WHERE date(closed_at) = ?`).get(today);
+  const row = get(`SELECT COALESCE(SUM(realized_pnl_usd), 0) AS total FROM trades WHERE date(closed_at) = ?`, [today]);
   return row?.total || 0;
 }
 
 // ─── Cooldowns ────────────────────────────────────────────────────────────────
 
 function setCooldown(tokenAddress, reason = 'traded') {
-  db.prepare(`
+  db.run(`
     INSERT INTO cooldowns (token_address, last_trade_time, reason)
     VALUES (?, datetime('now'), ?)
-    ON CONFLICT(token_address) DO UPDATE SET last_trade_time = datetime('now'), reason = excluded.reason
-  `).run(tokenAddress, reason);
+    ON CONFLICT(token_address) DO UPDATE SET last_trade_time=datetime('now'), reason=excluded.reason
+  `, [tokenAddress, reason]);
+  save();
 }
 
 function isOnCooldown(tokenAddress, cooldownHours) {
-  const row = db.prepare(`SELECT last_trade_time FROM cooldowns WHERE token_address = ?`).get(tokenAddress);
+  const row = get(`SELECT last_trade_time FROM cooldowns WHERE token_address = ?`, [tokenAddress]);
   if (!row) return false;
-  const lastTrade = new Date(row.last_trade_time);
-  const diff = (Date.now() - lastTrade.getTime()) / (1000 * 60 * 60);
+  const diff = (Date.now() - new Date(row.last_trade_time).getTime()) / (1000 * 60 * 60);
   return diff < cooldownHours;
 }
 
 // ─── Bot state ────────────────────────────────────────────────────────────────
 
 function setState(key, value) {
-  db.prepare(`
+  db.run(`
     INSERT INTO bot_state (key, value, updated_at) VALUES (?, ?, datetime('now'))
-    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
-  `).run(key, JSON.stringify(value));
+    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')
+  `, [key, JSON.stringify(value)]);
+  save();
 }
 
 function getState(key, defaultValue = null) {
-  const row = db.prepare(`SELECT value FROM bot_state WHERE key = ?`).get(key);
+  const row = get(`SELECT value FROM bot_state WHERE key = ?`, [key]);
   if (!row) return defaultValue;
   try { return JSON.parse(row.value); } catch { return row.value; }
 }
@@ -266,51 +299,46 @@ function getState(key, defaultValue = null) {
 // ─── Candidate history ────────────────────────────────────────────────────────
 
 function logCandidate(candidate, action) {
-  db.prepare(`
+  db.run(`
     INSERT INTO candidate_history (token_address, token_name, ticker, confidence_score, action_taken, snapshot)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(
-    candidate.tokenAddress,
-    candidate.tokenName || '',
-    candidate.ticker || '',
-    candidate.confidenceScore || null,
-    action,
-    JSON.stringify(candidate)
-  );
+    VALUES (?,?,?,?,?,?)
+  `, [
+    candidate.tokenAddress, candidate.tokenName || '', candidate.ticker || '',
+    candidate.confidenceScore || null, action, JSON.stringify(candidate),
+  ]);
+  save();
 }
 
 function getRecentCandidates(limit = 50) {
-  return db.prepare(`SELECT * FROM candidate_history ORDER BY scanned_at DESC LIMIT ?`).all(limit);
+  return all(`SELECT * FROM candidate_history ORDER BY scanned_at DESC LIMIT ?`, [limit]);
 }
 
 // ─── Daily summary ────────────────────────────────────────────────────────────
 
 function updateDailySummary() {
   const today = new Date().toISOString().slice(0, 10);
-  const trades = db.prepare(`SELECT * FROM trades WHERE date(closed_at) = ?`).all(today);
-  if (trades.length === 0) return;
+  const trades = all(`SELECT * FROM trades WHERE date(closed_at) = ?`, [today]);
+  if (!trades.length) return;
 
-  const wins = trades.filter((t) => t.realized_pnl_usd > 0).length;
-  const losses = trades.filter((t) => t.realized_pnl_usd <= 0).length;
+  const wins = trades.filter(t => t.realized_pnl_usd > 0).length;
+  const losses = trades.filter(t => t.realized_pnl_usd <= 0).length;
   const grossPnl = trades.reduce((s, t) => s + (t.realized_pnl_usd || 0), 0);
-  const bestPct = Math.max(...trades.map((t) => t.realized_pnl_pct || 0));
-  const worstPct = Math.min(...trades.map((t) => t.realized_pnl_pct || 0));
+  const bestPct = Math.max(...trades.map(t => t.realized_pnl_pct || 0));
+  const worstPct = Math.min(...trades.map(t => t.realized_pnl_pct || 0));
 
-  db.prepare(`
+  db.run(`
     INSERT INTO daily_summary (date, trades_count, wins, losses, gross_pnl_usd, best_trade_pct, worst_trade_pct)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    VALUES (?,?,?,?,?,?,?)
     ON CONFLICT(date) DO UPDATE SET
-      trades_count = excluded.trades_count,
-      wins = excluded.wins,
-      losses = excluded.losses,
-      gross_pnl_usd = excluded.gross_pnl_usd,
-      best_trade_pct = excluded.best_trade_pct,
-      worst_trade_pct = excluded.worst_trade_pct
-  `).run(today, trades.length, wins, losses, grossPnl, bestPct, worstPct);
+      trades_count=excluded.trades_count, wins=excluded.wins, losses=excluded.losses,
+      gross_pnl_usd=excluded.gross_pnl_usd, best_trade_pct=excluded.best_trade_pct,
+      worst_trade_pct=excluded.worst_trade_pct
+  `, [today, trades.length, wins, losses, grossPnl, bestPct, worstPct]);
+  save();
 }
 
 module.exports = {
-  initDb, getDb,
+  initDb, save,
   upsertPosition, getOpenPositions, getPosition, closePosition,
   logTrade, getTodayTrades, getDailyPnl,
   setCooldown, isOnCooldown,
