@@ -1,11 +1,11 @@
 {
   "name": "winston-solana-bot",
   "version": "3.0.0",
-  "description": "Winston – Solana continuation hunter. Finds already-hot coins, scores them, trades them.",
-  "main": "src/index.js",
+  "description": "Winston \u2013 Solana continuation hunter. Finds already-hot coins, scores them, trades them.",
+  "main": "index.js",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "NODE_ENV=development node src/index.js"
+    "start": "node index.js",
+    "dev": "NODE_ENV=development node index.js"
   },
   "dependencies": {
     "@solana/web3.js": "^1.91.0",
