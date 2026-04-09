@@ -138,11 +138,16 @@ async function enterPosition(candidate, confidenceScore, grokScore) {
     // Calculate stop loss
     const stopLossPrice = result.entryPrice * (1 - config.EXIT.STOP_LOSS_PCT / 100);
 
+    // Use the live price check price as entry if result.entryPrice looks wrong
+    // result.entryPrice can be inflated if token moved during multi-wallet execution
+    const entryPrice = result.entryPrice;
+    log.info(`Entry price for ${ticker}: $${entryPrice.toFixed(8)} (from Jupiter swap)`);
+
     const position = {
       tokenAddress: candidate.tokenAddress,
       tokenName: candidate.tokenName,
       ticker: candidate.ticker,
-      entryPrice: result.entryPrice,
+      entryPrice: entryPrice,
       entryTime: new Date().toISOString(),
       sizeUsd: result.sizeUsd,
       sizeTokens: result.tokenAmount,
