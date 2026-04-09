@@ -1,25 +1,22 @@
-// FILE: src/sources/dexscreener.js
-// DexScreener API client. Primary token discovery and market data source.
-// Pulls trending/boosted tokens on Solana and enriches them with pair data.
+// FILE: dexscreener.js
+// DexScreener API client. Uses the boosted + trending search endpoints
+// to find Solana tokens with real current traction.
 
 const axios = require('axios');
 const config = require('./config');
 const { createLogger } = require('./logger');
 
 const log = createLogger('DEXSCREENER');
-
-const BASE = config.DEXSCREENER_BASE;
 const TIMEOUT = 12000;
 
-// ─── Fetch trending / boosted Solana tokens ───────────────────────────────────
-// Returns a raw list of token addresses currently getting traction on Solana.
+// ─── Fetch trending Solana tokens ─────────────────────────────────────────────
 
 async function getTrendingTokens() {
-  const results = new Map(); // address -> profile data
+  const results = new Map();
 
-  // Source 1: active boosts (tokens with paid promotion = real attention signal)
+  // Source 1: Top boosted tokens (fixed URL)
   try {
-    const res = await axios.get('https://api.dexscreener.com/token-boosts/active/v1', { timeout: TIMEOUT });
+    const res = await axios.get('https://api.dexscreener.com/token-boosts/top/v1', { timeout: TIMEOUT });
     const items = Array.isArray(res.data) ? res.data : [];
     for (const item of items) {
       if (item.chainId === 'solana' && item.tokenAddress) {
@@ -31,37 +28,69 @@ async function getTrendingTokens() {
         });
       }
     }
-    log.info(`Active boosts: ${results.size} Solana tokens`);
+    log.info(`Top boosts: ${results.size} Solana tokens`);
   } catch (err) {
     log.warn(`Boost fetch failed: ${err.message}`);
   }
 
-  // Source 2: latest token profiles (recently active tokens)
+  // Source 2: Search for trending Solana tokens by volume
+  const trendingQueries = ['solana', 'sol meme', 'pump fun'];
+  for (const q of trendingQueries) {
+    try {
+      const res = await axios.get(
+        `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(q)}`,
+        { timeout: TIMEOUT }
+      );
+      const pairs = res.data?.pairs || [];
+      for (const pair of pairs) {
+        if (pair.chainId === 'solana' && pair.baseToken?.address) {
+          const addr = pair.baseToken.address;
+          if (!results.has(addr)) {
+            results.set(addr, {
+              tokenAddress: addr,
+              boostAmount: 0,
+              description: '',
+              links: [],
+              pairData: pair, // cache pair data to avoid re-fetching
+            });
+          }
+        }
+      }
+    } catch (err) {
+      log.warn(`Trending search failed for "${q}": ${err.message}`);
+    }
+  }
+
+  // Source 3: Top gainers on Solana via search
   try {
-    const res = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: TIMEOUT });
-    const items = Array.isArray(res.data) ? res.data : [];
-    for (const item of items) {
-      if (item.chainId === 'solana' && item.tokenAddress) {
-        if (!results.has(item.tokenAddress)) {
-          results.set(item.tokenAddress, {
-            tokenAddress: item.tokenAddress,
+    const res = await axios.get(
+      'https://api.dexscreener.com/latest/dex/search?q=solana%20trending',
+      { timeout: TIMEOUT }
+    );
+    const pairs = res.data?.pairs || [];
+    for (const pair of pairs) {
+      if (pair.chainId === 'solana' && pair.baseToken?.address) {
+        const addr = pair.baseToken.address;
+        if (!results.has(addr)) {
+          results.set(addr, {
+            tokenAddress: addr,
             boostAmount: 0,
-            description: item.description || '',
-            links: item.links || [],
+            description: '',
+            links: [],
+            pairData: pair,
           });
         }
       }
     }
-    log.info(`Profiles: ${results.size} total Solana candidates`);
+    log.info(`Total after search: ${results.size} Solana candidates`);
   } catch (err) {
-    log.warn(`Profile fetch failed: ${err.message}`);
+    log.warn(`Trending search failed: ${err.message}`);
   }
 
   return Array.from(results.values());
 }
 
-// ─── Fetch full pair data for a list of token addresses ───────────────────────
-// DexScreener allows batches of up to 30 addresses.
+// ─── Fetch pair data for token addresses ──────────────────────────────────────
 
 async function getTokenPairs(addresses) {
   const allPairs = [];
@@ -70,7 +99,10 @@ async function getTokenPairs(addresses) {
   for (const batch of batches) {
     try {
       const joined = batch.join(',');
-      const res = await axios.get(`${BASE}/tokens/v1/solana/${joined}`, { timeout: TIMEOUT });
+      const res = await axios.get(
+        `https://api.dexscreener.com/tokens/v1/solana/${joined}`,
+        { timeout: TIMEOUT }
+      );
       const pairs = Array.isArray(res.data) ? res.data : (res.data?.pairs || []);
       allPairs.push(...pairs);
     } catch (err) {
@@ -81,14 +113,14 @@ async function getTokenPairs(addresses) {
   return allPairs;
 }
 
-// ─── Get single token's best pair ─────────────────────────────────────────────
-
 async function getTokenData(address) {
   try {
-    const res = await axios.get(`${BASE}/tokens/v1/solana/${address}`, { timeout: TIMEOUT });
+    const res = await axios.get(
+      `https://api.dexscreener.com/tokens/v1/solana/${address}`,
+      { timeout: TIMEOUT }
+    );
     const pairs = Array.isArray(res.data) ? res.data : (res.data?.pairs || []);
     if (!pairs.length) return null;
-    // Pick highest liquidity pair
     return pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
   } catch (err) {
     log.warn(`Token data fetch failed for ${address}: ${err.message}`);
@@ -96,7 +128,7 @@ async function getTokenData(address) {
   }
 }
 
-// ─── Normalize a DexScreener pair into Winston's candidate format ─────────────
+// ─── Normalize pair → Winston candidate format ────────────────────────────────
 
 function normalizePair(pair, profile = {}) {
   if (!pair) return null;
@@ -111,24 +143,19 @@ function normalizePair(pair, profile = {}) {
   const priceChange1h = pair.priceChange?.h1 || 0;
   const priceChange5m = pair.priceChange?.m5 || 0;
 
-  // Token age in hours
   const createdAt = pair.pairCreatedAt ? new Date(pair.pairCreatedAt) : null;
   const ageHours = createdAt ? (Date.now() - createdAt.getTime()) / (1000 * 60 * 60) : null;
 
-  // Transaction counts (buyer activity signal)
   const txns = pair.txns || {};
   const buys1h = txns.h1?.buys || 0;
   const sells1h = txns.h1?.sells || 0;
   const buys24h = txns.h24?.buys || 0;
 
-  // Estimate pullback from ATH if we have 24h high — DexScreener doesn't expose ATH directly
-  // We use 24h price range as proxy: if price is near 24h high, less pullback
   const high24h = pair.priceHighH24 || priceUsd;
   const pullbackFromHigh = high24h > 0 ? ((high24h - priceUsd) / high24h) * 100 : 0;
 
-  // Social links from profile
-  const socialLinks = (profile.links || []).map((l) => l.url || '').filter(Boolean);
-  const twitterLink = socialLinks.find((l) => l.includes('twitter.com') || l.includes('x.com')) || '';
+  const socialLinks = (profile.links || []).map(l => l.url || '').filter(Boolean);
+  const twitterLink = socialLinks.find(l => l.includes('twitter.com') || l.includes('x.com')) || '';
 
   return {
     tokenAddress: pair.baseToken?.address || '',
@@ -155,28 +182,19 @@ function normalizePair(pair, profile = {}) {
     twitterLink,
     socialLinks,
     dataFetchedAt: new Date().toISOString(),
-    // buy/sell ratio — higher is more bullish
     buySellRatio1h: sells1h > 0 ? buys1h / sells1h : buys1h > 0 ? 5 : 1,
-    // volume acceleration proxy: 1h rate vs 24h average
     volumeAcceleration: volume24h > 0 ? (volume1h * 24) / volume24h : 1,
     marketCap: pair.marketCap || null,
     fdv: pair.fdv || null,
     dexId: pair.dexId || '',
-
-    // ── Honeypot / security fields ─────────────────────────────────────────
-    // DexScreener exposes some of these in pair info where available.
-    // We default to null (unknown) so filters only reject when explicitly true.
     freezeAuthority: pair.info?.freezeAuthority ?? null,
     mintAuthority: pair.info?.mintAuthority ?? null,
-    // Holder concentration — available from Birdeye/Helius, not DexScreener
-    // Set to null here; can be enriched later with a secondary API call
     top10HolderPct: null,
     topHolderPct: null,
   };
 }
 
-// ─── Main discovery call ──────────────────────────────────────────────────────
-// Returns array of normalized candidates ready for hard filtering.
+// ─── Main discovery ───────────────────────────────────────────────────────────
 
 async function discoverCandidates() {
   log.info('Starting DexScreener discovery scan...');
@@ -187,46 +205,67 @@ async function discoverCandidates() {
     return [];
   }
 
-  const addresses = [...new Set(profiles.map((p) => p.tokenAddress))];
-  log.info(`Fetching pair data for ${addresses.length} addresses`);
+  // Split into those with cached pair data and those needing a fetch
+  const needsFetch = [];
+  const cachedPairs = [];
 
-  const pairs = await getTokenPairs(addresses);
-  log.info(`Got ${pairs.length} pairs back`);
+  for (const profile of profiles) {
+    if (profile.pairData) {
+      cachedPairs.push({ pair: profile.pairData, profile });
+    } else {
+      needsFetch.push(profile);
+    }
+  }
 
-  // Build profile map for enrichment
-  const profileMap = new Map(profiles.map((p) => [p.tokenAddress, p]));
+  // Fetch pair data for non-cached profiles
+  const addresses = [...new Set(needsFetch.map(p => p.tokenAddress))];
+  let fetchedPairs = [];
+  if (addresses.length > 0) {
+    log.info(`Fetching pair data for ${addresses.length} addresses`);
+    fetchedPairs = await getTokenPairs(addresses);
+    log.info(`Got ${fetchedPairs.length} pairs back`);
+  }
 
-  // Normalize and deduplicate by token address (pick best liquidity pair per token)
+  const profileMap = new Map(profiles.map(p => [p.tokenAddress, p]));
+
+  // Deduplicate by token address, pick highest liquidity pair
   const byToken = new Map();
-  for (const pair of pairs) {
+
+  for (const { pair, profile } of cachedPairs) {
     const addr = pair.baseToken?.address;
     if (!addr) continue;
     const existing = byToken.get(addr);
-    if (!existing || (pair.liquidity?.usd || 0) > (existing.liquidity?.usd || 0)) {
-      byToken.set(addr, pair);
+    if (!existing || (pair.liquidity?.usd || 0) > (existing.pair?.liquidity?.usd || 0)) {
+      byToken.set(addr, { pair, profile });
+    }
+  }
+
+  for (const pair of fetchedPairs) {
+    const addr = pair.baseToken?.address;
+    if (!addr) continue;
+    const profile = profileMap.get(addr) || {};
+    const existing = byToken.get(addr);
+    if (!existing || (pair.liquidity?.usd || 0) > (existing.pair?.liquidity?.usd || 0)) {
+      byToken.set(addr, { pair, profile });
     }
   }
 
   const candidates = [];
-  for (const [addr, pair] of byToken) {
-    const profile = profileMap.get(addr) || {};
+  for (const [, { pair, profile }] of byToken) {
     const normalized = normalizePair(pair, profile);
-    if (normalized && normalized.tokenAddress) {
-      candidates.push(normalized);
-    }
+    if (normalized?.tokenAddress) candidates.push(normalized);
   }
 
   log.info(`Normalized ${candidates.length} candidates`);
   return candidates;
 }
 
-// ─── Live price fetch for position management ─────────────────────────────────
+// ─── Live price for exit manager ─────────────────────────────────────────────
 
 async function getCurrentPrice(tokenAddress) {
   try {
     const pair = await getTokenData(tokenAddress);
-    if (!pair) return null;
-    return parseFloat(pair.priceUsd || 0);
+    return pair ? parseFloat(pair.priceUsd || 0) : null;
   } catch (err) {
     log.warn(`Price fetch failed for ${tokenAddress}: ${err.message}`);
     return null;
@@ -235,15 +274,8 @@ async function getCurrentPrice(tokenAddress) {
 
 function chunkArray(arr, size) {
   const chunks = [];
-  for (let i = 0; i < arr.length; i += size) {
-    chunks.push(arr.slice(i, i + size));
-  }
+  for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
   return chunks;
 }
 
-module.exports = {
-  discoverCandidates,
-  getCurrentPrice,
-  getTokenData,
-  normalizePair,
-};
+module.exports = { discoverCandidates, getCurrentPrice, getTokenData, normalizePair };

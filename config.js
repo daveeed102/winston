@@ -57,9 +57,9 @@ const config = {
 
   // ─── Hard token filters ───────────────────────────────────────────────────
   FILTERS: {
-    MIN_LIQUIDITY_USD: parseFloat(process.env.MIN_LIQUIDITY || '75000'),
-    MIN_VOLUME_24H_USD: parseFloat(process.env.MIN_VOLUME_24H || '150000'),
-    MIN_VOLUME_1H_USD: parseFloat(process.env.MIN_VOLUME_1H || '10000'),
+    MIN_LIQUIDITY_USD: parseFloat(process.env.MIN_LIQUIDITY || '50000'),
+    MIN_VOLUME_24H_USD: parseFloat(process.env.MIN_VOLUME_24H || '100000'),
+    MIN_VOLUME_1H_USD: parseFloat(process.env.MIN_VOLUME_1H || '5000'),
     MIN_TOKEN_AGE_HOURS: parseFloat(process.env.MIN_TOKEN_AGE_HOURS || '6'),
     MAX_TOKEN_AGE_DAYS: parseFloat(process.env.MAX_TOKEN_AGE_DAYS || '30'),
     MIN_PRICE_CHANGE_1H: parseFloat(process.env.MIN_PRICE_CHANGE_1H || '2'),       // % min momentum
@@ -67,7 +67,7 @@ const config = {
     MIN_PRICE_CHANGE_6H: parseFloat(process.env.MIN_PRICE_CHANGE_6H || '5'),
     MAX_PRICE_CHANGE_6H: parseFloat(process.env.MAX_PRICE_CHANGE_6H || '200'),
     MAX_PULLBACK_FROM_HIGH: parseFloat(process.env.MAX_PULLBACK || '35'),          // % max dip from ATH
-    MIN_BUYS_1H: parseInt(process.env.MIN_BUYS_1H || '30'),                       // tx activity
+    MIN_BUYS_1H: parseInt(process.env.MIN_BUYS_1H || '15'),                       // tx activity
     MIN_UNIQUE_WALLETS_24H: parseInt(process.env.MIN_WALLETS || '100'),
     REJECT_FREEZE_AUTHORITY: process.env.REJECT_FREEZE_AUTH !== 'false',           // true = reject tokens with freeze authority
     REJECT_MINT_AUTHORITY: process.env.REJECT_MINT_AUTH !== 'false',
