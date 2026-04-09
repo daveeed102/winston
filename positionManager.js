@@ -122,6 +122,8 @@ async function enterPosition(candidate, confidenceScore, grokScore) {
         return null;
       }
       log.info(`Price check OK for ${ticker}: $${livePrice.toFixed(8)} (${priceDiff.toFixed(1)}% from scan price)`);
+      // Store livePrice in outer scope for entry price calculation
+      candidate._verifiedLivePrice = livePrice;
     }
   } catch (err) {
     log.warn(`Live price check failed for ${ticker}: ${err.message} — proceeding anyway`);
@@ -135,13 +137,12 @@ async function enterPosition(candidate, confidenceScore, grokScore) {
       return null;
     }
 
-    // Calculate stop loss
-    const stopLossPrice = result.entryPrice * (1 - config.EXIT.STOP_LOSS_PCT / 100);
+    // Use live price check as entry — accurate, not skewed by retry delays
+    const entryPrice = candidate._verifiedLivePrice || result.entryPrice;
+    log.info(`Entry price for ${ticker}: $${entryPrice.toFixed(8)} (live price check)`);
 
-    // Use the live price check price as entry if result.entryPrice looks wrong
-    // result.entryPrice can be inflated if token moved during multi-wallet execution
-    const entryPrice = result.entryPrice;
-    log.info(`Entry price for ${ticker}: $${entryPrice.toFixed(8)} (from Jupiter swap)`);
+    // Calculate stop loss from the CORRECT entry price
+    const stopLossPrice = entryPrice * (1 - config.EXIT.STOP_LOSS_PCT / 100);
 
     const position = {
       tokenAddress: candidate.tokenAddress,
@@ -174,7 +175,7 @@ async function enterPosition(candidate, confidenceScore, grokScore) {
     await discord.notifyTradeEntry(position, candidate);
     await discord.notifyStopArmed(position);
 
-    log.info(`✅ Position opened: ${ticker} @ $${result.entryPrice.toFixed(8)} | stop @ $${stopLossPrice.toFixed(8)}`);
+    log.info(`✅ Position opened: ${ticker} @ $${entryPrice.toFixed(8)} | stop @ $${stopLossPrice.toFixed(8)}`);
     return position;
   } catch (err) {
     log.error(`Entry error for ${ticker}: ${err.message}`);
