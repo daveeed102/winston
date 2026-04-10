@@ -119,16 +119,11 @@ async function checkPosition(position) {
     }
   }
 
-  // ── 3. Partial take profit ─────────────────────────────────────────────────
-  if (!position.partialTpDone && pnlPct >= config.EXIT.PARTIAL_TP_PCT) {
-    log.info(`💰 Partial TP for ${position.ticker} at +${pnlPct.toFixed(1)}%`);
-    const partialResult = await executePartialExit(position, currentPrice, config.EXIT.PARTIAL_TP_SIZE, peakPnlPct);
-    if (partialResult) {
-      position.partialTpDone = true;
-      db.upsertPosition(position);
-      const closedUsd = position.sizeUsd * config.EXIT.PARTIAL_TP_SIZE;
-      await discord.notifyPartialTp(position, currentPrice, closedUsd);
-    }
+  // ── 3. Take profit — exit full position when SOL gain target hit ────────────
+  if (position.takeProfitPrice && currentPrice >= position.takeProfitPrice) {
+    log.info(`💰 Take profit hit: ${position.ticker} @ $${currentPrice.toFixed(8)} (target: $${position.takeProfitPrice.toFixed(8)})`);
+    await executeExit(position, currentPrice, 'TAKE_PROFIT', 1.0, peakPnlPct);
+    return;
   }
 
   // ── 4. Time stop ───────────────────────────────────────────────────────────
