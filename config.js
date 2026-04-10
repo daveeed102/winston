@@ -40,9 +40,9 @@ const config = {
   // Confidence-based allocation (fixed USD per trade)
   SIZING: {
     ELITE: 50,    // 90–100 confidence
-    STRONG: 40,   // 85–89
-    GOOD: 30,     // 80–84
-    SMALL: 20,    // 75–79
+    STRONG: 50,   // 85–89
+    GOOD: 35,     // 80–84
+    SMALL: 25,    // 75–79
   },
 
   // ─── Confidence thresholds ────────────────────────────────────────────────
