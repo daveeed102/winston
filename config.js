@@ -76,10 +76,12 @@ const config = {
 
   // ─── Exit strategy ────────────────────────────────────────────────────────
   EXIT: {
-    // Fixed SOL profit/loss targets
-    // 0.48 SOL buy: take profit +0.096 SOL (~$8), stop loss -0.084 SOL (~$7)
-    // 0.30 SOL buy: take profit +0.060 SOL (~$5), stop loss -0.052 SOL (~$4.33)
-    TAKE_PROFIT_SOL_RATIO: parseFloat(process.env.TAKE_PROFIT_SOL_RATIO || '0.20'),  // 20% of position size
+    // Staged profit taking + stop loss
+    PARTIAL_TP_1_PCT: 20,          // sell 25% of position at +20%
+    PARTIAL_TP_1_SIZE: 0.25,
+    PARTIAL_TP_2_PCT: 50,          // sell another 25% at +50%
+    PARTIAL_TP_2_SIZE: 0.25,
+    // remaining 50% rides with trailing stop until it reverses
     STOP_LOSS_SOL_RATIO: parseFloat(process.env.STOP_LOSS_SOL_RATIO || '0.175'),     // 17.5% of position size
     TRAILING_ACTIVATE_PCT: parseFloat(process.env.TRAIL_ACTIVATE || '6'),          // trail starts at +6%
     TRAILING_DISTANCE_PCT: parseFloat(process.env.TRAIL_DISTANCE || '4'),          // trails 4% below peak

@@ -90,7 +90,10 @@ function createTables() {
       confidence_score REAL,
       allocation_pct REAL,
       grok_snapshot TEXT,
-      take_profit_price REAL,
+      tp1_price REAL,
+      tp2_price REAL,
+      tp1_done INTEGER DEFAULT 0,
+      tp2_done INTEGER DEFAULT 0,
       status TEXT DEFAULT 'open',
       updated_at TEXT DEFAULT (datetime('now'))
     )
@@ -172,14 +175,16 @@ function upsertPosition(pos) {
       token_address, token_name, ticker, entry_price, entry_time,
       size_usd, size_tokens, stop_loss_price, trailing_active,
       trailing_peak_price, trailing_stop_price, partial_tp_done,
-      confidence_score, allocation_pct, grok_snapshot, take_profit_price, status, updated_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
+      confidence_score, allocation_pct, grok_snapshot, tp1_price, tp2_price, tp1_done, tp2_done, status, updated_at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
     ON CONFLICT(token_address) DO UPDATE SET
       trailing_active=excluded.trailing_active,
       trailing_peak_price=excluded.trailing_peak_price,
       trailing_stop_price=excluded.trailing_stop_price,
       partial_tp_done=excluded.partial_tp_done,
       stop_loss_price=excluded.stop_loss_price,
+      tp1_done=excluded.tp1_done,
+      tp2_done=excluded.tp2_done,
       status=excluded.status,
       updated_at=datetime('now')
   `, [
@@ -191,7 +196,10 @@ function upsertPosition(pos) {
     pos.partialTpDone ? 1 : 0,
     pos.confidenceScore || null, pos.allocationPct || null,
     pos.grokSnapshot ? JSON.stringify(pos.grokSnapshot) : null,
-    pos.takeProfitPrice || null,
+    pos.tp1Price || null,
+    pos.tp2Price || null,
+    pos.tp1Done ? 1 : 0,
+    pos.tp2Done ? 1 : 0,
     pos.status || 'open',
   ]);
   save();
@@ -227,7 +235,10 @@ function deserializePosition(row) {
     confidenceScore: row.confidence_score,
     allocationPct: row.allocation_pct,
     grokSnapshot: row.grok_snapshot ? JSON.parse(row.grok_snapshot) : null,
-    takeProfitPrice: row.take_profit_price || null,
+    tp1Price: row.tp1_price || null,
+    tp2Price: row.tp2_price || null,
+    tp1Done: row.tp1_done === 1,
+    tp2Done: row.tp2_done === 1,
   };
 }
 

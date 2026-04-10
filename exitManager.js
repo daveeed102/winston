@@ -119,11 +119,27 @@ async function checkPosition(position) {
     }
   }
 
-  // ── 3. Take profit — exit full position when SOL gain target hit ────────────
-  if (position.takeProfitPrice && currentPrice >= position.takeProfitPrice) {
-    log.info(`💰 Take profit hit: ${position.ticker} @ $${currentPrice.toFixed(8)} (target: $${position.takeProfitPrice.toFixed(8)})`);
-    await executeExit(position, currentPrice, 'TAKE_PROFIT', 1.0, peakPnlPct);
-    return;
+  // ── 3. Staged take profits ────────────────────────────────────────────────
+  // TP1: sell 25% at +20% — lock some gains, keep riding
+  if (!position.tp1Done && position.tp1Price && currentPrice >= position.tp1Price) {
+    log.info(`💰 TP1 hit for ${position.ticker} at +${pnlPct.toFixed(1)}% — selling 25%`);
+    const tp1Result = await executePartialExit(position, currentPrice, config.EXIT.PARTIAL_TP_1_SIZE, peakPnlPct);
+    if (tp1Result) {
+      position.tp1Done = true;
+      db.upsertPosition(position);
+      await discord.notifyPartialTp(position, currentPrice, position.sizeUsd * config.EXIT.PARTIAL_TP_1_SIZE, 'TP1 +20% — 25% closed, 75% riding');
+    }
+  }
+
+  // TP2: sell another 25% at +50% — lock more, 50% still riding
+  if (!position.tp2Done && position.tp2Price && currentPrice >= position.tp2Price) {
+    log.info(`💰 TP2 hit for ${position.ticker} at +${pnlPct.toFixed(1)}% — selling another 25%`);
+    const tp2Result = await executePartialExit(position, currentPrice, config.EXIT.PARTIAL_TP_2_SIZE, peakPnlPct);
+    if (tp2Result) {
+      position.tp2Done = true;
+      db.upsertPosition(position);
+      await discord.notifyPartialTp(position, currentPrice, position.sizeUsd * config.EXIT.PARTIAL_TP_2_SIZE, 'TP2 +50% — another 25% closed, 50% riding');
+    }
   }
 
   // ── 4. Time stop ───────────────────────────────────────────────────────────

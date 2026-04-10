@@ -230,8 +230,9 @@ async function notifyTradeEntry(position, candidate) {
         { name: '24h Cont.', value: pct((g.continuation_24h_prob || 0) * 100, 0), inline: true },
         { name: '48h Cont.', value: pct((g.continuation_48h_prob || 0) * 100, 0), inline: true },
         { name: 'Dump Risk', value: pct((g.dump_risk_prob || 0) * 100, 0), inline: true },
-        { name: 'Stop Loss', value: usd(position.stopLossPrice) + ' (0.096 SOL max loss)', inline: true },
-        { name: 'Take Profit', value: usd(position.takeProfitPrice) + ' (+0.096 SOL target)', inline: true },
+        { name: 'Stop Loss', value: usd(position.stopLossPrice) + ' (max -0.096 SOL)', inline: true },
+        { name: 'TP1 (+20%)', value: usd(position.tp1Price) + ' — sell 25%', inline: true },
+        { name: 'TP2 (+50%)', value: usd(position.tp2Price) + ' — sell 25%', inline: true },
         { name: 'Trailing', value: 'Activates at +6%, trails 4% below peak', inline: false },
         { name: 'Wallet Results', value: walletField, inline: false },
         { name: 'Summary', value: g.summary_reason || 'N/A', inline: false },
@@ -252,7 +253,8 @@ async function notifyStopArmed(position) {
         { name: 'Entry', value: usd(position.entryPrice), inline: true },
         { name: 'Stop Price', value: usd(position.stopLossPrice), inline: true },
         { name: 'Max Loss', value: '0.096 SOL (~$8)', inline: true },
-        { name: 'Take Profit', value: usd(position.takeProfitPrice), inline: true },
+        { name: 'TP1 (+20%)', value: usd(position.tp1Price) + ' — 25%', inline: true },
+        { name: 'TP2 (+50%)', value: usd(position.tp2Price) + ' — 25%', inline: true },
       ],
       timestamp: new Date().toISOString(),
     }],
@@ -289,14 +291,16 @@ async function notifyTrailingMoved(position, currentPrice) {
   });
 }
 
-async function notifyPartialTp(position, currentPrice, closedUsd) {
+async function notifyPartialTp(position, currentPrice, closedUsd, label) {
   await send({
     embeds: [{
       title: 'Partial TP: ' + position.tokenName,
+      description: label || 'Partial position closed.',
       color: COLORS.GREEN,
       fields: [
         { name: 'Current Price', value: usd(currentPrice), inline: true },
         { name: 'Closed USD', value: usd(closedUsd), inline: true },
+        { name: 'Remaining', value: 'Still holding — trailing stop active', inline: false },
       ],
       timestamp: new Date().toISOString(),
     }],
