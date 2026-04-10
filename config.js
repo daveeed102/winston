@@ -30,7 +30,7 @@ const config = {
   KILL_SWITCH: process.env.KILL_SWITCH === 'true',                  // hard stop all activity
   PAUSE_NEW_ENTRIES: process.env.PAUSE_NEW_ENTRIES === 'true',      // exits only
   MAX_DAILY_LOSS_USD: parseFloat(process.env.MAX_DAILY_LOSS_USD || '50'),
-  MAX_CONCURRENT_POSITIONS: parseInt(process.env.MAX_CONCURRENT_POSITIONS || '2'),
+  MAX_CONCURRENT_POSITIONS: parseInt(process.env.MAX_CONCURRENT_POSITIONS || '3'),
   MAX_TRADES_PER_DAY: parseInt(process.env.MAX_TRADES_PER_DAY || '8'),
 
   // ─── Portfolio sizing ─────────────────────────────────────────────────────
@@ -75,7 +75,7 @@ const config = {
 
   // ─── Exit strategy ────────────────────────────────────────────────────────
   EXIT: {
-    STOP_LOSS_PCT: parseFloat(process.env.STOP_LOSS_PCT || '15'),                   // -6% hard stop
+    STOP_LOSS_SOL: parseFloat(process.env.STOP_LOSS_SOL || '0.096'),                // fixed SOL loss before exit
     TRAILING_ACTIVATE_PCT: parseFloat(process.env.TRAIL_ACTIVATE || '6'),          // trail starts at +6%
     TRAILING_DISTANCE_PCT: parseFloat(process.env.TRAIL_DISTANCE || '4'),          // trails 4% below peak
     PARTIAL_TP_PCT: parseFloat(process.env.PARTIAL_TP || '9'),                     // take 50% at +9%
