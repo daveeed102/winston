@@ -98,14 +98,18 @@ async function enterPosition(candidate, confidenceScore, grokScore) {
     return null;
   }
 
-  // Calculate position size — fixed USD amounts per confidence tier
-  const sizeUsdRaw = getAllocation(confidenceScore);
-  if (sizeUsdRaw <= 0) {
+  // Calculate position size in SOL
+  const solAllocation = getAllocation(confidenceScore);
+  if (solAllocation <= 0) {
     log.info(`Zero allocation for ${ticker} at confidence ${confidenceScore}`);
     return null;
   }
 
-  let sizeUsd = Math.min(sizeUsdRaw, config.MAX_POSITION_USD);
+  // Convert SOL to USD for Jupiter swap
+  const { getSolPriceUsd } = require('./executor');
+  const solPrice = await getSolPriceUsd();
+  const sizeUsd = solAllocation * solPrice;
+  log.info(`Size: ${solAllocation} SOL = ~$${sizeUsd.toFixed(2)} at $${solPrice.toFixed(2)}/SOL`);
 
   log.info(`Attempting entry: ${ticker} | confidence=${confidenceScore} | size=$${sizeUsd.toFixed(2)}`);
 
@@ -149,8 +153,12 @@ async function enterPosition(candidate, confidenceScore, grokScore) {
 
     log.info(`Entry price for ${ticker}: $${entryPrice.toFixed(8)} (from DexScreener scan)`);
 
-    // Calculate stop loss from verified entry price
-    const stopLossPrice = entryPrice * (1 - config.EXIT.STOP_LOSS_PCT / 100);
+    // Calculate stop loss based on fixed SOL loss (0.096 SOL)
+    // If we buy 0.48 SOL worth, we exit if we lose 0.096 SOL (20% of position)
+    // If we buy 0.30 SOL worth, we exit if we lose 0.096 SOL (32% of position)
+    const stopLossSolValue = config.EXIT.STOP_LOSS_SOL * solPrice; // SOL loss in USD
+    const stopLossPrice = entryPrice * (1 - (stopLossSolValue / sizeUsd));
+    log.info(`Stop loss: will exit if down ${config.EXIT.STOP_LOSS_SOL} SOL (~$${stopLossSolValue.toFixed(2)}), stop price: $${stopLossPrice.toFixed(8)}`);
 
     const position = {
       tokenAddress: candidate.tokenAddress,
@@ -166,7 +174,7 @@ async function enterPosition(candidate, confidenceScore, grokScore) {
       trailingStopPrice: null,
       partialTpDone: false,
       confidenceScore,
-      allocationPct: sizeUsd,
+      allocationPct: solAllocation,  // stored in SOL
       grokSnapshot: grokScore,
       allWalletResults: result.allWalletResults || [],  // per-wallet tx results for Discord
       status: 'open',
