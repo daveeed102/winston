@@ -153,12 +153,21 @@ async function enterPosition(candidate, confidenceScore, grokScore) {
 
     log.info(`Entry price for ${ticker}: $${entryPrice.toFixed(8)} (from DexScreener scan)`);
 
-    // Calculate stop loss based on fixed SOL loss (0.096 SOL)
-    // If we buy 0.48 SOL worth, we exit if we lose 0.096 SOL (20% of position)
-    // If we buy 0.30 SOL worth, we exit if we lose 0.096 SOL (32% of position)
-    const stopLossSolValue = config.EXIT.STOP_LOSS_SOL * solPrice; // SOL loss in USD
-    const stopLossPrice = entryPrice * (1 - (stopLossSolValue / sizeUsd));
-    log.info(`Stop loss: will exit if down ${config.EXIT.STOP_LOSS_SOL} SOL (~$${stopLossSolValue.toFixed(2)}), stop price: $${stopLossPrice.toFixed(8)}`);
+    // Stop loss = 17.5% of SOL spent (scales with position size)
+    // 0.48 SOL buy → stop at -0.084 SOL (~$7)
+    // 0.30 SOL buy → stop at -0.052 SOL (~$4.33)
+    const stopLossPct = config.EXIT.STOP_LOSS_SOL_RATIO;
+    const stopLossPrice = entryPrice * (1 - stopLossPct);
+    const stopLossSol = solAllocation * stopLossPct;
+    log.info(`Stop loss: -${stopLossSol.toFixed(3)} SOL (~$${(stopLossSol * solPrice).toFixed(2)}), stop price: $${stopLossPrice.toFixed(8)}`);
+
+    // Take profit = 20% of SOL spent (scales with position size)
+    // 0.48 SOL buy → take profit at +0.096 SOL (~$8)
+    // 0.30 SOL buy → take profit at +0.060 SOL (~$5)
+    const takeProfitPct = config.EXIT.TAKE_PROFIT_SOL_RATIO;
+    const takeProfitPrice = entryPrice * (1 + takeProfitPct);
+    const takeProfitSol = solAllocation * takeProfitPct;
+    log.info(`Take profit: +${takeProfitSol.toFixed(3)} SOL (~$${(takeProfitSol * solPrice).toFixed(2)}), target price: $${takeProfitPrice.toFixed(8)}`);
 
     const position = {
       tokenAddress: candidate.tokenAddress,
@@ -169,6 +178,7 @@ async function enterPosition(candidate, confidenceScore, grokScore) {
       sizeUsd: result.sizeUsd,
       sizeTokens: result.tokenAmount,
       stopLossPrice,
+      takeProfitPrice,
       trailingActive: false,
       trailingPeakPrice: null,
       trailingStopPrice: null,
