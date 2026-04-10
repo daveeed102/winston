@@ -82,107 +82,36 @@ async function notifyStartup(version, walletAddresses = []) {
 }
 
 async function notifyHeartbeat(state) {
-  const walletFields = (state.wallets || []).map((w) => {
+  const walletFields = (state.wallets || []).map(function(w) {
     const solLine = w.sol != null
-      ? `${w.sol.toFixed(4)} SOL (${usd(w.solUsd)})`
+      ? (w.sol.toFixed(4) + ' SOL (' + usd(w.solUsd) + ')')
       : 'Error fetching balance';
 
     const holdingLines = w.holdings && w.holdings.length > 0
-      ? w.holdings.map(h => `${h.ticker}: ${h.tokenBal.toFixed(0)} tokens ≈ ${usd(h.usdValue)}`).join('
-')
+      ? w.holdings.map(function(h) {
+          return h.ticker + ': ' + h.tokenBal.toFixed(0) + ' tokens (~' + usd(h.usdValue) + ')';
+        }).join('\n')
       : 'No open positions';
 
     return {
-      name: `👛 ${w.name}`,
-      value: `${solLine}
-${holdingLines}`,
+      name: 'Wallet: ' + w.name,
+      value: solLine + '\n' + holdingLines,
       inline: false,
     };
   });
 
   await send({
     embeds: [{
-      title: '💓 Winston Heartbeat',
+      title: 'Winston Heartbeat',
       color: COLORS.DARK,
       fields: [
-        { name: 'Open Positions', value: `${state.openPositions}`, inline: true },
-        { name: "Today's Trades", value: `${state.todayTrades}`, inline: true },
+        { name: 'Open Positions', value: String(state.openPositions), inline: true },
+        { name: "Today's Trades", value: String(state.todayTrades), inline: true },
         { name: "Today's PnL", value: usd(state.todayPnl), inline: true },
         { name: 'SOL Price', value: usd(state.solPrice), inline: true },
         { name: 'Last Scan', value: state.lastScan || 'N/A', inline: true },
-        { name: 'Kill Switch', value: state.killSwitch ? '🔴 ON' : '🟢 OFF', inline: true },
-        ...walletFields,
-      ],
-      timestamp: new Date().toISOString(),
-    }],
-  });
-}
-
-async function notifyKillSwitch(reason) {
-  await send({
-    embeds: [{
-      title: '🔴 KILL SWITCH ACTIVATED',
-      description: `Winston has halted all trading.\n**Reason:** ${reason}`,
-      color: COLORS.RED,
-      timestamp: new Date().toISOString(),
-    }],
-  });
-}
-
-async function notifyPause(reason) {
-  await send({
-    embeds: [{
-      title: '⏸️ New Entries Paused',
-      description: `**Reason:** ${reason}\nExiting existing positions normally.`,
-      color: COLORS.ORANGE,
-      timestamp: new Date().toISOString(),
-    }],
-  });
-}
-
-// ─── Candidate / scoring ──────────────────────────────────────────────────────
-
-async function notifyCandidateFound(candidate) {
-  await send({
-    embeds: [{
-      title: `🔍 Candidate: ${candidate.tokenName} (${candidate.ticker})`,
-      description: `Passed hard filters. Sending to Grok for scoring.`,
-      color: COLORS.GREY,
-      fields: [
-        { name: 'Address', value: `\`${candidate.tokenAddress}\``, inline: false },
-        { name: '1h Change', value: pct(candidate.priceChange1h), inline: true },
-        { name: '6h Change', value: pct(candidate.priceChange6h), inline: true },
-        { name: '24h Change', value: pct(candidate.priceChange24h), inline: true },
-        { name: 'Liquidity', value: usd(candidate.liquidityUsd), inline: true },
-        { name: '24h Volume', value: usd(candidate.volume24h), inline: true },
-        { name: 'Age', value: `${candidate.ageHours?.toFixed(1) || '?'}h`, inline: true },
-      ],
-      timestamp: new Date().toISOString(),
-    }],
-  });
-}
-
-async function notifyScoreCreated(candidate) {
-  const g = candidate.grokScore || {};
-  const tier = confidenceEmoji(candidate.confidenceScore);
-  const color = candidate.confidenceScore >= config.MIN_CONFIDENCE_TO_TRADE ? COLORS.PURPLE : COLORS.GREY;
-
-  await send({
-    embeds: [{
-      title: `📊 Score: ${candidate.tokenName} (${candidate.ticker}) — ${tier}`,
-      description: `Confidence score computed. ${candidate.confidenceScore >= config.MIN_CONFIDENCE_TO_TRADE ? '**Will attempt entry.**' : 'Below threshold. Skipping.'}`,
-      color,
-      fields: [
-        { name: '🎯 Confidence', value: `**${score(candidate.confidenceScore)}/100**`, inline: true },
-        { name: '🔮 24h Continuation', value: pct((g.continuation_24h_prob || 0) * 100, 0), inline: true },
-        { name: '🔮 48h Continuation', value: pct((g.continuation_48h_prob || 0) * 100, 0), inline: true },
-        { name: '💀 Dump Risk', value: pct((g.dump_risk_prob || 0) * 100, 0), inline: true },
-        { name: '📣 Hype Quality', value: score(g.hype_quality_score), inline: true },
-        { name: '📖 Narrative', value: score(g.narrative_strength_score), inline: true },
-        { name: '📈 Trend Health', value: score(g.trend_health_score), inline: true },
-        { name: '🤖 Grok Verdict', value: g.verdict || 'N/A', inline: true },
-        { name: '💬 Grok Summary', value: g.summary_reason || 'N/A', inline: false },
-      ],
+        { name: 'Kill Switch', value: state.killSwitch ? 'ON' : 'OFF', inline: true },
+      ].concat(walletFields),
       timestamp: new Date().toISOString(),
     }],
   });
@@ -199,10 +128,10 @@ async function notifyTradeEntry(position, candidate) {
   const walletNames = require('./config').WALLET_NAMES || ['Wallet 1', 'Wallet 2', 'Wallet 3'];
   const walletField = walletResults.length > 0
     ? walletResults.map((r, i) => {
-        const icon = r.success ? '✅' : '❌';
-        const name = walletNames[i] || `Wallet ${i + 1}`;
-        const tx = r.signature ? `[tx](https://solscan.io/tx/${r.signature})` : r.reason || 'failed';
-        return `${icon} ${name}: ${tx}`;
+        const icon = r.success ? '[OK]' : '[FAIL]';
+        const name = walletNames[i] || ('Wallet ' + (i + 1));
+        const tx = r.signature ? ('[tx](https://solscan.io/tx/' + r.signature + ')') : (r.reason || 'failed');
+        return icon + ' ' + name + ': ' + tx;
       }).join('\n')
     : 'N/A';
 
