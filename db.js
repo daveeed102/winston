@@ -90,6 +90,7 @@ function createTables() {
       confidence_score REAL,
       allocation_pct REAL,
       grok_snapshot TEXT,
+      take_profit_price REAL,
       status TEXT DEFAULT 'open',
       updated_at TEXT DEFAULT (datetime('now'))
     )
@@ -171,8 +172,8 @@ function upsertPosition(pos) {
       token_address, token_name, ticker, entry_price, entry_time,
       size_usd, size_tokens, stop_loss_price, trailing_active,
       trailing_peak_price, trailing_stop_price, partial_tp_done,
-      confidence_score, allocation_pct, grok_snapshot, status, updated_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
+      confidence_score, allocation_pct, grok_snapshot, take_profit_price, status, updated_at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
     ON CONFLICT(token_address) DO UPDATE SET
       trailing_active=excluded.trailing_active,
       trailing_peak_price=excluded.trailing_peak_price,
@@ -190,6 +191,7 @@ function upsertPosition(pos) {
     pos.partialTpDone ? 1 : 0,
     pos.confidenceScore || null, pos.allocationPct || null,
     pos.grokSnapshot ? JSON.stringify(pos.grokSnapshot) : null,
+    pos.takeProfitPrice || null,
     pos.status || 'open',
   ]);
   save();
@@ -225,6 +227,7 @@ function deserializePosition(row) {
     confidenceScore: row.confidence_score,
     allocationPct: row.allocation_pct,
     grokSnapshot: row.grok_snapshot ? JSON.parse(row.grok_snapshot) : null,
+    takeProfitPrice: row.take_profit_price || null,
   };
 }
 
