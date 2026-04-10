@@ -35,7 +35,12 @@ function pct(n, decimals = 1) {
 
 function usd(n) {
   if (n == null) return 'N/A';
-  return `$${Number(n).toFixed(2)}`;
+  const v = Number(n);
+  if (v === 0) return '$0.00';
+  if (v >= 1) return `$${v.toFixed(2)}`;
+  if (v >= 0.01) return `$${v.toFixed(4)}`;
+  if (v >= 0.0001) return `$${v.toFixed(6)}`;
+  return `$${v.toFixed(10)}`;
 }
 
 function score(n) {
@@ -190,7 +195,7 @@ async function notifyTradeEntry(position, candidate) {
         { name: 'Address', value: `\`${position.tokenAddress}\``, inline: false },
         { name: 'Entry Price', value: usd(position.entryPrice), inline: true },
         { name: 'Size (USD)', value: usd(position.sizeUsd), inline: true },
-        { name: 'Allocation', value: pct(position.allocationPct * 100), inline: true },
+        { name: 'Size', value: usd(position.allocationPct), inline: true },
         { name: '1h / 6h / 24h', value: `${pct(candidate?.priceChange1h)} / ${pct(candidate?.priceChange6h)} / ${pct(candidate?.priceChange24h)}`, inline: false },
         { name: 'Vol 1h/24h', value: `${usd(candidate?.volume1h)} / ${usd(candidate?.volume24h)}`, inline: true },
         { name: 'Liquidity', value: usd(candidate?.liquidityUsd), inline: true },
@@ -217,7 +222,8 @@ async function notifyStopArmed(position) {
       color: COLORS.YELLOW,
       fields: [
         { name: 'Entry', value: usd(position.entryPrice), inline: true },
-        { name: 'Stop', value: usd(position.stopLossPrice), inline: true },
+        { name: 'Stop (-15%)', value: usd(position.stopLossPrice), inline: true },
+        { name: 'Stop Loss %', value: '-15%', inline: true },
       ],
       timestamp: new Date().toISOString(),
     }],
