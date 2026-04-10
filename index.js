@@ -37,7 +37,7 @@ async function boot() {
   log.info(`╚══════════════════════════════════╝`);
 
   // Init DB
-  initDb();
+  await initDb();
   log.info('Database initialized');
 
   // Init Solana executor
@@ -107,6 +107,40 @@ async function sendHeartbeat() {
   const todayTrades = db.getTodayTrades();
   const todayPnl = db.getDailyPnl();
 
+  // Fetch real SOL balances + token holdings from chain for all wallets
+  const { getSolBalance, getTokenBalance, getWalletAddresses, getSolPriceUsd } = require('./executor');
+  const walletAddresses = getWalletAddresses();
+  const solPrice = await getSolPriceUsd();
+
+  const wallets = [];
+  for (const w of walletAddresses) {
+    try {
+      const sol = await getSolBalance(w.index - 1);
+      const name = config.WALLET_NAMES[w.index - 1] || `Wallet ${w.index}`;
+
+      // Get token holdings for each open position
+      const holdings = [];
+      for (const pos of openPositions) {
+        try {
+          const tokenBal = await getTokenBalance(pos.tokenAddress, w.index - 1);
+          if (tokenBal > 0) {
+            const usdValue = tokenBal * (pos.entryPrice || 0);
+            holdings.push({
+              ticker: pos.ticker,
+              tokenBal,
+              usdValue,
+            });
+          }
+        } catch {}
+      }
+
+      wallets.push({ index: w.index, name, address: w.address, sol, solUsd: sol * solPrice, holdings });
+    } catch (err) {
+      const name = config.WALLET_NAMES[w.index - 1] || `Wallet ${w.index}`;
+      wallets.push({ index: w.index, name, address: w.address, sol: null, solUsd: null, holdings: [] });
+    }
+  }
+
   await discord.notifyHeartbeat({
     openPositions: openPositions.length,
     todayTrades: todayTrades.length,
@@ -114,6 +148,8 @@ async function sendHeartbeat() {
     lastScan: getLastScanTime(),
     candidatesFound: getLastCandidatesFound(),
     killSwitch: config.KILL_SWITCH,
+    wallets,
+    solPrice,
   });
 }
 
