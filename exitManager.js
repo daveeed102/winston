@@ -141,9 +141,11 @@ async function checkPosition(position) {
   // ── 5. Momentum failure check ──────────────────────────────────────────────
   // Only fires if: holding >5 min, price is negative, AND dropped from peak
   // Never fires in first 5 minutes to avoid false signals on entry price noise
-  if (!position.trailingActive && peak > entry && holdTimeHours >= (5 / 60)) {
+  // Momentum failure: only fires if holding >10min, dropped >12% from peak, AND PnL < -5%
+  // This prevents selling a healthy coin during a normal pullback
+  if (!position.trailingActive && peak > entry && holdTimeHours >= (10 / 60)) {
     const dropFromPeak = ((peak - currentPrice) / peak) * 100;
-    if (dropFromPeak >= config.EXIT.MOMENTUM_FAIL_PCT && pnlPct < -2) {
+    if (dropFromPeak >= config.EXIT.MOMENTUM_FAIL_PCT && pnlPct < -5) {
       log.info(`📊 Momentum failure: ${position.ticker} dropped ${dropFromPeak.toFixed(1)}% from peak, PnL ${pnlPct.toFixed(1)}%`);
       await executeExit(position, currentPrice, 'MOMENTUM_FAILURE', 1.0, peakPnlPct);
       return;
