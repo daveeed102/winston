@@ -110,20 +110,18 @@ async function enterPosition(candidate, confidenceScore, grokScore) {
   log.info(`Attempting entry: ${ticker} | confidence=${confidenceScore} | size=$${sizeUsd.toFixed(2)}`);
 
   // ── Live price sanity check ───────────────────────────────────────────────
-  // Verify current price is within 20% of what DexScreener reported.
+  // Verify current price is within 25% of what DexScreener reported.
   // Protects against buying a token that is already crashing.
   try {
     const { getCurrentPrice } = require('./dexscreener');
     const livePrice = await getCurrentPrice(candidate.tokenAddress);
-    if (livePrice && candidate.priceUsd) {
+    if (livePrice && livePrice > 0 && candidate.priceUsd && candidate.priceUsd > 0) {
       const priceDiff = Math.abs(livePrice - candidate.priceUsd) / candidate.priceUsd * 100;
-      if (priceDiff > 20) {
-        log.warn(`Price moved too much since scan for ${ticker}: scanned $${candidate.priceUsd.toFixed(8)}, live $${livePrice.toFixed(8)} (${priceDiff.toFixed(1)}% diff) — skipping entry`);
+      if (priceDiff > 25) {
+        log.warn(`Price moved too much for ${ticker}: scanned $${candidate.priceUsd.toFixed(8)}, live $${livePrice.toFixed(8)} (${priceDiff.toFixed(1)}% diff) — skipping`);
         return null;
       }
       log.info(`Price check OK for ${ticker}: $${livePrice.toFixed(8)} (${priceDiff.toFixed(1)}% from scan price)`);
-      // Store livePrice in outer scope for entry price calculation
-      candidate._verifiedLivePrice = livePrice;
     }
   } catch (err) {
     log.warn(`Live price check failed for ${ticker}: ${err.message} — proceeding anyway`);
@@ -137,11 +135,21 @@ async function enterPosition(candidate, confidenceScore, grokScore) {
       return null;
     }
 
-    // Use live price check as entry — accurate, not skewed by retry delays
-    const entryPrice = candidate._verifiedLivePrice || result.entryPrice;
-    log.info(`Entry price for ${ticker}: $${entryPrice.toFixed(8)} (live price check)`);
+    // Use DexScreener's priceUsd as entry price — most reliable source.
+    // Jupiter's reported price can be skewed by decimal issues or retry delays.
+    // Fall back to candidate scan price, then Jupiter price as last resort.
+    const entryPrice = (candidate.priceUsd && candidate.priceUsd > 0)
+      ? candidate.priceUsd
+      : result.entryPrice;
 
-    // Calculate stop loss from the CORRECT entry price
+    if (!entryPrice || entryPrice <= 0) {
+      log.error(`Could not determine valid entry price for ${ticker} — aborting`);
+      return null;
+    }
+
+    log.info(`Entry price for ${ticker}: $${entryPrice.toFixed(8)} (from DexScreener scan)`);
+
+    // Calculate stop loss from verified entry price
     const stopLossPrice = entryPrice * (1 - config.EXIT.STOP_LOSS_PCT / 100);
 
     const position = {
