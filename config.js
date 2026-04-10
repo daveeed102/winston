@@ -16,6 +16,7 @@ const config = {
   HELIUS_API_KEY: process.env.HELIUS_API_KEY || '',                 // optional, faster RPC
   JUPITER_API_BASE: 'https://quote-api.jup.ag/v6',
   SOL_MINT: 'So11111111111111111111111111111111111111112',
+  WALLET_NAMES: ['Daveeed', 'Kindude', 'Reshawnda'],
 
   // ─── API keys ─────────────────────────────────────────────────────────────
   GROK_API_KEY: process.env.GROK_API_KEY || '',
