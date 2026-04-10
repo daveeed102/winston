@@ -176,7 +176,7 @@ function upsertPosition(pos) {
       size_usd, size_tokens, stop_loss_price, trailing_active,
       trailing_peak_price, trailing_stop_price, partial_tp_done,
       confidence_score, allocation_pct, grok_snapshot, tp1_price, tp2_price, tp1_done, tp2_done, status, updated_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
     ON CONFLICT(token_address) DO UPDATE SET
       trailing_active=excluded.trailing_active,
       trailing_peak_price=excluded.trailing_peak_price,

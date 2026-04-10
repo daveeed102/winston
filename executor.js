@@ -169,12 +169,13 @@ async function buyToken(tokenAddress, sizeUsd) {
 
 // ─── SELL — all wallets simultaneously ───────────────────────────────────────
 
-async function sellToken(tokenAddress, fraction = 1.0) {
-  log.info(`SELL ${tokenAddress} (${(fraction * 100).toFixed(0)}%) across ${wallets.length} wallet(s)`);
+async function sellToken(tokenAddress, fraction = 1.0, specificWalletIndex = null) {
+  const targetWallets = specificWalletIndex !== null ? [{ wallet: wallets[specificWalletIndex], i: specificWalletIndex }] : wallets.map((w, i) => ({ wallet: w, i }));
+  log.info(`SELL ${tokenAddress} (${(fraction * 100).toFixed(0)}%) across ${targetWallets.length} wallet(s)`);
   const solPrice = await getSolPriceUsd();
   const decimals = await getTokenDecimals(tokenAddress);
 
-  const walletPromises = wallets.map(async (wallet, i) => {
+  const walletPromises = targetWallets.map(async ({ wallet, i }) => {
     const label = `Wallet ${i + 1}`;
     // Stagger wallet executions by 3s each to avoid Jupiter 429 rate limits
     await sleep(i * 3000);

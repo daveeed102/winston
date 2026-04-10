@@ -29,6 +29,148 @@ let exitInterval = null;
 let heartbeatInterval = null;
 let isShuttingDown = false;
 
+// ─── Clean slate on startup ──────────────────────────────────────────────────
+// On every redeploy, sell all token balances back to SOL across all wallets.
+// This keeps everyone in sync and prevents orphaned positions from old deploys.
+
+async function cleanSlateAllWallets() {
+  const { Connection, PublicKey } = require('@solana/web3.js');
+  const { sellToken, getSolPriceUsd, getWalletAddresses } = require('./executor');
+
+  log.info('Clean slate: checking all wallets for token balances...');
+
+  const walletAddresses = getWalletAddresses();
+  const rpcUrl = config.HELIUS_API_KEY
+    ? `https://mainnet.helius-rpc.com/?api-key=${config.HELIUS_API_KEY}`
+    : config.SOLANA_RPC_URL;
+  const connection = new (require('@solana/web3.js').Connection)(rpcUrl, 'confirmed');
+  const bs58 = require('bs58');
+  const { Keypair } = require('@solana/web3.js');
+
+  const keys = [
+    process.env.WALLET_PRIVATE_KEY,
+    process.env.WALLET_PRIVATE_KEY_2,
+    process.env.WALLET_PRIVATE_KEY_3,
+  ].filter(Boolean);
+
+  let totalSold = 0;
+  const soldTokens = [];
+
+  for (let i = 0; i < keys.length; i++) {
+    const walletName = config.WALLET_NAMES[i] || ('Wallet ' + (i + 1));
+    try {
+      const keypair = Keypair.fromSecretKey(bs58.decode(keys[i]));
+      const tokenAccounts = await connection.getParsedTokenAccountsByOwner(keypair.publicKey, {
+        programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
+      });
+
+      const nonZero = tokenAccounts.value.filter(a => {
+        const bal = a.account.data.parsed.info.tokenAmount.uiAmount;
+        return bal && bal > 0;
+      });
+
+      if (nonZero.length === 0) {
+        log.info(`${walletName}: no token balances to clear`);
+        continue;
+      }
+
+      log.info(`${walletName}: found ${nonZero.length} token(s) to sell`);
+
+      for (const account of nonZero) {
+        const mint = account.account.data.parsed.info.mint;
+        const balance = account.account.data.parsed.info.tokenAmount.uiAmount;
+        try {
+          log.info(`${walletName}: selling ${balance} of ${mint}`);
+          await sellToken(mint, 1.0);
+          soldTokens.push({ wallet: walletName, mint, balance });
+          totalSold++;
+          await new Promise(r => setTimeout(r, 2000)); // small delay between sells
+        } catch (err) {
+          log.warn(`${walletName}: failed to sell ${mint}: ${err.message}`);
+        }
+      }
+    } catch (err) {
+      log.warn(`Clean slate failed for wallet ${i + 1}: ${err.message}`);
+    }
+  }
+
+  if (totalSold > 0) {
+    log.info(`Clean slate complete: sold ${totalSold} token position(s)`);
+    await discord.notifyError('STARTUP', `Clean slate: sold ${totalSold} leftover token(s) back to SOL before starting fresh.`,
+      soldTokens.map(t => `${t.wallet}: ${t.mint}`).join(', ')
+    );
+  } else {
+    log.info('Clean slate: all wallets already clean');
+  }
+}
+
+// ─── Startup liquidation ──────────────────────────────────────────────────────
+// Sells all non-SOL token balances back to SOL on startup.
+// Called on every deploy to ensure clean state.
+
+async function liquidateAllTokens() {
+  const { getWalletAddresses, getTokenBalance, sellToken, getSolPriceUsd } = require('./executor');
+  const { Connection, PublicKey } = require('@solana/web3.js');
+  const axios = require('axios');
+
+  const wallets = getWalletAddresses();
+
+  for (const wallet of wallets) {
+    try {
+      // Get all token accounts for this wallet
+      const rpcUrl = config.HELIUS_API_KEY
+        ? `https://mainnet.helius-rpc.com/?api-key=${config.HELIUS_API_KEY}`
+        : config.SOLANA_RPC_URL;
+
+      const res = await axios.post(rpcUrl, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'getTokenAccountsByOwner',
+        params: [
+          wallet.address,
+          { programId: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA' },
+          { encoding: 'jsonParsed' },
+        ],
+      }, { timeout: 15000 });
+
+      const accounts = res.data?.result?.value || [];
+      const tokensWithBalance = accounts.filter(a => {
+        const amount = a.account?.data?.parsed?.info?.tokenAmount?.uiAmount;
+        return amount && amount > 0;
+      });
+
+      if (tokensWithBalance.length === 0) {
+        log.info(`Wallet ${wallet.index} (${config.WALLET_NAMES[wallet.index-1]}): no tokens to liquidate`);
+        continue;
+      }
+
+      log.info(`Wallet ${wallet.index} (${config.WALLET_NAMES[wallet.index-1]}): found ${tokensWithBalance.length} token(s) to sell`);
+
+      for (const account of tokensWithBalance) {
+        const mint = account.account?.data?.parsed?.info?.mint;
+        const uiAmount = account.account?.data?.parsed?.info?.tokenAmount?.uiAmount;
+        if (!mint || !uiAmount) continue;
+
+        // Skip wrapped SOL
+        if (mint === config.SOL_MINT) continue;
+
+        try {
+          log.info(`Liquidating ${uiAmount.toFixed(4)} tokens of ${mint} from wallet ${wallet.index}`);
+          const result = await sellToken(mint, 1.0, wallet.index - 1);
+          if (result.success) {
+            log.info(`Sold ${mint} for $${result.usdReceived?.toFixed(2)} — wallet ${wallet.index} clean`);
+            await discord.notifyError('STARTUP', `Liquidated leftover ${mint.slice(0,8)}... from ${config.WALLET_NAMES[wallet.index-1]} — $${result.usdReceived?.toFixed(2)} recovered`);
+          }
+        } catch (err) {
+          log.warn(`Could not liquidate ${mint} from wallet ${wallet.index}: ${err.message}`);
+        }
+      }
+    } catch (err) {
+      log.warn(`Startup liquidation failed for wallet ${wallet.index}: ${err.message}`);
+    }
+  }
+}
+
 // ─── Startup ──────────────────────────────────────────────────────────────────
 
 async function boot() {
@@ -43,6 +185,13 @@ async function boot() {
   // Init Solana executor
   initExecutor();
   log.info('Executor initialized');
+
+  // ── Startup liquidation ───────────────────────────────────────────────────
+  // On every redeploy the DB resets, so we sell ALL token holdings back to SOL
+  // This ensures wallets start clean and Winston doesn't re-buy tokens it forgot about
+  log.info('Running startup liquidation — selling any existing token holdings...');
+  await liquidateAllTokens();
+  log.info('Startup liquidation complete. Wallets are clean.');
 
   // Start health server (keeps Railway container alive)
   startHealthServer();
