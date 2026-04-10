@@ -128,7 +128,7 @@ function getAllocation(score) {
   if (score >= T.GOOD)   return S.GOOD;    // $30
   if (score >= T.SMALL)  return S.SMALL;   // $20
   // Floor tier: covers cases where MIN_CONFIDENCE is set below 75
-  if (score >= config.MIN_CONFIDENCE_TO_TRADE) return 15; // $15 floor
+  if (score >= config.MIN_CONFIDENCE_TO_TRADE) return 25; // $25 floor
   return 0;
 }
 
