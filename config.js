@@ -30,19 +30,19 @@ const config = {
   KILL_SWITCH: process.env.KILL_SWITCH === 'true',                  // hard stop all activity
   PAUSE_NEW_ENTRIES: process.env.PAUSE_NEW_ENTRIES === 'true',      // exits only
   MAX_DAILY_LOSS_USD: parseFloat(process.env.MAX_DAILY_LOSS_USD || '50'),
-  MAX_CONCURRENT_POSITIONS: parseInt(process.env.MAX_CONCURRENT_POSITIONS || '4'),
+  MAX_CONCURRENT_POSITIONS: parseInt(process.env.MAX_CONCURRENT_POSITIONS || '2'),
   MAX_TRADES_PER_DAY: parseInt(process.env.MAX_TRADES_PER_DAY || '8'),
 
   // ─── Portfolio sizing ─────────────────────────────────────────────────────
   PORTFOLIO_SIZE_USD: parseFloat(process.env.PORTFOLIO_SIZE_USD || '200'),
   MAX_POSITION_USD: parseFloat(process.env.MAX_POSITION_USD || '40'),
 
-  // Confidence-based allocation (fixed USD per trade)
+  // Confidence-based allocation (SOL per trade)
   SIZING: {
-    ELITE: 50,    // 90–100 confidence
-    STRONG: 50,   // 85–89
-    GOOD: 35,     // 80–84
-    SMALL: 25,    // 75–79
+    ELITE: 0.48,    // 90–100 confidence
+    STRONG: 0.48,   // 85–89
+    GOOD: 0.48,     // 80–84
+    SMALL: 0.30,    // 65–79
   },
 
   // ─── Confidence thresholds ────────────────────────────────────────────────
@@ -82,7 +82,7 @@ const config = {
     PARTIAL_TP_SIZE: parseFloat(process.env.PARTIAL_TP_SIZE || '0.5'),             // fraction to close
     MAX_HOLD_HOURS: parseFloat(process.env.MAX_HOLD_HOURS || '48'),
     HYPE_COLLAPSE_THRESHOLD: parseFloat(process.env.HYPE_COLLAPSE || '0.3'),       // if volume drops 70%, exit
-    MOMENTUM_FAIL_PCT: parseFloat(process.env.MOMENTUM_FAIL || '3'),               // % reversal from peak triggers check
+    MOMENTUM_FAIL_PCT: parseFloat(process.env.MOMENTUM_FAIL || '12'),              // % reversal from peak triggers check
   },
 
   // ─── Cooldowns / rate limiting ────────────────────────────────────────────
