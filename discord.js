@@ -82,6 +82,24 @@ async function notifyStartup(version, walletAddresses = []) {
 }
 
 async function notifyHeartbeat(state) {
+  const walletFields = (state.wallets || []).map((w) => {
+    const solLine = w.sol != null
+      ? `${w.sol.toFixed(4)} SOL (${usd(w.solUsd)})`
+      : 'Error fetching balance';
+
+    const holdingLines = w.holdings && w.holdings.length > 0
+      ? w.holdings.map(h => `${h.ticker}: ${h.tokenBal.toFixed(0)} tokens ≈ ${usd(h.usdValue)}`).join('
+')
+      : 'No open positions';
+
+    return {
+      name: `👛 ${w.name}`,
+      value: `${solLine}
+${holdingLines}`,
+      inline: false,
+    };
+  });
+
   await send({
     embeds: [{
       title: '💓 Winston Heartbeat',
@@ -90,9 +108,10 @@ async function notifyHeartbeat(state) {
         { name: 'Open Positions', value: `${state.openPositions}`, inline: true },
         { name: "Today's Trades", value: `${state.todayTrades}`, inline: true },
         { name: "Today's PnL", value: usd(state.todayPnl), inline: true },
+        { name: 'SOL Price', value: usd(state.solPrice), inline: true },
         { name: 'Last Scan', value: state.lastScan || 'N/A', inline: true },
-        { name: 'Candidates Found', value: `${state.candidatesFound || 0}`, inline: true },
         { name: 'Kill Switch', value: state.killSwitch ? '🔴 ON' : '🟢 OFF', inline: true },
+        ...walletFields,
       ],
       timestamp: new Date().toISOString(),
     }],
@@ -177,11 +196,13 @@ async function notifyTradeEntry(position, candidate) {
 
   // Build per-wallet tx summary
   const walletResults = position.allWalletResults || [];
+  const walletNames = require('./config').WALLET_NAMES || ['Wallet 1', 'Wallet 2', 'Wallet 3'];
   const walletField = walletResults.length > 0
     ? walletResults.map((r, i) => {
         const icon = r.success ? '✅' : '❌';
+        const name = walletNames[i] || `Wallet ${i + 1}`;
         const tx = r.signature ? `[tx](https://solscan.io/tx/${r.signature})` : r.reason || 'failed';
-        return `${icon} Wallet ${i + 1}: ${tx}`;
+        return `${icon} ${name}: ${tx}`;
       }).join('\n')
     : 'N/A';
 
