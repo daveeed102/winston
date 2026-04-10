@@ -161,13 +161,10 @@ async function enterPosition(candidate, confidenceScore, grokScore) {
     const stopLossSol = solAllocation * stopLossPct;
     log.info(`Stop loss: -${stopLossSol.toFixed(3)} SOL (~$${(stopLossSol * solPrice).toFixed(2)}), stop price: $${stopLossPrice.toFixed(8)}`);
 
-    // Take profit = 20% of SOL spent (scales with position size)
-    // 0.48 SOL buy → take profit at +0.096 SOL (~$8)
-    // 0.30 SOL buy → take profit at +0.060 SOL (~$5)
-    const takeProfitPct = config.EXIT.TAKE_PROFIT_SOL_RATIO;
-    const takeProfitPrice = entryPrice * (1 + takeProfitPct);
-    const takeProfitSol = solAllocation * takeProfitPct;
-    log.info(`Take profit: +${takeProfitSol.toFixed(3)} SOL (~$${(takeProfitSol * solPrice).toFixed(2)}), target price: $${takeProfitPrice.toFixed(8)}`);
+    // Staged take profits: 25% at +20%, 25% at +50%, rest rides with trailing stop
+    const tp1Price = entryPrice * (1 + config.EXIT.PARTIAL_TP_1_PCT / 100);
+    const tp2Price = entryPrice * (1 + config.EXIT.PARTIAL_TP_2_PCT / 100);
+    log.info(`TP1 at +${config.EXIT.PARTIAL_TP_1_PCT}%: $${tp1Price.toFixed(8)} | TP2 at +${config.EXIT.PARTIAL_TP_2_PCT}%: $${tp2Price.toFixed(8)}`);
 
     const position = {
       tokenAddress: candidate.tokenAddress,
