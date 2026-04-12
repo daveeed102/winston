@@ -1,19 +1,22 @@
 /**
- * Pump.fun Launch Listener
+ * Pump.fun Launch Listener - v4
  *
- * Subscribes to Pump.fun program logs via Helius WebSocket.
- * Extracts the mint address directly from the log data —
- * no separate getTransaction call needed, which was causing
- * the "Could not extract mint" errors due to propagation delay.
+ * Uses Helius programSubscribe to watch the Pump.fun program for
+ * new accounts being created. When a new bonding curve account is
+ * created, the mint address is embedded directly in the account data
+ * at a known offset — no secondary RPC call needed at all.
  *
- * Pump.fun program ID: 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
+ * Pump.fun program:      6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
+ * Bonding curve layout:  [discriminator 8 bytes][mint pubkey 32 bytes]...
  *
- * The logsNotification payload includes the full account list
- * in value.logs and the accounts in the transaction message.
- * We pull the mint from the accountKeys in the notification itself.
+ * Alternative approach used here for maximum reliability:
+ * Subscribe to logs, store the FULL signature, then use
+ * Helius getTransaction with retries (waiting for confirmation).
+ * We keep the full sig in memory, not the truncated display version.
  */
 
 const WebSocket = require('ws');
+const { Connection, PublicKey } = require('@solana/web3.js');
 const config = require('./config');
 const logger = require('./logger');
 
@@ -26,6 +29,8 @@ class PumpListener {
     this.reconnectDelay = 1000;
     this.maxReconnectDelay = 30000;
     this.running = false;
+    this.pendingSigs = new Set();
+    this.connection = new Connection(config.HELIUS_RPC_URL, 'confirmed');
   }
 
   start() {
@@ -43,9 +48,10 @@ class PumpListener {
     this.ws = new WebSocket(config.HELIUS_WS_URL);
 
     this.ws.on('open', () => {
-      logger.info('[LISTENER] WebSocket connected. Subscribing to Pump.fun logs...');
+      logger.info('[LISTENER] Connected. Subscribing to Pump.fun program...');
       this.reconnectDelay = 1000;
 
+      // Subscribe to logs — we get the FULL signature in the notification
       this.ws.send(JSON.stringify({
         jsonrpc: '2.0',
         id: 1,
@@ -62,26 +68,25 @@ class PumpListener {
         const msg = JSON.parse(data.toString());
 
         if (msg.id === 1 && msg.result !== undefined) {
-          logger.info(`[LISTENER] Subscribed to Pump.fun logs (sub ID: ${msg.result})`);
+          logger.info(`[LISTENER] Subscribed (sub ID: ${msg.result})`);
           return;
         }
 
         if (msg.method === 'logsNotification') {
-          await this.handleLog(msg.params?.result);
+          this.handleLog(msg.params?.result);
         }
       } catch (err) {
-        logger.debug(`[LISTENER] Message parse error: ${err.message}`);
+        logger.debug(`[LISTENER] Parse error: ${err.message}`);
       }
     });
 
     this.ws.on('error', (err) => {
-      logger.error(`[LISTENER] WebSocket error: ${err.message}`);
+      logger.error(`[LISTENER] WS error: ${err.message}`);
     });
 
     this.ws.on('close', () => {
-      logger.warn('[LISTENER] WebSocket closed');
+      logger.warn('[LISTENER] WS closed');
       if (this.running) {
-        logger.info(`[LISTENER] Reconnecting in ${this.reconnectDelay}ms...`);
         setTimeout(() => {
           this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxReconnectDelay);
           this.connect();
@@ -90,94 +95,152 @@ class PumpListener {
     });
   }
 
-  async handleLog(result) {
+  handleLog(result) {
     if (!result?.value) return;
-
     const { value } = result;
-    const logs = value.logs || [];
-    const signature = value.signature;
-
-    // Skip errored transactions
     if (value.err) return;
 
-    // Must be a create instruction
+    const logs = value.logs || [];
+    const signature = value.signature; // This is the FULL signature from Helius
+
+    if (!signature || signature.length < 80) return; // sanity check it's a real sig
+
     const isCreate = logs.some(log =>
       log.includes('Instruction: Create') ||
       log.includes('Program log: create')
     );
     if (!isCreate) return;
+    if (this.pendingSigs.has(signature)) return;
 
+    this.pendingSigs.add(signature);
     const detectedAt = Date.now();
-    logger.info(`[LISTENER] New token create! Sig: ${signature.slice(0, 20)}...`);
+    logger.info(`[LISTENER] Create detected: ${signature.slice(0, 24)}...`);
 
-    // ── Extract mint from log text ──
-    // Pump.fun logs the mint address in a line like:
-    // "Program log: mint: <ADDRESS>"
-    // Try that first — zero extra RPC calls, instant.
-    let mint = extractMintFromLogs(logs);
+    // Resolve asynchronously — don't block the WS message handler
+    this.resolveAndBuy(signature, detectedAt).finally(() => {
+      this.pendingSigs.delete(signature);
+    });
+  }
 
-    // ── Fallback: parse from accountKeys in the notification ──
-    // Helius enriched WS sometimes includes accounts in the payload
-    if (!mint) {
-      mint = extractMintFromAccounts(value);
-    }
+  async resolveAndBuy(signature, detectedAt) {
+    const mint = await getMintFromTransaction(this.connection, signature);
 
     if (!mint) {
-      logger.warn(`[LISTENER] Could not extract mint from logs for ${signature.slice(0, 20)}... — skipping`);
+      logger.warn(`[LISTENER] Could not resolve mint for ${signature.slice(0, 24)}`);
       return;
     }
 
-    logger.info(`[LISTENER] Mint: ${mint} | Detection latency: ${Date.now() - detectedAt}ms`);
+    const ageMs = Date.now() - detectedAt;
+    logger.info(`[LISTENER] ✅ Mint: ${mint} | Latency: ${ageMs}ms`);
 
-    this.onNewToken(mint, detectedAt).catch(err => {
+    try {
+      await this.onNewToken(mint, detectedAt);
+    } catch (err) {
       logger.error(`[LISTENER] onNewToken error: ${err.message}`);
-    });
+    }
   }
 }
 
 /**
- * Try to extract mint address from Pump.fun log lines.
- * Pump.fun emits lines like:
- *   "Program log: mint: So11111..."
- *   "Program data: <base64>"  <- sometimes contains mint info
+ * Fetch the transaction and extract the mint from account keys.
+ * Retries with escalating delays to handle propagation lag.
+ *
+ * On Pump.fun create transactions the account layout is:
+ * [0] = feePayerWallet / signer
+ * [1] = mint (the new token) ← this is what we want
+ * [2] = bondingCurve
+ * [3] = associatedBondingCurve
+ * [4] = global config
+ * [5] = mplTokenMetadata program
+ * ... etc
  */
-function extractMintFromLogs(logs) {
-  for (const log of logs) {
-    // Pattern: "Program log: mint: <ADDR>"
-    const mintMatch = log.match(/mint:\s*([1-9A-HJ-NP-Za-km-z]{32,44})/);
-    if (mintMatch) return mintMatch[1];
+async function getMintFromTransaction(connection, signature) {
+  const delays = [500, 1000, 2000, 4000, 6000];
 
-    // Pattern: address appearing after "create" in log
-    const createMatch = log.match(/create.*?([1-9A-HJ-NP-Za-km-z]{43,44})/);
-    if (createMatch) return createMatch[1];
+  for (let i = 0; i < delays.length; i++) {
+    await sleep(delays[i]);
+
+    try {
+      const tx = await connection.getTransaction(signature, {
+        maxSupportedTransactionVersion: 0,
+        commitment: 'confirmed',
+      });
+
+      if (!tx) {
+        logger.debug(`[LISTENER] TX not found yet (attempt ${i + 1})`);
+        continue;
+      }
+
+      // Get account keys from the transaction message
+      let accounts;
+      try {
+        // Versioned transactions (V0)
+        const msg = tx.transaction.message;
+        if (msg.getAccountKeys) {
+          accounts = msg.getAccountKeys().staticAccountKeys;
+        } else {
+          accounts = msg.accountKeys;
+        }
+      } catch {
+        accounts = tx.transaction.message.accountKeys;
+      }
+
+      if (!accounts || accounts.length < 2) {
+        logger.debug(`[LISTENER] Not enough accounts in TX`);
+        continue;
+      }
+
+      // Index 1 = mint on Pump.fun creates
+      const mintAccount = accounts[1];
+      const mintAddress = mintAccount?.toBase58
+        ? mintAccount.toBase58()
+        : mintAccount?.toString?.()
+        ?? mintAccount;
+
+      if (mintAddress && isValidSolanaAddress(mintAddress) && !isSystemAddress(mintAddress)) {
+        return mintAddress;
+      }
+
+      // Fallback: scan token balances for a mint that changed
+      const postBalances = tx.meta?.postTokenBalances || [];
+      for (const bal of postBalances) {
+        if (bal.mint && isValidSolanaAddress(bal.mint) && !isSystemAddress(bal.mint)) {
+          return bal.mint;
+        }
+      }
+
+      logger.debug(`[LISTENER] Could not find valid mint in TX accounts`);
+      return null;
+
+    } catch (err) {
+      logger.debug(`[LISTENER] getTransaction attempt ${i + 1} error: ${err.message}`);
+    }
   }
+
   return null;
 }
 
-/**
- * Helius enriched websocket notifications sometimes include
- * account keys directly in the notification payload.
- * On Pump.fun creates, index 1 is the mint.
- */
-function extractMintFromAccounts(value) {
-  try {
-    // Helius may include accountKeys at various paths depending on version
-    const accounts =
-      value?.transaction?.message?.accountKeys ||
-      value?.transaction?.message?.staticAccountKeys ||
-      value?.accountKeys ||
-      null;
+function isValidSolanaAddress(addr) {
+  if (typeof addr !== 'string') return false;
+  return addr.length >= 32 && addr.length <= 44;
+}
 
-    if (!accounts || accounts.length < 2) return null;
+function isSystemAddress(addr) {
+  const system = new Set([
+    '11111111111111111111111111111111',
+    'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+    'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bmd',
+    'So11111111111111111111111111111111111111112',
+    'SysvarRent111111111111111111111111111111111',
+    'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s',
+    '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+    'Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1',
+  ]);
+  return system.has(addr);
+}
 
-    const mint = accounts[1];
-    if (typeof mint === 'string' && mint.length >= 32) return mint;
-    if (mint?.pubkey) return mint.pubkey;
-    if (mint?.toBase58) return mint.toBase58();
-  } catch {
-    // ignore
-  }
-  return null;
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 module.exports = PumpListener;
