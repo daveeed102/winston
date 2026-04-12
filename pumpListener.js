@@ -1,17 +1,15 @@
 /**
- * Pump.fun Launch Listener - v6
+ * Pump.fun Launch Listener - v7
  *
- * Uses Helius Enhanced WebSocket (transactionSubscribe) instead of
- * logsSubscribe. This streams the FULL parsed transaction in the
- * notification itself — zero secondary RPC calls needed.
+ * Uses logsSubscribe (works on all Helius tiers) but resolves the mint
+ * via the Helius Enhanced Transactions REST API which parses the tx
+ * server-side and returns clean JSON — much more reliable than getTransaction.
  *
- * transactionSubscribe is available on all Helius plans including free.
- * It includes accountKeys, tokenBalances, etc. right in the message.
- *
- * Pump.fun program: 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
+ * Endpoint: GET https://api.helius.xyz/v0/transactions?api-key=KEY&transactions=SIG
  */
 
 const WebSocket = require('ws');
+const axios = require('axios');
 const config = require('./config');
 const logger = require('./logger');
 
@@ -38,6 +36,7 @@ class PumpListener {
     this.reconnectDelay = 1000;
     this.maxReconnectDelay = 30000;
     this.running = false;
+    this.pendingSigs = new Set();
     this.seenMints = new Set();
   }
 
@@ -52,30 +51,20 @@ class PumpListener {
   }
 
   connect() {
-    logger.info('[LISTENER] Connecting to Helius Enhanced WebSocket...');
+    logger.info('[LISTENER] Connecting to Helius WebSocket...');
     this.ws = new WebSocket(config.HELIUS_WS_URL);
 
     this.ws.on('open', () => {
-      logger.info('[LISTENER] Connected. Subscribing via transactionSubscribe...');
+      logger.info('[LISTENER] Connected. Subscribing to Pump.fun logs...');
       this.reconnectDelay = 1000;
 
-      // transactionSubscribe: streams full tx data for every Pump.fun transaction
-      // accountInclude filters to only txs that mention the pump program
       this.ws.send(JSON.stringify({
         jsonrpc: '2.0',
         id: 1,
-        method: 'transactionSubscribe',
+        method: 'logsSubscribe',
         params: [
-          {
-            accountInclude: [PUMP_PROGRAM_ID],
-            failed: false,
-          },
-          {
-            commitment: 'processed',
-            encoding: 'jsonParsed',
-            transactionDetails: 'full',
-            maxSupportedTransactionVersion: 0,
-          },
+          { mentions: [PUMP_PROGRAM_ID] },
+          { commitment: 'processed' },
         ],
       }));
     });
@@ -85,12 +74,12 @@ class PumpListener {
         const msg = JSON.parse(data.toString());
 
         if (msg.id === 1 && msg.result !== undefined) {
-          logger.info(`[LISTENER] transactionSubscribe confirmed (sub ID: ${msg.result})`);
+          logger.info(`[LISTENER] Subscribed to logs (sub ID: ${msg.result})`);
           return;
         }
 
-        if (msg.method === 'transactionNotification') {
-          this.handleTransaction(msg.params?.result);
+        if (msg.method === 'logsNotification') {
+          this.handleLog(msg.params?.result);
         }
       } catch (err) {
         logger.debug(`[LISTENER] Parse error: ${err.message}`);
@@ -110,87 +99,124 @@ class PumpListener {
     });
   }
 
-  handleTransaction(result) {
-    if (!result) return;
+  handleLog(result) {
+    if (!result?.value) return;
+    const { value } = result;
+    if (value.err) return;
 
-    const detectedAt = Date.now();
-    const tx = result.transaction;
-    const signature = result.signature;
+    const logs = value.logs || [];
+    const signature = value.signature;
 
-    if (!tx) return;
+    if (!signature || signature.length < 80) return;
 
-    // Check this is a Create instruction by scanning log messages
-    const logs = tx.meta?.logMessages || [];
     const isCreate = logs.some(log =>
       log.includes('Instruction: Create') ||
       log.includes('Program log: create')
     );
     if (!isCreate) return;
+    if (this.pendingSigs.has(signature)) return;
 
-    // Extract mint from the transaction data that came WITH the notification
-    const mint = extractMint(tx);
+    this.pendingSigs.add(signature);
+    const detectedAt = Date.now();
+    logger.info(`[LISTENER] Create detected: ${signature.slice(0, 20)}...`);
+
+    this.resolveAndBuy(signature, detectedAt).finally(() => {
+      this.pendingSigs.delete(signature);
+    });
+  }
+
+  async resolveAndBuy(signature, detectedAt) {
+    const mint = await resolveMint(signature);
 
     if (!mint) {
-      logger.debug(`[LISTENER] Create tx but no mint found: ${signature?.slice(0, 20)}`);
+      logger.warn(`[LISTENER] Could not resolve mint for ${signature.slice(0, 20)}`);
       return;
     }
 
-    // Deduplicate
+    // Deduplicate mints
     if (this.seenMints.has(mint)) return;
     this.seenMints.add(mint);
-
-    // Trim seen mints set to avoid memory leak
     if (this.seenMints.size > 500) {
-      const first = this.seenMints.values().next().value;
-      this.seenMints.delete(first);
+      this.seenMints.delete(this.seenMints.values().next().value);
     }
 
-    logger.info(`[LISTENER] ✅ New token: ${mint} | Sig: ${signature?.slice(0, 20)}...`);
+    const ageMs = Date.now() - detectedAt;
+    logger.info(`[LISTENER] ✅ Mint: ${mint} | Latency: ${ageMs}ms`);
 
-    this.onNewToken(mint, detectedAt).catch(err => {
+    try {
+      await this.onNewToken(mint, detectedAt);
+    } catch (err) {
       logger.error(`[LISTENER] onNewToken error: ${err.message}`);
-    });
+    }
   }
 }
 
 /**
- * Extract mint address from the full transaction notification.
- * Tries multiple fields in order of reliability.
+ * Resolve mint using Helius Enhanced Transactions API
+ * GET https://api.helius.xyz/v0/transactions?api-key=KEY
+ * Body: { transactions: [signature] }
+ *
+ * This returns a fully parsed transaction object with tokenTransfers,
+ * accountData, etc. — much easier to extract mint from than raw RPC.
  */
-function extractMint(tx) {
-  // Method 1: postTokenBalances — most reliable, direct mint field
-  const postBals = tx.meta?.postTokenBalances || [];
-  for (const bal of postBals) {
-    if (isGoodMint(bal.mint)) return bal.mint;
-  }
+async function resolveMint(signature) {
+  const delays = [600, 1200, 2500, 5000];
 
-  // Method 2: preTokenBalances
-  const preBals = tx.meta?.preTokenBalances || [];
-  for (const bal of preBals) {
-    if (isGoodMint(bal.mint)) return bal.mint;
-  }
+  for (let i = 0; i < delays.length; i++) {
+    await sleep(delays[i]);
 
-  // Method 3: parsed inner instructions — look for initializeMint
-  const innerIxGroups = tx.meta?.innerInstructions || [];
-  for (const group of innerIxGroups) {
-    for (const ix of (group.instructions || [])) {
-      const parsed = ix.parsed;
-      if (
-        parsed?.type === 'initializeMint' ||
-        parsed?.type === 'initializeMint2' ||
-        parsed?.type === 'initializeMint3'
-      ) {
-        if (isGoodMint(parsed?.info?.mint)) return parsed.info.mint;
+    try {
+      // Helius Enhanced Transactions API
+      const response = await axios.post(
+        `https://api.helius.xyz/v0/transactions/?api-key=${config.HELIUS_API_KEY}`,
+        { transactions: [signature] },
+        { timeout: 8000 }
+      );
+
+      const txList = response.data;
+      if (!Array.isArray(txList) || txList.length === 0) {
+        logger.debug(`[LISTENER] No tx data yet (attempt ${i + 1})`);
+        continue;
       }
-    }
-  }
 
-  // Method 4: account keys — pump.fun create layout has mint at index 1
-  const accountKeys = tx.transaction?.message?.accountKeys || [];
-  for (let i = 1; i <= 4; i++) {
-    const acct = accountKeys[i];
-    const addr = typeof acct === 'string' ? acct : acct?.pubkey;
-    if (isGoodMint(addr)) return addr;
+      const tx = txList[0];
+      if (!tx) continue;
+
+      // Method 1: tokenTransfers — cleanest field, has mint directly
+      const transfers = tx.tokenTransfers || [];
+      for (const t of transfers) {
+        if (isGoodMint(t.mint)) return t.mint;
+      }
+
+      // Method 2: accountData with tokenBalanceChanges
+      const accountData = tx.accountData || [];
+      for (const acct of accountData) {
+        for (const change of (acct.tokenBalanceChanges || [])) {
+          if (isGoodMint(change.mint)) return change.mint;
+        }
+      }
+
+      // Method 3: nativeTransfers won't have mint, but instructions might
+      const ixs = tx.instructions || [];
+      for (const ix of ixs) {
+        for (const inner of (ix.innerInstructions || [])) {
+          if (inner.parsed?.type?.includes('initializeMint')) {
+            const mint = inner.parsed?.info?.mint;
+            if (isGoodMint(mint)) return mint;
+          }
+          // accounts array on inner instructions
+          const accts = inner.accounts || [];
+          for (const addr of accts) {
+            if (isGoodMint(addr)) return addr;
+          }
+        }
+      }
+
+      logger.debug(`[LISTENER] TX parsed but mint not found (attempt ${i + 1}), tx type: ${tx.type}`);
+
+    } catch (err) {
+      logger.debug(`[LISTENER] Resolve attempt ${i + 1} error: ${err.message}`);
+    }
   }
 
   return null;
@@ -201,6 +227,10 @@ function isGoodMint(addr) {
   if (addr.length < 32 || addr.length > 44) return false;
   if (SKIP_ADDRESSES.has(addr)) return false;
   return true;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 module.exports = PumpListener;
