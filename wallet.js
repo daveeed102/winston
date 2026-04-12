@@ -1,6 +1,8 @@
 /**
  * Wallet loader
- * Loads keypair from WALLET_PRIVATE_KEY env var (byte array format)
+ * Accepts WALLET_PRIVATE_KEY in two formats:
+ *   - Raw base58 string (what Phantom exports directly)
+ *   - JSON byte array [1,2,3,...] (old format)
  */
 
 const { Keypair } = require('@solana/web3.js');
@@ -12,11 +14,23 @@ let _keypair = null;
 function getKeypair() {
   if (_keypair) return _keypair;
 
+  const raw = config.WALLET_PRIVATE_KEY.trim();
+
   try {
-    const raw = JSON.parse(config.WALLET_PRIVATE_KEY);
-    _keypair = Keypair.fromSecretKey(Uint8Array.from(raw));
+    if (raw.startsWith('[')) {
+      // Format: JSON byte array [1,2,3,...]
+      const bytes = JSON.parse(raw);
+      _keypair = Keypair.fromSecretKey(Uint8Array.from(bytes));
+    } else {
+      // Format: raw base58 string directly from Phantom/Solflare
+      const bs58 = require('bs58');
+      const bytes = bs58.decode(raw);
+      _keypair = Keypair.fromSecretKey(bytes);
+    }
+
     logger.info(`[WALLET] Loaded wallet: ${_keypair.publicKey.toBase58()}`);
     return _keypair;
+
   } catch (err) {
     throw new Error(`Failed to load wallet keypair: ${err.message}. Check WALLET_PRIVATE_KEY in .env`);
   }
