@@ -1,26 +1,31 @@
 /**
- * Pump.fun Launch Listener - v4
+ * Pump.fun Launch Listener - v5
  *
- * Uses Helius programSubscribe to watch the Pump.fun program for
- * new accounts being created. When a new bonding curve account is
- * created, the mint address is embedded directly in the account data
- * at a known offset — no secondary RPC call needed at all.
- *
- * Pump.fun program:      6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
- * Bonding curve layout:  [discriminator 8 bytes][mint pubkey 32 bytes]...
- *
- * Alternative approach used here for maximum reliability:
- * Subscribe to logs, store the FULL signature, then use
- * Helius getTransaction with retries (waiting for confirmation).
- * We keep the full sig in memory, not the truncated display version.
+ * Detection: logsSubscribe on Pump.fun program ID
+ * Mint resolution: Helius getParsedTransaction REST API
+ * (more reliable than WS getTransaction for brand new txs)
  */
 
 const WebSocket = require('ws');
-const { Connection, PublicKey } = require('@solana/web3.js');
+const axios = require('axios');
 const config = require('./config');
 const logger = require('./logger');
 
 const PUMP_PROGRAM_ID = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
+
+// System/program addresses to exclude when scanning for the mint
+const SKIP_ADDRESSES = new Set([
+  '11111111111111111111111111111111',
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+  'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bmd',
+  'So11111111111111111111111111111111111111112',
+  'SysvarRent111111111111111111111111111111111',
+  'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s',
+  '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+  'Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1',
+  'SysvarC1ock11111111111111111111111111111111',
+  'ComputeBudget111111111111111111111111111111',
+]);
 
 class PumpListener {
   constructor(onNewToken) {
@@ -30,7 +35,6 @@ class PumpListener {
     this.maxReconnectDelay = 30000;
     this.running = false;
     this.pendingSigs = new Set();
-    this.connection = new Connection(config.HELIUS_RPC_URL, 'confirmed');
   }
 
   start() {
@@ -48,10 +52,8 @@ class PumpListener {
     this.ws = new WebSocket(config.HELIUS_WS_URL);
 
     this.ws.on('open', () => {
-      logger.info('[LISTENER] Connected. Subscribing to Pump.fun program...');
+      logger.info('[LISTENER] Connected. Subscribing to Pump.fun logs...');
       this.reconnectDelay = 1000;
-
-      // Subscribe to logs — we get the FULL signature in the notification
       this.ws.send(JSON.stringify({
         jsonrpc: '2.0',
         id: 1,
@@ -63,15 +65,13 @@ class PumpListener {
       }));
     });
 
-    this.ws.on('message', async (data) => {
+    this.ws.on('message', (data) => {
       try {
         const msg = JSON.parse(data.toString());
-
         if (msg.id === 1 && msg.result !== undefined) {
           logger.info(`[LISTENER] Subscribed (sub ID: ${msg.result})`);
           return;
         }
-
         if (msg.method === 'logsNotification') {
           this.handleLog(msg.params?.result);
         }
@@ -80,9 +80,7 @@ class PumpListener {
       }
     });
 
-    this.ws.on('error', (err) => {
-      logger.error(`[LISTENER] WS error: ${err.message}`);
-    });
+    this.ws.on('error', (err) => logger.error(`[LISTENER] WS error: ${err.message}`));
 
     this.ws.on('close', () => {
       logger.warn('[LISTENER] WS closed');
@@ -101,9 +99,10 @@ class PumpListener {
     if (value.err) return;
 
     const logs = value.logs || [];
-    const signature = value.signature; // This is the FULL signature from Helius
+    const signature = value.signature;
 
-    if (!signature || signature.length < 80) return; // sanity check it's a real sig
+    // Must be full length sig (88 chars), not truncated
+    if (!signature || signature.length < 80) return;
 
     const isCreate = logs.some(log =>
       log.includes('Instruction: Create') ||
@@ -116,14 +115,13 @@ class PumpListener {
     const detectedAt = Date.now();
     logger.info(`[LISTENER] Create detected: ${signature.slice(0, 24)}...`);
 
-    // Resolve asynchronously — don't block the WS message handler
     this.resolveAndBuy(signature, detectedAt).finally(() => {
       this.pendingSigs.delete(signature);
     });
   }
 
   async resolveAndBuy(signature, detectedAt) {
-    const mint = await getMintFromTransaction(this.connection, signature);
+    const mint = await resolveMintViaHelius(signature);
 
     if (!mint) {
       logger.warn(`[LISTENER] Could not resolve mint for ${signature.slice(0, 24)}`);
@@ -142,101 +140,82 @@ class PumpListener {
 }
 
 /**
- * Fetch the transaction and extract the mint from account keys.
- * Retries with escalating delays to handle propagation lag.
- *
- * On Pump.fun create transactions the account layout is:
- * [0] = feePayerWallet / signer
- * [1] = mint (the new token) ← this is what we want
- * [2] = bondingCurve
- * [3] = associatedBondingCurve
- * [4] = global config
- * [5] = mplTokenMetadata program
- * ... etc
+ * Use Helius REST API to get the parsed transaction.
+ * Retries with escalating delays — tx needs to confirm first.
+ * Extracts mint from postTokenBalances (most reliable field).
  */
-async function getMintFromTransaction(connection, signature) {
-  const delays = [500, 1000, 2000, 4000, 6000];
+async function resolveMintViaHelius(signature) {
+  const url = `${config.HELIUS_RPC_URL}`;
+  const delays = [800, 1500, 3000, 5000];
 
   for (let i = 0; i < delays.length; i++) {
     await sleep(delays[i]);
 
     try {
-      const tx = await connection.getTransaction(signature, {
-        maxSupportedTransactionVersion: 0,
-        commitment: 'confirmed',
-      });
+      const response = await axios.post(url, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'getParsedTransaction',
+        params: [
+          signature,
+          {
+            encoding: 'jsonParsed',
+            maxSupportedTransactionVersion: 0,
+            commitment: 'confirmed',
+          },
+        ],
+      }, { timeout: 8000 });
 
+      const tx = response.data?.result;
       if (!tx) {
-        logger.debug(`[LISTENER] TX not found yet (attempt ${i + 1})`);
+        logger.debug(`[LISTENER] TX not ready yet (attempt ${i + 1})`);
         continue;
       }
 
-      // Get account keys from the transaction message
-      let accounts;
-      try {
-        // Versioned transactions (V0)
-        const msg = tx.transaction.message;
-        if (msg.getAccountKeys) {
-          accounts = msg.getAccountKeys().staticAccountKeys;
-        } else {
-          accounts = msg.accountKeys;
-        }
-      } catch {
-        accounts = tx.transaction.message.accountKeys;
-      }
-
-      if (!accounts || accounts.length < 2) {
-        logger.debug(`[LISTENER] Not enough accounts in TX`);
-        continue;
-      }
-
-      // Index 1 = mint on Pump.fun creates
-      const mintAccount = accounts[1];
-      const mintAddress = mintAccount?.toBase58
-        ? mintAccount.toBase58()
-        : mintAccount?.toString?.()
-        ?? mintAccount;
-
-      if (mintAddress && isValidSolanaAddress(mintAddress) && !isSystemAddress(mintAddress)) {
-        return mintAddress;
-      }
-
-      // Fallback: scan token balances for a mint that changed
-      const postBalances = tx.meta?.postTokenBalances || [];
-      for (const bal of postBalances) {
-        if (bal.mint && isValidSolanaAddress(bal.mint) && !isSystemAddress(bal.mint)) {
+      // Method 1: postTokenBalances — most reliable
+      const postBals = tx.meta?.postTokenBalances || [];
+      for (const bal of postBals) {
+        if (bal.mint && !SKIP_ADDRESSES.has(bal.mint) && bal.mint.length >= 32) {
+          logger.debug(`[LISTENER] Mint from postTokenBalances: ${bal.mint}`);
           return bal.mint;
         }
       }
 
-      logger.debug(`[LISTENER] Could not find valid mint in TX accounts`);
+      // Method 2: parsed account keys — look for newly initialized mint
+      const accounts = tx.transaction?.message?.accountKeys || [];
+      // On pump.fun creates, index 1 is the mint
+      for (let idx = 1; idx <= 3; idx++) {
+        const acct = accounts[idx];
+        const addr = acct?.pubkey || acct;
+        if (addr && typeof addr === 'string' && !SKIP_ADDRESSES.has(addr) && addr.length >= 32) {
+          logger.debug(`[LISTENER] Mint from accountKeys[${idx}]: ${addr}`);
+          return addr;
+        }
+      }
+
+      // Method 3: innerInstructions — look for initializeMint
+      const innerIxs = tx.meta?.innerInstructions || [];
+      for (const group of innerIxs) {
+        for (const ix of (group.instructions || [])) {
+          if (ix.parsed?.type === 'initializeMint' || ix.parsed?.type === 'initializeMint2') {
+            const mint = ix.parsed?.info?.mint;
+            if (mint && !SKIP_ADDRESSES.has(mint)) {
+              logger.debug(`[LISTENER] Mint from initializeMint instruction: ${mint}`);
+              return mint;
+            }
+          }
+        }
+      }
+
+      logger.debug(`[LISTENER] TX found but no mint extracted (attempt ${i + 1})`);
       return null;
 
     } catch (err) {
-      logger.debug(`[LISTENER] getTransaction attempt ${i + 1} error: ${err.message}`);
+      logger.debug(`[LISTENER] Attempt ${i + 1} error: ${err.message}`);
     }
   }
 
   return null;
-}
-
-function isValidSolanaAddress(addr) {
-  if (typeof addr !== 'string') return false;
-  return addr.length >= 32 && addr.length <= 44;
-}
-
-function isSystemAddress(addr) {
-  const system = new Set([
-    '11111111111111111111111111111111',
-    'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
-    'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bmd',
-    'So11111111111111111111111111111111111111112',
-    'SysvarRent111111111111111111111111111111111',
-    'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s',
-    '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
-    'Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1',
-  ]);
-  return system.has(addr);
 }
 
 function sleep(ms) {
