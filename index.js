@@ -89,11 +89,17 @@ async function onNewToken(mint, detectedAt) {
 
   logger.info(`[SNIPER] New token: ${mint} | Age: ${ageSec.toFixed(2)}s`);
 
+  // ── PUMP.FUN MINT VALIDATION ──
+  // Every Pump.fun token mint ends in 'pump' - hard reject anything else
+  if (!mint.endsWith('pump')) {
+    logger.info(`[SNIPER] Skipping ${mint} - not a Pump.fun token (doesn't end in 'pump')`);
+    return;
+  }
+
   // ── FRESHNESS CHECK ──
   // Only buy tokens that JUST launched - skip stale ones
   if (ageSec > config.MAX_TOKEN_AGE_SECONDS) {
     logger.info(`[SNIPER] Skipping ${mint} - too old (${ageSec.toFixed(1)}s > ${config.MAX_TOKEN_AGE_SECONDS}s)`);
-    // Don't spam Discord for every skip - too noisy
     return;
   }
 
@@ -119,9 +125,58 @@ async function onNewToken(mint, detectedAt) {
     return;
   }
 
+  // ── GREEN CHECK ──
+  // Only buy if the token is already moving up
+  const isGreen = await checkTokenIsGreen(mint);
+  if (!isGreen) {
+    logger.info(`[SNIPER] Skipping ${mint} - not green (flat or red)`);
+    return;
+  }
+
   // ── FIRE THE BUY ──
   logger.info(`[SNIPER] 🚀 Buying ${mint} | ${ageSec.toFixed(2)}s old | ${positions.count() + 1}/${config.MAX_POSITIONS} slots`);
   await executeBuy(mint);
+}
+
+/**
+ * Check if a token is green (price moving up) before buying.
+ * Takes two price samples 1.5 seconds apart.
+ * Returns true only if price2 > price1 (upward momentum).
+ * Uses a small test amount to get a quote price.
+ */
+async function checkTokenIsGreen(mint) {
+  // Use a tiny amount just to get a price quote — not an actual trade
+  const TEST_LAMPORTS = 1_000_000; // 0.001 SOL worth, just for pricing
+
+  try {
+    // Sample 1
+    const price1 = await jupiter.getTokenValueInSol(mint, TEST_LAMPORTS);
+
+    if (price1 <= 0) {
+      // No liquidity yet at all — skip
+      logger.info(`[GREEN CHECK] ${mint.slice(0,8)}... no liquidity yet`);
+      return false;
+    }
+
+    // Wait 1.5 seconds then sample again
+    await sleep(1500);
+
+    const price2 = await jupiter.getTokenValueInSol(mint, TEST_LAMPORTS);
+
+    if (price2 <= 0) return false;
+
+    const changePct = ((price2 - price1) / price1) * 100;
+    const isGreen = price2 > price1;
+
+    logger.info(`[GREEN CHECK] ${mint.slice(0,8)}... | P1: ${price1.toFixed(8)} | P2: ${price2.toFixed(8)} | ${changePct >= 0 ? '+' : ''}${changePct.toFixed(2)}% | ${isGreen ? '🟢 GREEN' : '🔴 RED/FLAT'}`);
+
+    return isGreen;
+
+  } catch (err) {
+    logger.debug(`[GREEN CHECK] Error for ${mint}: ${err.message}`);
+    // On error, skip — don't buy blind
+    return false;
+  }
 }
 
 /**
@@ -161,6 +216,10 @@ async function executeBuy(mint) {
 
   // Start exit monitoring (20x check + 30s timer)
   exitMgr.monitor(mint);
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function shutdown(listener) {
