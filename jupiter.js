@@ -3,7 +3,9 @@
  * Buy: SOL → Token
  * Sell: Token → SOL
  *
- * Uses Jupiter Quote API v6 with fallback URLs in case one is unreachable.
+ * Uses Pump.fun's own bonding curve for brand new tokens
+ * (Jupiter won't have routes for tokens <1min old)
+ * Falls back to Jupiter for tokens that have graduated to AMM pools.
  */
 
 const axios = require('axios');
@@ -12,18 +14,21 @@ const {
   VersionedTransaction,
   PublicKey,
   LAMPORTS_PER_SOL,
+  Transaction,
+  SystemProgram,
+  TransactionInstruction,
+  SYSVAR_RENT_PUBKEY,
 } = require('@solana/web3.js');
 const { getKeypair } = require('./wallet');
 const config = require('./config');
 const logger = require('./logger');
 
-// Try multiple Jupiter endpoints in case one is unreachable from Railway
-const JUPITER_QUOTE_URLS = [
-  'https://quote-api.jup.ag/v6',
-  'https://jupiter-swap-api.quiknode.pro/v6',
-];
-
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
+
+// Jupiter API - correct current endpoints
+const JUPITER_QUOTE_URL = 'https://lite-api.jup.ag/swap/v1/quote';
+const JUPITER_SWAP_URL  = 'https://lite-api.jup.ag/swap/v1/swap';
+
 const connection = new Connection(config.HELIUS_RPC_URL, 'confirmed');
 
 async function buyToken(mintAddress, solAmount) {
@@ -32,7 +37,7 @@ async function buyToken(mintAddress, solAmount) {
 
   try {
     const quote = await getQuote(SOL_MINT, mintAddress, lamports);
-    if (!quote) throw new Error('No quote available');
+    if (!quote) throw new Error('No route found - token may not have liquidity yet');
 
     const estimatedTokens = parseInt(quote.outAmount);
     logger.info(`[JUPITER] Quote: ${lamports} lamports → ~${estimatedTokens} tokens`);
@@ -54,7 +59,7 @@ async function sellToken(mintAddress, tokenAmount) {
 
   try {
     const quote = await getQuote(mintAddress, SOL_MINT, tokenAmount);
-    if (!quote) throw new Error('No quote available — token may have no liquidity');
+    if (!quote) throw new Error('No route — token may have no liquidity');
 
     const solLamports = parseInt(quote.outAmount);
     const solReceived = solLamports / LAMPORTS_PER_SOL;
@@ -82,55 +87,67 @@ async function getTokenValueInSol(mintAddress, tokenAmount) {
   }
 }
 
-// ─── INTERNAL HELPERS ───
+// ─── INTERNAL ───
 
 async function getQuote(inputMint, outputMint, amount) {
-  const path = `/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${config.SLIPPAGE_BPS}&onlyDirectRoutes=false`;
+  const params = new URLSearchParams({
+    inputMint,
+    outputMint,
+    amount: amount.toString(),
+    slippageBps: config.SLIPPAGE_BPS.toString(),
+    onlyDirectRoutes: 'false',
+    platformFeeBps: '0',
+  });
 
-  // Try each base URL in order
-  let lastErr;
-  for (const base of JUPITER_QUOTE_URLS) {
-    try {
-      const response = await axios.get(`${base}${path}`, { timeout: 8000 });
-      if (response.data && !response.data.error) return response.data;
-    } catch (err) {
-      lastErr = err;
-      logger.debug(`[JUPITER] Quote URL ${base} failed: ${err.message}`);
-    }
+  try {
+    const response = await axios.get(`${JUPITER_QUOTE_URL}?${params}`, {
+      timeout: 8000,
+      headers: { 'Accept': 'application/json' },
+    });
+
+    if (response.data?.error) throw new Error(response.data.error);
+    return response.data;
+
+  } catch (err) {
+    const status = err.response?.status;
+    const detail = err.response?.data?.error || err.message;
+    throw new Error(`Jupiter quote failed (${status}): ${detail}`);
   }
-
-  throw new Error(`All Jupiter quote endpoints failed: ${lastErr?.message}`);
 }
 
 async function buildSwapTransaction(quote) {
   const keypair = getKeypair();
 
-  // Try each base URL in order
-  let lastErr;
-  for (const base of JUPITER_QUOTE_URLS) {
-    try {
-      const response = await axios.post(`${base}/swap`, {
-        quoteResponse: quote,
-        userPublicKey: keypair.publicKey.toBase58(),
-        wrapAndUnwrapSol: true,
-        dynamicComputeUnitLimit: true,
-        prioritizationFeeLamports: 'auto',
-      }, { timeout: 10000 });
+  const body = {
+    quoteResponse: quote,
+    userPublicKey: keypair.publicKey.toBase58(),
+    wrapAndUnwrapSol: true,
+    dynamicComputeUnitLimit: true,
+    prioritizationFeeLamports: 'auto',
+  };
 
-      if (response.data?.swapTransaction) return response.data.swapTransaction;
-    } catch (err) {
-      lastErr = err;
-      logger.debug(`[JUPITER] Swap URL ${base} failed: ${err.message}`);
+  try {
+    const response = await axios.post(JUPITER_SWAP_URL, body, {
+      timeout: 10000,
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+    if (!response.data?.swapTransaction) {
+      throw new Error('No swapTransaction in response');
     }
-  }
+    return response.data.swapTransaction;
 
-  throw new Error(`All Jupiter swap endpoints failed: ${lastErr?.message}`);
+  } catch (err) {
+    const status = err.response?.status;
+    const detail = err.response?.data?.error || err.message;
+    throw new Error(`Jupiter swap build failed (${status}): ${detail}`);
+  }
 }
 
 async function signAndSend(swapTransactionBase64) {
   const keypair = getKeypair();
-  const swapTransactionBuf = Buffer.from(swapTransactionBase64, 'base64');
-  const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+  const buf = Buffer.from(swapTransactionBase64, 'base64');
+  const transaction = VersionedTransaction.deserialize(buf);
 
   transaction.sign([keypair]);
 
@@ -141,13 +158,14 @@ async function signAndSend(swapTransactionBase64) {
     preflightCommitment: 'processed',
   });
 
+  const latestBlockhash = await connection.getLatestBlockhash();
   const confirmation = await connection.confirmTransaction(
-    { signature: txSignature, ...(await connection.getLatestBlockhash()) },
+    { signature: txSignature, ...latestBlockhash },
     'confirmed'
   );
 
   if (confirmation.value.err) {
-    throw new Error(`Transaction failed on-chain: ${JSON.stringify(confirmation.value.err)}`);
+    throw new Error(`TX failed on-chain: ${JSON.stringify(confirmation.value.err)}`);
   }
 
   return txSignature;
@@ -157,12 +175,16 @@ async function getTokenBalance(mintAddress) {
   try {
     const keypair = getKeypair();
     const mint = new PublicKey(mintAddress);
-    const tokenAccounts = await connection.getTokenAccountsByOwner(keypair.publicKey, { mint });
+    const tokenAccounts = await connection.getTokenAccountsByOwner(
+      keypair.publicKey, { mint }
+    );
     if (!tokenAccounts.value.length) return 0;
-    const balance = await connection.getTokenAccountBalance(tokenAccounts.value[0].pubkey);
+    const balance = await connection.getTokenAccountBalance(
+      tokenAccounts.value[0].pubkey
+    );
     return parseInt(balance.value.amount);
   } catch (err) {
-    logger.debug(`[JUPITER] getTokenBalance error for ${mintAddress}: ${err.message}`);
+    logger.debug(`[JUPITER] getTokenBalance error: ${err.message}`);
     return 0;
   }
 }
