@@ -1,24 +1,24 @@
 // ============================================================
-// WINSTON v17 — Copy Trade Bot (Grok-reviewed)
+// WINSTON v20.1 — Pre-emptive Timer Exit Bot
 // ⚠️  HIGH RISK — for educational/personal use only
 // ============================================================
-// Changes from v16 (per Grok review):
-//   1. Max hold bumped to 45 minutes (was 10 min)
-//   2. Emergency sell is now HIGHEST priority — checked before
-//      TP/SL in the exit loop (not just in poll)
-//   3. Tiered exits:
-//        - 50% sold at +100% (2x) — locks profit fast
-//        - Remaining 50% sold at +175% (2.75x) — let it run
-//        - Moon bag trail: if peak hit +100%, trailing SL at -25%
-//   4. Min buy signal lowered to 0.5 SOL (was 1.0)
+// Tuned specifically for CP7eVtQYsw...FbpV22s5w1
 //
-// Exit priority order:
-//   1. He sells         → emergency sell 100% instantly
-//   2. Tier 1 TP +100%  → sell 50%
-//   3. Tier 2 TP +175%  → sell remaining 50%
-//   4. Trailing SL      → if peak ≥ +100%, floor at -25% from peak
-//   5. Hard SL -45%     → full exit if never hit TP1
-//   6. Max hold 45min   → safety net fallback
+// CORE INSIGHT: He IS the price movement. When he sells,
+// the dump is instant. Waiting for his sell signal = too late.
+//
+// Strategy: EXIT AT 6 MINUTES FLAT — before he sells.
+// His median hold is 8-10min. At 6min the pump is still live.
+// We don't need his sell signal. We just need to leave first.
+//
+// Exit priority:
+//   1. SL at -20%      → bail early if it's a rug/bad token
+//   2. Hard exit 6min  → out before he dumps, no exceptions
+//
+// Math per trade (0.065 SOL / ~$10):
+//   Win  (exit at +15%): +0.0098 SOL profit after fees
+//   Loss (SL at -20%):   -0.013  SOL loss after fees
+//   Need ~57% win rate to profit — realistic for his style
 // ============================================================
 
 require('dotenv').config();
@@ -29,7 +29,8 @@ const fetch = require('node-fetch');
 // ── CONFIG ───────────────────────────────────────────────────
 const CONFIG = {
   HELIUS_API_KEY:  process.env.HELIUS_API_KEY  || '',
-  PRIVATE_KEY:     process.env.WALLET_PRIVATE_KEY || process.env.PRIVATE_KEY || '',
+  PRIVATE_KEY_1:   process.env.WALLET_PRIVATE_KEY || process.env.PRIVATE_KEY || '',
+  PRIVATE_KEY_2:   process.env.WALLET_PRIVATE_KEY_2 || '',
   DISCORD_WEBHOOK: process.env.DISCORD_WEBHOOK_URL || process.env.DISCORD_WEBHOOK || '',
 
   get HELIUS_RPC() { return `https://mainnet.helius-rpc.com/?api-key=${this.HELIUS_API_KEY}`; },
@@ -38,48 +39,47 @@ const CONFIG = {
   JUPITER_QUOTE: 'https://lite-api.jup.ag/swap/v1/quote',
   JUPITER_SWAP:  'https://lite-api.jup.ag/swap/v1/swap',
 
-  // ── Target wallet ────────────────────────────────────────
+  // ── Target ───────────────────────────────────────────────
   TARGET: 'CP7eVtQYsweR7vAjSvW2shgA1weszsVmxDFbpV22s5w1',
 
-  // ── Entry filter (lowered to 0.5 SOL per Grok) ──────────
-  MIN_BUY_SOL_SIGNAL: 0.5,
+  // ── Only copy trades where whale spends >= 2 SOL ────────
+  // Data shows: every fast exit (<6min) was a sub-2 SOL buy.
+  // Above 2 SOL his median hold is 12+ min — our timer wins.
+  MIN_BUY_SOL_SIGNAL: 2.0,
 
-  // ── Scaled sizing ($5–$10 by conviction) ─────────────────
+  // ── Scaled sizing ($8-$12 based on his conviction) ───────
+  // Whale spends 2-4 SOL   -> we bet 0.096 SOL (~$8)
+  // Whale spends 4-8 SOL   -> we bet 0.120 SOL (~$10)
+  // Whale spends 8+ SOL    -> we bet 0.140 SOL (~$12)
   BUY_TIERS: [
-    { maxWhaleSol: 2.0,      ourSol: 0.033 }, // ~$5
-    { maxWhaleSol: 4.0,      ourSol: 0.046 }, // ~$7
-    { maxWhaleSol: Infinity, ourSol: 0.065 }, // ~$10
+    { maxWhaleSol: 4.0,      ourSol: 0.096 }, // ~$8
+    { maxWhaleSol: 8.0,      ourSol: 0.120 }, // ~$10
+    { maxWhaleSol: Infinity, ourSol: 0.140 }, // ~$12
   ],
-  BUY_SOL: 0.065, // fallback
+  BUY_SOL: 0.096,
 
-  // ── Tiered TP exits ──────────────────────────────────────
-  TP1_PCT:      100,  // sell 50% at +100% (2x)
-  TP1_SELL_PCT:  50,  // how much to sell at TP1
-  TP2_PCT:      175,  // sell remaining 50% at +175% (2.75x)
+  // ── Exit strategy — PRE-EMPTIVE TIMER ───────────────────
+  // We exit at 6 minutes BEFORE he sells, not after.
+  // His median hold is 8-10min — at 6min price still elevated.
+  // SL at -20% catches rugs/bad tokens early.
+  // NO TP — we just ride the 6 minutes and get out flat.
+  TP_PCT:           35,   // cash immediately if up 35% — don't be greedy
+  SL_PCT:          -20,   // bail early on bad tokens
+  EXIT_SECONDS:    360,   // 6 minute hard exit — fallback if TP never hit
 
-  // ── Trailing stop (activates after TP1 hit) ──────────────
-  // Once peak ROI ≥ TP1, we never close below peak - TRAIL_DROP
-  TRAIL_DROP:    25,  // trail by 25% from peak (e.g. peak +120% → floor +95%)
-
-  // ── Hard stop loss (full exit, only if TP1 never hit) ────
-  SL_PCT:       -45,
-
-  // ── Max hold — 45 min safety net ─────────────────────────
-  MAX_HOLD_SECONDS: 2700,  // 45 minutes
-
-  EXIT_CHECK_MS: 800,
+  EXIT_CHECK_MS: 500,     // check every 500ms for precision
 
   // ── Speed fees ───────────────────────────────────────────
   BUY_PRIORITY_LAMPORTS:       3000000, // 0.003 SOL
   BUY_SLIPPAGE_BPS:            2000,    // 20%
   SELL_PRIORITY_LAMPORTS:      3000000, // 0.003 SOL
   SELL_SLIPPAGE_BPS:           2500,    // 25%
-  EMERGENCY_PRIORITY_LAMPORTS: 8000000, // 0.008 SOL — absolute max
+  EMERGENCY_PRIORITY_LAMPORTS: 8000000, // 0.008 SOL — max speed to beat him
   EMERGENCY_SLIPPAGE_BPS:      4000,    // 40%
 
-  MAX_RETRIES: 3,
+  MAX_RETRIES: 5,
   POLL_MS:     500,
-  HEALTH_MS:  30000,
+  HEALTH_MS:  20000,
   SOL_MINT:  'So11111111111111111111111111111111111111112',
 };
 
@@ -92,19 +92,21 @@ const IGNORE = new Set([
   'bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1',
 ]);
 
-// ── STATE ────────────────────────────────────────────────────
-const state = {
-  wallet:      null,
-  connection:  null,
-  isRunning:   false,
-  lastSig:     null,
-  // mint → { time, sol, sym, isSelling, tp1Hit, highestRoi, soldPct }
-  positions:   new Map(),
-  tradedMints: new Set(),
-  // Mints where whale sold — emergency exit queue
-  emergencyQueue: new Set(),
-  stats: { buys:0, sells:0, errors:0, retries:0, startBal:0 },
-};
+// ── WALLETS + STATE ──────────────────────────────────────────
+
+function makeWallet(label) {
+  return {
+    label,
+    keypair:        null,
+    positions:      new Map(), // mint → { time, sol, sym, isSelling, highestRoi }
+    tradedMints:    new Set(),
+    emergencyQueue: new Set(),
+    stats: { buys:0, sells:0, wins:0, losses:0, totalPnl:0, errors:0, retries:0, startBal:0 },
+  };
+}
+
+const wallets = [];
+const shared  = { connection:null, isRunning:false, lastSig:null };
 
 // ── UTILS ────────────────────────────────────────────────────
 
@@ -115,8 +117,8 @@ function log(lv, msg, d={}) {
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-async function solBal() {
-  try { return (await state.connection.getBalance(state.wallet.publicKey)) / 1e9; } catch(e) { return 0; }
+async function solBal(keypair) {
+  try { return (await shared.connection.getBalance(keypair.publicKey)) / 1e9; } catch(e) { return 0; }
 }
 
 async function tokenInfo(mint) {
@@ -196,7 +198,7 @@ async function confirm(sig, timeout=60000) {
   const start = Date.now();
   while(Date.now()-start < timeout) {
     try {
-      const r = await state.connection.getSignatureStatuses([sig]);
+      const r = await shared.connection.getSignatureStatuses([sig]);
       const v = r?.value?.[0];
       if(v?.err) return false;
       if(v?.confirmationStatus==='confirmed'||v?.confirmationStatus==='finalized') return true;
@@ -208,10 +210,10 @@ async function confirm(sig, timeout=60000) {
 
 // ── GET CURRENT ROI ──────────────────────────────────────────
 
-async function getCurrentRoi(mint, pos) {
+async function getCurrentRoi(mint, pos, keypair) {
   try {
-    const accts = await state.connection.getParsedTokenAccountsByOwner(
-      state.wallet.publicKey, { mint: new PublicKey(mint) }
+    const accts = await shared.connection.getParsedTokenAccountsByOwner(
+      keypair.publicKey, { mint: new PublicKey(mint) }
     );
     const acct = accts?.value?.[0];
     if(!acct) return null;
@@ -226,9 +228,7 @@ async function getCurrentRoi(mint, pos) {
     if(!q.outAmount) return null;
 
     const currentVal = parseFloat(q.outAmount) / 1e9;
-    // ROI based on remaining position (soldPct already accounted for in pos.sol)
-    const invested = pos.sol * (1 - (pos.soldPct||0) / 100);
-    return ((currentVal / invested) - 1) * 100;
+    return ((currentVal / pos.sol) - 1) * 100;
   } catch(e) { return null; }
 }
 
@@ -241,32 +241,29 @@ function scaleBuy(whaleSol) {
   return CONFIG.BUY_SOL;
 }
 
-// ── PARTIAL SELL ─────────────────────────────────────────────
-// Sells a percentage of remaining token balance
+// ── SELL ─────────────────────────────────────────────────────
 
-async function execPartialSell(mint, pct, reason, emergency=false, attempt=1) {
+async function execSell(w, mint, reason, emergency=false, attempt=1) {
   const info     = await tokenInfo(mint);
-  const pos      = state.positions.get(mint);
+  const pos      = w.positions.get(mint);
   if(!pos) return false;
 
   const slippage = emergency ? CONFIG.EMERGENCY_SLIPPAGE_BPS : CONFIG.SELL_SLIPPAGE_BPS;
   const priority = emergency ? CONFIG.EMERGENCY_PRIORITY_LAMPORTS : CONFIG.SELL_PRIORITY_LAMPORTS;
-  const tag      = emergency ? '🚨 EMERGENCY' : '🔴';
 
-  log('EXEC', `${tag} SELL ${pct}% ${info.sym} — ${reason} (attempt ${attempt})`, { mint: mint.slice(0,12) });
+  log('EXEC', `${emergency?'🚨':'🔴'} [${w.label}] SELL ${info.sym} — ${reason} (attempt ${attempt})`);
 
   try {
-    const accts = await state.connection.getParsedTokenAccountsByOwner(
-      state.wallet.publicKey, { mint: new PublicKey(mint) }
+    const accts = await shared.connection.getParsedTokenAccountsByOwner(
+      w.keypair.publicKey, { mint: new PublicKey(mint) }
     );
     const acct = accts?.value?.[0];
-    if(!acct) { state.positions.delete(mint); return false; }
+    if(!acct) { w.positions.delete(mint); return false; }
     const bal = parseFloat(acct.account.data.parsed.info.tokenAmount.uiAmount||0);
-    if(bal <= 0) { state.positions.delete(mint); return false; }
-    const dec    = acct.account.data.parsed.info.tokenAmount.decimals;
-    const sellAmt = bal * (pct / 100);
-    const raw    = BigInt(Math.floor(sellAmt * Math.pow(10, dec)));
-    if(raw <= 0n) { state.positions.delete(mint); return false; }
+    if(bal <= 0) { w.positions.delete(mint); return false; }
+    const dec = acct.account.data.parsed.info.tokenAmount.decimals;
+    const raw = BigInt(Math.floor(bal * Math.pow(10, dec)));
+    if(raw <= 0n) { w.positions.delete(mint); return false; }
 
     const qr = await fetch(`${CONFIG.JUPITER_QUOTE}?inputMint=${mint}&outputMint=${CONFIG.SOL_MINT}&amount=${raw.toString()}&slippageBps=${slippage}`);
     if(!qr.ok) throw new Error(`Sell quote ${qr.status}`);
@@ -277,7 +274,7 @@ async function execPartialSell(mint, pct, reason, emergency=false, attempt=1) {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         quoteResponse: q,
-        userPublicKey: state.wallet.publicKey.toString(),
+        userPublicKey: w.keypair.publicKey.toString(),
         wrapAndUnwrapSol: true,
         dynamicSlippage: { minBps: 50, maxBps: slippage },
         prioritizationFeeLamports: priority
@@ -289,64 +286,61 @@ async function execPartialSell(mint, pct, reason, emergency=false, attempt=1) {
 
     const buf = Buffer.from(sd.swapTransaction, 'base64');
     const tx  = VersionedTransaction.deserialize(buf);
-    tx.sign([state.wallet]);
-    const sig = await state.connection.sendRawTransaction(tx.serialize(), { skipPreflight:true, maxRetries:5 });
+    tx.sign([w.keypair]);
+    const sig = await shared.connection.sendRawTransaction(tx.serialize(), { skipPreflight:true, maxRetries:5 });
 
     if(await confirm(sig)) {
       const solBack  = parseFloat(q.outAmount) / 1e9;
-      const portion  = pos.sol * (pct / 100);
-      const pnl      = solBack - portion;
+      const pnl      = solBack - pos.sol;
       const pnlSign  = pnl >= 0 ? '+' : '';
       const pnlEmoji = pnl >= 0 ? '📈' : '📉';
-      const roiPct   = ((solBack / portion) - 1) * 100;
+      const roiPct   = ((solBack / pos.sol) - 1) * 100;
 
-      // Track sold percentage on position
-      pos.soldPct = (pos.soldPct||0) + pct;
-      state.stats.sells++;
+      // Track win/loss stats
+      if(pnl >= 0) w.stats.wins++; else w.stats.losses++;
+      w.stats.totalPnl += pnl;
+      w.stats.sells++;
+      w.positions.delete(mint);
 
-      // If fully sold, clean up
-      if(pos.soldPct >= 100) state.positions.delete(mint);
+      const winRate = w.stats.sells > 0 ? ((w.stats.wins/w.stats.sells)*100).toFixed(0) : '0';
 
-      log('SELL', `✅ ${info.sym} ${pct}% → ${solBack.toFixed(4)} SOL (${pnlSign}${pnl.toFixed(4)}) | ${reason}`);
+      log('SELL', `✅ [${w.label}] ${info.sym} → ${solBack.toFixed(4)} SOL (${pnlSign}${pnl.toFixed(4)}) | ${reason} | WR:${winRate}%`);
 
-      const label = emergency              ? '🚨 **EMERGENCY EXIT** (whale selling)'
-        : reason.startsWith('TP1')         ? '🎯 **TAKE PROFIT 1** (50% sold at 2x)'
-        : reason.startsWith('TP2')         ? '🎯🎯 **TAKE PROFIT 2** (final 50%)'
-        : reason.startsWith('TRAIL')       ? '📉 **TRAILING STOP**'
-        : reason.startsWith('SL')          ? '🛑 **STOP LOSS**'
-        : reason.startsWith('max_hold')    ? '⏱ **MAX HOLD EXIT**'
-        : '🔴 **SELL**';
+      const label = emergency              ? `🚨 **EMERGENCY** [${w.label}]`
+        : reason.startsWith('TP')          ? `🎯 **TAKE PROFIT** [${w.label}]`
+        : reason.startsWith('SL')          ? `🛑 **STOP LOSS** [${w.label}]`
+        : reason.startsWith('max_hold')    ? `⏱ **MAX HOLD** [${w.label}]`
+        : `🔴 **SELL** [${w.label}]`;
 
       await discord(
         `${label} \`${mint}\`\n` +
-        `💰  **${solBack.toFixed(4)} SOL** back  ·  ${pnlEmoji} **${pnlSign}${pnl.toFixed(4)} SOL** (${pnlSign}${roiPct.toFixed(1)}%)\n` +
-        `📊  Sold **${pct}%** of position  ·  Remaining: **${100 - pos.soldPct}%**\n` +
+        `💰  **${solBack.toFixed(4)} SOL** back  ·  ${pnlEmoji} **${pnlSign}${pnl.toFixed(4)} SOL** (**${pnlSign}${roiPct.toFixed(1)}%**)\n` +
+        `📊  Session: **${w.stats.wins}W/${w.stats.losses}L** (${winRate}% WR) · PnL: **${w.stats.totalPnl>=0?'+':''}${w.stats.totalPnl.toFixed(4)} SOL**\n` +
         `🔗  https://solscan.io/tx/${sig}`
       );
       return true;
     } else { throw new Error('Confirm timeout'); }
   } catch(e) {
-    log('ERROR', `Sell fail: ${e.message}`, { attempt, emergency });
+    log('ERROR', `[${w.label}] Sell fail: ${e.message}`, { attempt });
     if(attempt < CONFIG.MAX_RETRIES) {
-      state.stats.retries++;
-      await sleep(emergency ? 200 : 1000);
-      return execPartialSell(mint, pct, reason, emergency, attempt+1);
+      w.stats.retries++;
+      await sleep(emergency ? 200 : 800);
+      return execSell(w, mint, reason, emergency, attempt+1);
     }
-    state.stats.errors++;
-    if(pct >= 100) state.positions.delete(mint);
-    await discord(`❌ Sell FAILED: ${info.sym} \`${mint.slice(0,16)}\` — ${e.message}`);
+    w.stats.errors++;
+    w.positions.delete(mint);
+    await discord(`❌ [${w.label}] Sell FAILED: ${info.sym} \`${mint.slice(0,16)}\` — ${e.message}`);
     return false;
   }
 }
 
 // ── BUY ──────────────────────────────────────────────────────
 
-async function execBuy(mint, whaleSol, sol=CONFIG.BUY_SOL) {
-  state.tradedMints.add(mint);
+async function execBuy(w, mint, whaleSol, sol, attempt=1) {
   const info     = await tokenInfo(mint);
   const lamports = Math.floor(sol * 1e9);
 
-  log('EXEC', `🪞 BUY ${info.sym} ${sol.toFixed(4)} SOL (whale: ${whaleSol.toFixed(2)} SOL)`, { mint: mint.slice(0,12) });
+  log('EXEC', `🪞 [${w.label}] BUY ${info.sym} ${sol.toFixed(4)} SOL (whale: ${whaleSol.toFixed(2)})`, { mint: mint.slice(0,12) });
 
   try {
     const qr = await fetch(`${CONFIG.JUPITER_QUOTE}?inputMint=${CONFIG.SOL_MINT}&outputMint=${mint}&amount=${lamports}&slippageBps=${CONFIG.BUY_SLIPPAGE_BPS}`);
@@ -358,7 +352,7 @@ async function execBuy(mint, whaleSol, sol=CONFIG.BUY_SOL) {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         quoteResponse: q,
-        userPublicKey: state.wallet.publicKey.toString(),
+        userPublicKey: w.keypair.publicKey.toString(),
         wrapAndUnwrapSol: true,
         dynamicSlippage: { minBps: 50, maxBps: CONFIG.BUY_SLIPPAGE_BPS },
         prioritizationFeeLamports: CONFIG.BUY_PRIORITY_LAMPORTS
@@ -370,130 +364,94 @@ async function execBuy(mint, whaleSol, sol=CONFIG.BUY_SOL) {
 
     const buf = Buffer.from(sd.swapTransaction, 'base64');
     const tx  = VersionedTransaction.deserialize(buf);
-    tx.sign([state.wallet]);
-    const sig = await state.connection.sendRawTransaction(tx.serialize(), { skipPreflight:true, maxRetries:5 });
+    tx.sign([w.keypair]);
+    const sig = await shared.connection.sendRawTransaction(tx.serialize(), { skipPreflight:true, maxRetries:5 });
 
     if(await confirm(sig)) {
-      state.positions.set(mint, {
-        time:       Date.now(),
-        sol,
-        sym:        info.sym,
-        isSelling:  false,
-        soldPct:    0,       // % of position sold so far
-        tp1Hit:     false,   // has first TP fired?
-        highestRoi: -Infinity,
+      w.positions.set(mint, {
+        time: Date.now(), sol, sym: info.sym,
+        isSelling: false, highestRoi: -Infinity,
       });
-      state.stats.buys++;
-      log('BUY', `✅ ${info.sym} ${sol.toFixed(4)} SOL | TP1:+${CONFIG.TP1_PCT}% TP2:+${CONFIG.TP2_PCT}% SL:${CONFIG.SL_PCT}%`);
+      w.stats.buys++;
+      log('BUY', `✅ [${w.label}] ${info.sym} ${sol.toFixed(4)} SOL | Exit:${CONFIG.EXIT_SECONDS/60}min SL:${CONFIG.SL_PCT}%`);
       await discord(
-        `🪞  **COPY BUY** \`${mint}\`\n` +
+        `🪞  **COPY BUY** [${w.label}] \`${mint}\`\n` +
         `💸  **${sol.toFixed(4)} SOL** | Whale: **${whaleSol.toFixed(2)} SOL**\n` +
-        `🎯  TP1: **+${CONFIG.TP1_PCT}%** (50%) → TP2: **+${CONFIG.TP2_PCT}%** (50%)\n` +
-        `📉  Trail: **-${CONFIG.TRAIL_DROP}%** from peak after TP1 | SL: **${CONFIG.SL_PCT}%**\n` +
-        `⏱  Max hold: **${CONFIG.MAX_HOLD_SECONDS/60}min** | Emergency exit if he sells\n` +
+        `🎯  TP: **+${CONFIG.TP_PCT}%** early cash | 6min timer | SL: **${CONFIG.SL_PCT}%**\n` +
         `🔗  https://solscan.io/tx/${sig}`
       );
       return true;
     } else { throw new Error('Confirm timeout'); }
   } catch(e) {
-    state.stats.errors++;
-    log('ERROR', `Buy fail: ${e.message}`, { mint: mint.slice(0,12) });
-    await discord(`❌ Buy failed: ${info.sym} \`${mint.slice(0,16)}\` — ${e.message}`);
+    log('ERROR', `[${w.label}] Buy fail (attempt ${attempt}): ${e.message}`);
+    if(attempt < CONFIG.MAX_RETRIES) {
+      w.stats.retries++;
+      await sleep(800 * attempt);
+      return execBuy(w, mint, whaleSol, sol, attempt+1);
+    }
+    w.stats.errors++;
+    await discord(`❌ [${w.label}] Buy FAILED: ${info.sym} \`${mint.slice(0,16)}\` — ${e.message}`);
     return false;
   }
 }
 
 // ── EXIT MANAGER ─────────────────────────────────────────────
-// Priority: 1. Emergency (he sold) 2. TP1 3. TP2 4. Trail 5. SL 6. Max hold
+// Simple and fast — matches the wallet's scalper style
 
-async function exitManager() {
-  log('INFO', `🎯 Exit manager | TP1:+${CONFIG.TP1_PCT}% TP2:+${CONFIG.TP2_PCT}% SL:${CONFIG.SL_PCT}% Trail:-${CONFIG.TRAIL_DROP}% Max:${CONFIG.MAX_HOLD_SECONDS/60}min`);
+async function exitManager(w) {
+  log('INFO', `[${w.label}] ⏱ Exit | 6min timer + SL:${CONFIG.SL_PCT}%`);
 
-  while(state.isRunning) {
+  while(shared.isRunning) {
     await sleep(CONFIG.EXIT_CHECK_MS);
 
-    for(const [mint, pos] of state.positions) {
+    for(const [mint, pos] of w.positions) {
       if(pos.isSelling) continue;
-      if((pos.soldPct||0) >= 100) { state.positions.delete(mint); continue; }
 
       const ageSec = (Date.now() - pos.time) / 1000;
+      const ageMin = ageSec / 60;
+      const timeLeft = ((CONFIG.EXIT_SECONDS - ageSec)).toFixed(0);
 
-      // ── PRIORITY 1: Emergency queue (whale sold) ──────────
-      // This is checked FIRST every cycle, before any RPC calls
-      if(state.emergencyQueue.has(mint)) {
-        state.emergencyQueue.delete(mint);
+      // ── 1. HARD 6-MINUTE EXIT — primary strategy ─────────
+      // Exit before whale sells. No waiting for his signal.
+      if(ageSec >= CONFIG.EXIT_SECONDS) {
         pos.isSelling = true;
-        log('EMERGENCY', `🚨 EMERGENCY EXIT ${pos.sym} — whale sold`);
-        execPartialSell(mint, 100, 'emergency_whale_sold', true)
-          .catch(e => log('ERROR', `Emergency sell error: ${e.message}`));
+        log('EXIT', `[${w.label}] ⏱ 6MIN EXIT ${pos.sym} — selling before whale`);
+        execSell(w, mint, `6min_exit`, false)
+          .catch(e => log('ERROR', `[${w.label}] Timer exit: ${e.message}`));
         continue;
       }
 
-      // ── PRIORITY 6: Max hold (no RPC needed) ─────────────
-      if(ageSec >= CONFIG.MAX_HOLD_SECONDS) {
-        pos.isSelling = true;
-        log('EXIT', `⏱ MAX HOLD ${pos.sym} at ${(ageSec/60).toFixed(1)}min`);
-        execPartialSell(mint, 100, `max_hold_${(ageSec/60).toFixed(0)}min`, false)
-          .catch(e => log('ERROR', `Max-hold sell error: ${e.message}`));
-        await discord(`⏱  **MAX HOLD EXIT** \`${mint.slice(0,16)}...\`\n⏱  Held **${(ageSec/60).toFixed(1)} min**`);
-        continue;
-      }
-
-      // ── Get current ROI ───────────────────────────────────
-      const roi = await getCurrentRoi(mint, pos);
+      // ── 2. STOP LOSS -20% — catch rugs/bad tokens ────────
+      // Check ROI only for SL — no TP, we just ride the timer
+      const roi = await getCurrentRoi(mint, pos, w.keypair);
       if(roi === null) continue;
-
-      // Track peak
       if(roi > pos.highestRoi) pos.highestRoi = roi;
 
-      // Console display
+      // Console countdown
       const bar = roi >= 0
-        ? '█'.repeat(Math.min(Math.floor(roi/10), 20)) + '░'.repeat(Math.max(20-Math.floor(roi/10),0))
-        : '▓'.repeat(Math.min(Math.floor(Math.abs(roi)/5), 20));
-      const tp1flag = pos.tp1Hit ? ' [TP1✅]' : '';
-      console.log(`  [${pos.sym}] ${roi>=0?'+':''}${roi.toFixed(1)}% [${bar}] peak:${pos.highestRoi.toFixed(0)}% | ${ageSec.toFixed(0)}s${tp1flag}`);
+        ? '█'.repeat(Math.min(Math.floor(roi/2), 20)) + '░'.repeat(Math.max(20-Math.floor(roi/2),0))
+        : '▓'.repeat(Math.min(Math.floor(Math.abs(roi)/2), 20));
+      console.log(`  [${w.label}][${pos.sym}] ${roi>=0?'+':''}${roi.toFixed(1)}% [${bar}] peak:${pos.highestRoi.toFixed(0)}% | ${ageMin.toFixed(1)}min | exit in ${timeLeft}s | TP:+${CONFIG.TP_PCT}% SL:${CONFIG.SL_PCT}%`);
 
-      // ── PRIORITY 2: TP1 — sell 50% at +100% ──────────────
-      if(!pos.tp1Hit && roi >= CONFIG.TP1_PCT) {
-        pos.tp1Hit = true;
-        log('EXIT', `🎯 TP1 ${pos.sym} at +${roi.toFixed(1)}% — selling 50%`);
-        execPartialSell(mint, CONFIG.TP1_SELL_PCT, `TP1_+${roi.toFixed(0)}%`, false)
-          .catch(e => log('ERROR', `TP1 sell error: ${e.message}`));
-        await discord(`🎯  **TP1 HIT** \`${mint.slice(0,16)}...\`\n📊  **+${roi.toFixed(1)}%** — sold **50%**\n📈  Letting remaining 50% ride to **+${CONFIG.TP2_PCT}%** or trail`);
+      // ── TAKE PROFIT at +35% ──────────────────────────────
+      if(roi >= CONFIG.TP_PCT) {
+        pos.isSelling = true;
+        log('EXIT', `[${w.label}] 🎯 TAKE PROFIT ${pos.sym} at +${roi.toFixed(1)}% — cashing early`);
+        execSell(w, mint, `TP_+${roi.toFixed(0)}%`, false)
+          .catch(e => log('ERROR', `[${w.label}] TP: ${e.message}`));
+        await discord(`🎯  **TAKE PROFIT +${CONFIG.TP_PCT}%** [${w.label}] \`${mint.slice(0,16)}...\`
+📊  **+${roi.toFixed(1)}%** after **${ageMin.toFixed(1)}min** — cashed before 6min timer`);
         continue;
       }
 
-      // ── PRIORITY 3: TP2 — sell remaining 50% at +175% ────
-      if(pos.tp1Hit && (pos.soldPct||0) < 100 && roi >= CONFIG.TP2_PCT) {
+      // ── STOP LOSS at -20% ────────────────────────────────
+      if(roi <= CONFIG.SL_PCT) {
         pos.isSelling = true;
-        log('EXIT', `🎯🎯 TP2 ${pos.sym} at +${roi.toFixed(1)}% — selling remaining`);
-        execPartialSell(mint, 100, `TP2_+${roi.toFixed(0)}%`, false)
-          .catch(e => log('ERROR', `TP2 sell error: ${e.message}`));
-        await discord(`🎯🎯  **TP2 HIT** \`${mint.slice(0,16)}...\`\n📊  **+${roi.toFixed(1)}%** — selling final 50%`);
-        continue;
-      }
-
-      // ── PRIORITY 4: Trailing SL (only after TP1 hit) ─────
-      // Floor = peak ROI - TRAIL_DROP
-      if(pos.tp1Hit && pos.highestRoi >= CONFIG.TP1_PCT) {
-        const trailFloor = pos.highestRoi - CONFIG.TRAIL_DROP;
-        if(roi <= trailFloor) {
-          pos.isSelling = true;
-          log('EXIT', `📉 TRAIL STOP ${pos.sym} at ${roi.toFixed(1)}% (floor was ${trailFloor.toFixed(1)}%)`);
-          execPartialSell(mint, 100, `TRAIL_${roi.toFixed(0)}%_floor_${trailFloor.toFixed(0)}%`, false)
-            .catch(e => log('ERROR', `Trail sell error: ${e.message}`));
-          await discord(`📉  **TRAILING STOP** \`${mint.slice(0,16)}...\`\n📊  ROI **${roi.toFixed(1)}%** dropped below floor **${trailFloor.toFixed(1)}%**\n📈  Peak was **+${pos.highestRoi.toFixed(1)}%**`);
-          continue;
-        }
-      }
-
-      // ── PRIORITY 5: Hard SL (only if TP1 never hit) ──────
-      if(!pos.tp1Hit && roi <= CONFIG.SL_PCT) {
-        pos.isSelling = true;
-        log('EXIT', `🛑 STOP LOSS ${pos.sym} at ${roi.toFixed(1)}%`);
-        execPartialSell(mint, 100, `SL_${roi.toFixed(0)}%`, false)
-          .catch(e => log('ERROR', `SL sell error: ${e.message}`));
-        await discord(`🛑  **STOP LOSS** \`${mint.slice(0,16)}...\`\n📊  **${roi.toFixed(1)}%** after ${ageSec.toFixed(0)}s`);
+        log('EXIT', `[${w.label}] 🛑 STOP LOSS ${pos.sym} at ${roi.toFixed(1)}% — rug/bad token`);
+        execSell(w, mint, `SL_${roi.toFixed(0)}%`, false)
+          .catch(e => log('ERROR', `[${w.label}] SL: ${e.message}`));
+        await discord(`🛑  **STOP LOSS** [${w.label}] \`${mint.slice(0,16)}...\`
+📊  **${roi.toFixed(1)}%** after **${ageMin.toFixed(1)}min**`);
         continue;
       }
     }
@@ -503,16 +461,16 @@ async function exitManager() {
 // ── POLL ─────────────────────────────────────────────────────
 
 async function poll() {
-  log('INFO', `🪞 Mirroring ${CONFIG.TARGET.slice(0,20)}... every ${CONFIG.POLL_MS}ms`);
+  log('INFO', `🪞 Mirroring ${CONFIG.TARGET.slice(0,20)}... every ${CONFIG.POLL_MS}ms (${wallets.length} wallets)`);
 
-  while(state.isRunning) {
+  while(shared.isRunning) {
     try {
       const r = await fetch(CONFIG.HELIUS_RPC, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          jsonrpc: '2.0', id: 1,
+          jsonrpc:'2.0', id:1,
           method: 'getSignaturesForAddress',
-          params: [CONFIG.TARGET, { limit: 10 }]
+          params: [CONFIG.TARGET, { limit:10 }]
         })
       });
       const d    = await r.json();
@@ -520,50 +478,52 @@ async function poll() {
 
       const newSigs = [];
       for(const s of sigs) {
-        if(s.signature === state.lastSig) break;
+        if(s.signature === shared.lastSig) break;
         if(!s.err) newSigs.push(s);
       }
 
       if(newSigs.length > 0) {
-        state.lastSig = newSigs[0].signature;
-        const parsed  = await heliusParse(newSigs.map(s => s.signature));
+        shared.lastSig = newSigs[0].signature;
+        const parsed   = await heliusParse(newSigs.map(s => s.signature));
 
         for(const tx of parsed) {
           const trades = extractTrades(tx);
           if(!trades) continue;
 
-          // ── HE SOLD → queue emergency exit ──────────────
-          // Add to queue — exitManager picks it up next cycle
-          // This ensures emergency is always highest priority
+          // He sold → queue emergency for all wallets holding it
           for(const t of trades.filter(t => t.dir==='sell')) {
-            if(!state.positions.has(t.mint)) continue;
-            const pos = state.positions.get(t.mint);
-            if(pos.isSelling) continue;
-            log('EMERGENCY', `🚨 TARGET SELLING ${t.mint.slice(0,10)}... — queuing emergency exit`);
-            state.emergencyQueue.add(t.mint);
+            for(const w of wallets) {
+              if(!w.positions.has(t.mint)) continue;
+              if(w.positions.get(t.mint).isSelling) continue;
+              log('EMERGENCY', `🚨 [${w.label}] TARGET SOLD ${t.mint.slice(0,10)}...`);
+              w.emergencyQueue.add(t.mint);
+            }
           }
 
-          // ── HE BOUGHT → we buy ───────────────────────────
+          // He bought → both wallets buy simultaneously
           for(const t of trades.filter(t => t.dir==='buy')) {
             if(IGNORE.has(t.mint)) continue;
-            if(state.tradedMints.has(t.mint)) continue;
-            if(state.positions.has(t.mint)) continue;
-
             if(t.sol < CONFIG.MIN_BUY_SOL_SIGNAL) {
-              log('INFO', `⏭ SKIP ${t.mint.slice(0,10)}... only ${t.sol.toFixed(2)} SOL (min: ${CONFIG.MIN_BUY_SOL_SIGNAL})`);
+              log('INFO', `⏭ SKIP ${t.mint.slice(0,10)}... whale only ${t.sol.toFixed(2)} SOL (min: ${CONFIG.MIN_BUY_SOL_SIGNAL})`);
               continue;
             }
 
             const ourSize = scaleBuy(t.sol);
-            const bal     = await solBal();
-            if(bal < ourSize + 0.015) {
-              log('INFO', `💸 Balance too low (${bal.toFixed(4)} SOL)`);
-              continue;
-            }
 
-            log('MIRROR', `🟢 TARGET BOUGHT ${t.mint.slice(0,10)}... ${t.sol.toFixed(2)} SOL → we bet ${ourSize.toFixed(3)} SOL`);
-            execBuy(t.mint, t.sol, ourSize)
-              .catch(e => log('ERROR', `Mirror buy error: ${e.message}`));
+            Promise.allSettled(
+              wallets.map(async (w) => {
+                if(w.tradedMints.has(t.mint)) return;
+                if(w.positions.has(t.mint)) return;
+                const bal = await solBal(w.keypair);
+                if(bal < ourSize + 0.015) {
+                  log('INFO', `[${w.label}] 💸 Balance too low (${bal.toFixed(4)} SOL)`);
+                  return;
+                }
+                w.tradedMints.add(t.mint);
+                log('MIRROR', `🟢 [${w.label}] BUYING ${t.mint.slice(0,10)}... ${ourSize.toFixed(3)} SOL (whale: ${t.sol.toFixed(2)})`);
+                return execBuy(w, t.mint, t.sol, ourSize);
+              })
+            ).catch(e => log('ERROR', `allSettled: ${e.message}`));
           }
         }
       }
@@ -576,23 +536,26 @@ async function poll() {
 // ── HEALTH ───────────────────────────────────────────────────
 
 async function health() {
-  while(state.isRunning) {
-    const bal = await solBal();
-    const pnl = bal - state.stats.startBal;
-    console.log('\n' + '═'.repeat(62));
-    console.log('  🪞 WINSTON v17 — Copy Trade Bot');
-    console.log('═'.repeat(62));
+  while(shared.isRunning) {
+    console.log('\n' + '═'.repeat(64));
+    console.log('  🪞 WINSTON v20.1 — Scalper Copy Bot');
+    console.log('═'.repeat(64));
     console.log(`  👀 ${CONFIG.TARGET.slice(0,20)}...`);
-    console.log(`  💰 ${bal.toFixed(4)} SOL | PnL: ${pnl>=0?'+':''}${pnl.toFixed(4)} SOL`);
-    console.log(`  🛒 ${state.stats.buys}B  🚪 ${state.stats.sells}S  ❌ ${state.stats.errors}E  🔄 ${state.stats.retries}R`);
-    console.log(`  📦 ${state.positions.size} open | 🚫 ${state.tradedMints.size} blacklisted`);
-    console.log(`  🎯 TP1:+${CONFIG.TP1_PCT}%(50%) → TP2:+${CONFIG.TP2_PCT}%(50%) | Trail:-${CONFIG.TRAIL_DROP}% | SL:${CONFIG.SL_PCT}% | Max:${CONFIG.MAX_HOLD_SECONDS/60}min`);
-    for(const [m, p] of state.positions) {
-      const age  = ((Date.now()-p.time)/60).toFixed(1);
-      const sold = p.soldPct||0;
-      console.log(`     ${p.sym} ${m.slice(0,8)}... | ${age}min | ${p.sol.toFixed(4)} SOL | sold:${sold}% | tp1:${p.tp1Hit?'✅':'⬜'}`);
+    console.log(`  🎯 TP:+${CONFIG.TP_PCT}%  SL:${CONFIG.SL_PCT}%  Timer:${CONFIG.EXIT_SECONDS/60}min  MinSignal:${CONFIG.MIN_BUY_SOL_SIGNAL} SOL`);
+
+    for(const w of wallets) {
+      const bal     = await solBal(w.keypair);
+      const pnl     = bal - w.stats.startBal;
+      const winRate = w.stats.sells > 0 ? ((w.stats.wins/w.stats.sells)*100).toFixed(0) : '0';
+      console.log(`  [${w.label}] ${w.keypair.publicKey.toString().slice(0,16)}...`);
+      console.log(`       💰 ${bal.toFixed(4)} SOL | PnL: ${pnl>=0?'+':''}${pnl.toFixed(4)} SOL`);
+      console.log(`       📊 ${w.stats.buys}B ${w.stats.wins}W/${w.stats.losses}L (${winRate}% WR) | PnL: ${w.stats.totalPnl>=0?'+':''}${w.stats.totalPnl.toFixed(4)} SOL`);
+      for(const [m, p] of w.positions) {
+        const age = ((Date.now()-p.time)/60000).toFixed(1);
+        console.log(`       📦 ${p.sym} ${m.slice(0,8)}... | ${age}min | ${p.sol.toFixed(4)} SOL`);
+      }
     }
-    console.log('═'.repeat(62) + '\n');
+    console.log('═'.repeat(64) + '\n');
     await sleep(CONFIG.HEALTH_MS);
   }
 }
@@ -600,51 +563,54 @@ async function health() {
 // ── MAIN ─────────────────────────────────────────────────────
 
 async function main() {
-  console.log('\n╔════════════════════════════════════════════════════════════╗');
-  console.log('║  🪞 WINSTON v17 — Copy Trade Bot (Grok-reviewed)           ║');
-  console.log('║  Tiered TP · Trailing SL · Emergency exit · 45min max     ║');
-  console.log('╚════════════════════════════════════════════════════════════╝\n');
+  console.log('\n╔══════════════════════════════════════════════════════════════╗');
+  console.log('║  🪞 WINSTON v20.1 — Scalper-Optimized Copy Trade Bot         ║');
+  console.log('║  TP:+25% · SL:-20% · 12min max · Dual wallet                ║');
+  console.log('╚══════════════════════════════════════════════════════════════╝\n');
 
-  if(!CONFIG.HELIUS_API_KEY) { log('ERROR', 'HELIUS_API_KEY missing in .env'); process.exit(1); }
-  if(!CONFIG.PRIVATE_KEY)    { log('ERROR', 'WALLET_PRIVATE_KEY missing in .env'); process.exit(1); }
+  if(!CONFIG.HELIUS_API_KEY) { log('ERROR', 'HELIUS_API_KEY missing'); process.exit(1); }
+  if(!CONFIG.PRIVATE_KEY_1)  { log('ERROR', 'WALLET_PRIVATE_KEY missing'); process.exit(1); }
 
-  try { state.wallet = Keypair.fromSecretKey(bs58.decode(CONFIG.PRIVATE_KEY)); }
-  catch(e) { log('ERROR', 'Bad private key'); process.exit(1); }
-  log('INFO', `Wallet: ${state.wallet.publicKey}`);
+  for(const [label, key] of [['W1', CONFIG.PRIVATE_KEY_1], ['W2', CONFIG.PRIVATE_KEY_2]]) {
+    if(!key) { log('INFO', `[${label}] No key — skipping`); continue; }
+    try {
+      const w   = makeWallet(label);
+      w.keypair = Keypair.fromSecretKey(bs58.decode(key));
+      wallets.push(w);
+      log('INFO', `[${label}] ${w.keypair.publicKey}`);
+    } catch(e) { log('ERROR', `[${label}] Bad key: ${e.message}`); }
+  }
 
-  state.connection     = new Connection(CONFIG.HELIUS_RPC, { commitment:'confirmed' });
-  state.stats.startBal = await solBal();
-  log('INFO', `Balance: ${state.stats.startBal.toFixed(4)} SOL`);
+  if(!wallets.length) { log('ERROR', 'No valid wallets'); process.exit(1); }
 
-  if(state.stats.startBal < 0.10) {
-    log('ERROR', 'Need at least 0.10 SOL to trade safely.');
-    process.exit(1);
+  shared.connection = new Connection(CONFIG.HELIUS_RPC, { commitment:'confirmed' });
+
+  for(const w of wallets) {
+    w.stats.startBal = await solBal(w.keypair);
+    log('INFO', `[${w.label}] Balance: ${w.stats.startBal.toFixed(4)} SOL`);
   }
 
   try {
     const r = await fetch(CONFIG.HELIUS_RPC, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'getSignaturesForAddress', params:[CONFIG.TARGET,{limit:1}] })
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({jsonrpc:'2.0',id:1,method:'getSignaturesForAddress',params:[CONFIG.TARGET,{limit:1}]})
     });
     const d = await r.json();
-    state.lastSig = d?.result?.[0]?.signature || null;
-    log('INFO', `Cursor: ${state.lastSig ? state.lastSig.slice(0,20)+'...' : 'none'}`);
-  } catch(e) { log('ERROR', `Init failed: ${e.message}`); process.exit(1); }
+    shared.lastSig = d?.result?.[0]?.signature || null;
+    log('INFO', `Cursor: ${shared.lastSig ? shared.lastSig.slice(0,20)+'...' : 'none'}`);
+  } catch(e) { log('ERROR', `Init: ${e.message}`); process.exit(1); }
 
-  state.isRunning = true;
-  log('INFO', `🪞 LIVE | ${CONFIG.TARGET} | TP1:+${CONFIG.TP1_PCT}% TP2:+${CONFIG.TP2_PCT}% SL:${CONFIG.SL_PCT}% Max:${CONFIG.MAX_HOLD_SECONDS/60}min`);
+  shared.isRunning = true;
 
   await discord(
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-    `🪞  **WINSTON v17 ONLINE**\n` +
+    `🪞  **WINSTON v20.1 ONLINE**\n` +
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-    `👀  Target: \`${CONFIG.TARGET}\`\n` +
-    `💸  Scaled sizing: **$5–$10** per trade\n` +
-    `🎯  TP1: **+${CONFIG.TP1_PCT}%** (sell 50%) → TP2: **+${CONFIG.TP2_PCT}%** (sell 50%)\n` +
-    `📉  Trailing SL: **-${CONFIG.TRAIL_DROP}%** from peak (activates after TP1)\n` +
-    `🛑  Hard SL: **${CONFIG.SL_PCT}%** | Max hold: **${CONFIG.MAX_HOLD_SECONDS/60}min**\n` +
-    `🚨  Emergency exit if target sells first\n` +
-    `💰  Balance: **${state.stats.startBal.toFixed(4)} SOL**\n` +
+    `👀  \`${CONFIG.TARGET}\`\n` +
+    `👛  ${wallets.map(w=>`[${w.label}]`).join(' + ')} · **$5/$8/$10** scaled by conviction\n` +
+    `🎯  TP: **+${CONFIG.TP_PCT}%** instant cash | 6min timer | SL: **${CONFIG.SL_PCT}%**\n` +
+    `🚨  Emergency exit if he sells first\n` +
+    `📊  Min signal: **${CONFIG.MIN_BUY_SOL_SIGNAL} SOL** (ignores test buys)\n` +
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬`
   );
 
@@ -652,22 +618,27 @@ async function main() {
   const shutdown = async () => {
     if(shuttingDown) return;
     shuttingDown = true;
-    state.isRunning = false;
-    const f = await solBal(); const p = f - state.stats.startBal;
+    shared.isRunning = false;
+    const lines = await Promise.all(wallets.map(async w => {
+      const f  = await solBal(w.keypair);
+      const p  = f - w.stats.startBal;
+      const wr = w.stats.sells > 0 ? ((w.stats.wins/w.stats.sells)*100).toFixed(0) : '0';
+      return `[${w.label}] **${f.toFixed(4)} SOL** · PnL:**${p>=0?'+':''}${p.toFixed(4)}** · ${w.stats.wins}W/${w.stats.losses}L (${wr}% WR)`;
+    }));
     await discord(
-      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-      `🔴  **WINSTON v17 OFFLINE**\n` +
-      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-      `💰  **${f.toFixed(4)} SOL**  ·  PnL: **${p>=0?'+':''}${p.toFixed(4)} SOL**\n` +
-      `🛒  ${state.stats.buys}B  🚪 ${state.stats.sells}S  ❌ ${state.stats.errors}E\n` +
-      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬`
+      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON v19 OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
+      lines.join('\n') + '\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬'
     );
     process.exit(0);
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-  await Promise.all([poll(), exitManager(), health()]);
+  await Promise.all([
+    poll(),
+    ...wallets.map(w => exitManager(w)),
+    health(),
+  ]);
 }
 
 main().catch(e => { log('ERROR', 'Fatal', { err: e.message }); process.exit(1); });
