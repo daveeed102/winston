@@ -35,8 +35,19 @@ const CONFIG = {
   // ── Target wallet to copy ────────────────────────────────
   TARGET: 'CP7eVtQYsweR7vAjSvW2shgA1weszsVmxDFbpV22s5w1',
 
-  // ── Trade sizing ─────────────────────────────────────────
-  BUY_SOL: 0.12,   // ~$10 USD per trade
+  // ── Entry filter ─────────────────────────────────────────
+  MIN_BUY_SOL_SIGNAL: 1.0,   // ignore whale buys below 1 SOL — too small/risky
+
+  // ── Scaled trade sizing ($5-$10 based on his conviction) ──
+  // He buys 1-2 SOL    → we bet ~$5  (0.033 SOL)
+  // He buys 2-4 SOL    → we bet ~$7  (0.046 SOL)
+  // He buys 4+ SOL     → we bet ~$10 (0.065 SOL)
+  BUY_TIERS: [
+    { maxWhaleSol: 2.0,        ourSol: 0.033 },
+    { maxWhaleSol: 4.0,        ourSol: 0.046 },
+    { maxWhaleSol: Infinity,   ourSol: 0.065 },
+  ],
+  BUY_SOL: 0.065,  // fallback default (overridden by scaleBuy at runtime)
 
   // ── Exit config ──────────────────────────────────────────
   TP_PCT:           175,   // take profit at +175% ROI (2.75x)
@@ -212,12 +223,21 @@ async function getCurrentRoi(mint, pos) {
   } catch(e) { return null; }
 }
 
+// ── SCALE BUY — maps whale size to our bet size ─────────────
+// Returns the correct SOL amount based on BUY_TIERS config
+
+function scaleBuy(whaleSol) {
+  for(const tier of CONFIG.BUY_TIERS) {
+    if(whaleSol <= tier.maxWhaleSol) return tier.ourSol;
+  }
+  return CONFIG.BUY_SOL; // fallback
+}
+
 // ── BUY ──────────────────────────────────────────────────────
 
-async function execBuy(mint, whaleSol) {
+async function execBuy(mint, whaleSol, sol=CONFIG.BUY_SOL) {
   state.tradedMints.add(mint); // blacklist immediately
   const info    = await tokenInfo(mint);
-  const sol     = CONFIG.BUY_SOL;
   const lamports= Math.floor(sol * 1e9);
 
   log('EXEC', `🪞 BUY ${info.sym} ${sol.toFixed(4)} SOL (whale: ${whaleSol.toFixed(2)} SOL)`, { mint: mint.slice(0,12) });
@@ -255,7 +275,7 @@ async function execBuy(mint, whaleSol) {
       log('BUY', `✅ ${info.sym} ${sol.toFixed(4)} SOL | TP:+${CONFIG.TP_PCT}% SL:${CONFIG.SL_PCT}%`);
       await discord(
         `🪞  **COPY BUY** \`${mint}\`\n` +
-        `💸  **${sol.toFixed(4)} SOL** (~$10) | Whale: **${whaleSol.toFixed(2)} SOL**\n` +
+        `💸  **${sol.toFixed(4)} SOL** | Whale spent: **${whaleSol.toFixed(2)} SOL**\n` +
         `🎯  TP: **+${CONFIG.TP_PCT}%** | SL: **${CONFIG.SL_PCT}%** | Max: **${CONFIG.MAX_HOLD_SECONDS}s**\n` +
         `⚡  Will also sell if he sells first\n` +
         `🔗  https://solscan.io/tx/${sig}`
@@ -464,14 +484,23 @@ async function poll() {
             if(state.tradedMints.has(t.mint)) continue;
             if(state.positions.has(t.mint)) continue;
 
+            // Skip if his buy is too small — low conviction, high rug risk
+            if(t.sol < CONFIG.MIN_BUY_SOL_SIGNAL) {
+              log('INFO', `⏭ SKIP ${t.mint.slice(0,10)}... whale only spent ${t.sol.toFixed(2)} SOL (min: ${CONFIG.MIN_BUY_SOL_SIGNAL})`);
+              continue;
+            }
+
+            // Scale our bet to match his conviction level
+            const ourSize = scaleBuy(t.sol);
+
             const bal = await solBal();
-            if(bal < CONFIG.BUY_SOL + 0.015) {
+            if(bal < ourSize + 0.015) {
               log('INFO', `💸 Balance too low (${bal.toFixed(4)} SOL)`);
               continue;
             }
 
-            log('MIRROR', `🟢 TARGET BOUGHT ${t.mint.slice(0,10)}... ${t.sol.toFixed(2)} SOL — COPYING`);
-            execBuy(t.mint, t.sol)
+            log('MIRROR', `🟢 TARGET BOUGHT ${t.mint.slice(0,10)}... ${t.sol.toFixed(2)} SOL → we bet ${ourSize.toFixed(3)} SOL`);
+            execBuy(t.mint, t.sol, ourSize)
               .catch(e => log('ERROR', `Mirror buy error: ${e.message}`));
           }
         }
