@@ -1,11 +1,8 @@
 {
-  "name": "winston-v16",
-  "version": "16.0.0",
-  "description": "Winston Copy Trade Bot",
+  "name": "winston-v20",
+  "version": "20.3.0",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
+  "scripts": { "start": "node index.js" },
   "dependencies": {
     "@solana/web3.js": "^1.98.0",
     "bs58": "^5.0.0",
