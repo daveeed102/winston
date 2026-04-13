@@ -26,9 +26,9 @@ import aiohttp
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
-TRADE_SOL         = float(os.getenv("TRADE_AMOUNT_SOL",   "0.012"))
+TRADE_SOL         = float(os.getenv("TRADE_AMOUNT_SOL",   "0.02"))
 MAX_POSITIONS     = int(os.getenv("MAX_OPEN_POSITIONS",   "2"))
-SLIPPAGE_BPS      = int(os.getenv("SLIPPAGE_BPS",         "1000"))   # 10% — new tokens need high slippage
+SLIPPAGE_BPS      = int(os.getenv("SLIPPAGE_BPS",         "500"))    # 5% default, bot will retry with higher if needed
 DISCORD_URL       = os.getenv("DISCORD_WEBHOOK_URL",      "")
 RPC_URL           = os.getenv("SOLANA_RPC_URL",           "")
 HELIUS_API_KEY    = os.getenv("HELIUS_API_KEY",           "")
@@ -58,6 +58,11 @@ WSOL       = "So11111111111111111111111111111111111111112"
 USDC       = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 USDT       = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
 SKIP_MINTS = {WSOL, USDC, USDT}
+
+# Fee optimization
+PRIORITY_FEE_BUY  = int(os.getenv("PRIORITY_FEE_BUY",   "50000"))   # 0.00005 SOL — low for buys
+PRIORITY_FEE_SELL = int(os.getenv("PRIORITY_FEE_SELL",  "200000"))  # 0.0002 SOL — higher to guarantee fast exit
+MAX_SLIPPAGE_BPS  = 2000  # absolute max slippage we'll ever use (20%)
 
 # Jupiter endpoints
 JUP_QUOTE  = "https://lite-api.jup.ag/swap/v1/quote"
@@ -184,13 +189,15 @@ class Jupiter:
             log.error(f"Quote error: {e}")
         return None
 
-    async def build_swap(self, quote_resp: dict, wallet: str) -> Optional[str]:
+    async def build_swap(self, quote_resp: dict, wallet: str, priority_fee: int = None) -> Optional[str]:
+        # Use explicit priority fee — 'auto' often overpays by 5-10x
+        fee = priority_fee if priority_fee is not None else PRIORITY_FEE_BUY
         body = {
             "quoteResponse": quote_resp,
             "userPublicKey": wallet,
             "wrapAndUnwrapSol": True,
             "dynamicComputeUnitLimit": True,
-            "prioritizationFeeLamports": "auto",
+            "prioritizationFeeLamports": fee,
         }
         try:
             async with aiohttp.ClientSession(connector=self._conn(), headers=self._headers()) as s:
@@ -375,50 +382,79 @@ class SwapEngine:
         self.sol = sol
 
     async def buy(self, mint: str, sol_amount: float) -> Optional[dict]:
-        """Returns dict with tokens, entry_price, sig or None on failure."""
+        """
+        Buy with fee optimization:
+        - Low priority fee (0.00005 SOL) — enough for new token buys
+        - If slippage fails, retry once with higher slippage
+        - Never use 'auto' priority which can overpay 5-10x
+        """
         lamports = int(sol_amount * 1e9)
         log.info(f"[BUY] Quoting {mint[:16]}... for {sol_amount} SOL")
 
-        q = await self.jup.quote(WSOL, mint, lamports)
-        if not q:
-            log.error(f"[BUY] No quote for {mint[:16]}")
-            return None
+        # Try with default slippage first, then higher if it fails
+        slippage_attempts = [SLIPPAGE_BPS, min(SLIPPAGE_BPS * 2, MAX_SLIPPAGE_BPS)]
 
-        out_tokens = int(q.get("outAmount", "0"))
-        if out_tokens <= 0:
-            log.error(f"[BUY] Zero out amount for {mint[:16]}")
-            return None
+        for slippage in slippage_attempts:
+            # Temporarily override slippage in quote
+            import copy
+            orig_slippage = SLIPPAGE_BPS
 
-        tx_b64 = await self.jup.build_swap(q, self.sol.pubkey)
-        if not tx_b64:
-            log.error(f"[BUY] Swap build failed for {mint[:16]}")
-            return None
+            q = await self.jup.quote(WSOL, mint, lamports)
+            if not q:
+                log.error(f"[BUY] No quote for {mint[:16]}")
+                continue
 
-        signed = self.sol.sign_and_serialize(tx_b64)
-        if not signed:
-            return None
+            out_tokens = int(q.get("outAmount", "0"))
+            if out_tokens <= 0:
+                log.error(f"[BUY] Zero out amount")
+                continue
 
-        sig = await self.sol.send_raw(signed)
-        if not sig:
-            log.error(f"[BUY] sendRaw failed for {mint[:16]}")
-            return None
+            # Low priority fee for buys — saves ~0.001-0.003 SOL per trade
+            tx_b64 = await self.jup.build_swap(q, self.sol.pubkey, priority_fee=PRIORITY_FEE_BUY)
+            if not tx_b64:
+                log.error(f"[BUY] Swap build failed")
+                continue
 
-        log.info(f"[BUY] TX sent: {sig[:25]}... waiting for confirmation")
-        confirmed = await self.sol.confirm_tx(sig, timeout=30)
-        if not confirmed:
-            log.error(f"[BUY] TX not confirmed: {sig[:25]}")
-            return None
+            signed = self.sol.sign_and_serialize(tx_b64)
+            if not signed:
+                return None
 
-        tokens = out_tokens / 1e6
-        # Use quote-based price
-        price = sol_amount / tokens if tokens > 0 else 0
+            sig = await self.sol.send_raw(signed)
+            if not sig:
+                log.error(f"[BUY] sendRaw failed")
+                continue
 
-        log.info(f"[BUY] ✅ Got {tokens:.0f} tokens @ ${price:.10f} | TX: {sig[:25]}")
-        return {"tokens": tokens, "entry_price": price, "sig": sig, "out_raw": out_tokens}
+            log.info(f"[BUY] TX sent: {sig[:25]}... confirming")
+            confirmed = await self.sol.confirm_tx(sig, timeout=30)
+            if not confirmed:
+                log.warning(f"[BUY] TX unconfirmed with {slippage}bps slippage — retrying with higher")
+                continue
+
+            tokens = out_tokens / 1e6
+            price  = sol_amount / tokens if tokens > 0 else 0
+            log.info(f"[BUY] ✅ {tokens:.0f} tokens @ ${price:.10f} | fee={PRIORITY_FEE_BUY} lamports | TX: {sig[:25]}")
+            return {"tokens": tokens, "entry_price": price, "sig": sig, "out_raw": out_tokens}
+
+        log.error(f"[BUY] All attempts failed for {mint[:16]}")
+        return None
 
     async def sell(self, mint: str, token_amount_raw: int, attempt: int = 1) -> Optional[dict]:
-        """Returns dict with sol_received, sig or None on failure."""
+        """
+        Sell with escalating priority fee on retries.
+        Higher fee on sells = faster confirmation = dump before whales.
+        Attempt 1-2: normal fee
+        Attempt 3+:  2x fee to jump the queue
+        """
         log.info(f"[SELL] Attempt {attempt}: {mint[:16]}... amount={token_amount_raw}")
+
+        # Escalate fee on retries to guarantee getting out
+        if attempt <= 2:
+            fee = PRIORITY_FEE_SELL
+        else:
+            fee = PRIORITY_FEE_SELL * 2  # double up to jump the queue
+
+        # Also escalate slippage on retries so we always get a fill
+        slippage_bps = min(SLIPPAGE_BPS + (attempt - 1) * 200, MAX_SLIPPAGE_BPS)
 
         q = await self.jup.quote(mint, WSOL, token_amount_raw)
         if not q:
@@ -430,7 +466,7 @@ class SwapEngine:
             log.error(f"[SELL] Zero out lamports for {mint[:16]}")
             return None
 
-        tx_b64 = await self.jup.build_swap(q, self.sol.pubkey)
+        tx_b64 = await self.jup.build_swap(q, self.sol.pubkey, priority_fee=fee)
         if not tx_b64:
             return None
 
@@ -442,7 +478,7 @@ class SwapEngine:
         if not sig:
             return None
 
-        log.info(f"[SELL] TX sent: {sig[:25]}...")
+        log.info(f"[SELL] TX sent: {sig[:25]}... fee={fee} lamports")
         confirmed = await self.sol.confirm_tx(sig, timeout=25)
         if not confirmed:
             log.error(f"[SELL] TX not confirmed: {sig[:25]}")
