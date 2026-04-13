@@ -26,7 +26,7 @@ import aiohttp
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
-TRADE_SOL         = float(os.getenv("TRADE_AMOUNT_SOL",   "0.02"))
+TRADE_SOL         = float(os.getenv("TRADE_AMOUNT_SOL",   "0.037"))
 MAX_POSITIONS     = int(os.getenv("MAX_OPEN_POSITIONS",   "2"))
 SLIPPAGE_BPS      = int(os.getenv("SLIPPAGE_BPS",         "500"))    # 5% default, bot will retry with higher if needed
 DISCORD_URL       = os.getenv("DISCORD_WEBHOOK_URL",      "")
