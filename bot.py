@@ -79,6 +79,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("winston")
 
+class RateLimitError(Exception):
+    pass
+
 # ─── MODELS ──────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -144,10 +147,14 @@ class Jupiter:
         try:
             async with aiohttp.ClientSession(connector=self._conn(), headers=self._headers()) as s:
                 async with s.get(f"{JUP_PRICE}?ids={mint}", timeout=aiohttp.ClientTimeout(total=4)) as r:
+                    if r.status == 429:
+                        raise RateLimitError()
                     if r.status == 200:
                         d = await r.json()
                         p = d.get("data", {}).get(mint, {}).get("price")
                         if p: return float(p)
+        except RateLimitError:
+            raise
         except: pass
 
         # Method 2: Quote-based (works on brand new tokens)
@@ -160,6 +167,8 @@ class Jupiter:
             }
             async with aiohttp.ClientSession(connector=self._conn(), headers=self._headers()) as s:
                 async with s.get(JUP_QUOTE, params=params, timeout=aiohttp.ClientTimeout(total=6)) as r:
+                    if r.status == 429:
+                        raise RateLimitError()
                     if r.status == 200:
                         d = await r.json()
                         out_lamports = int(d.get("outAmount", "0"))
@@ -167,24 +176,31 @@ class Jupiter:
                             out_sol = out_lamports / 1e9
                             tokens = token_amount / 1e6
                             return out_sol / tokens
+        except RateLimitError:
+            raise
         except: pass
 
         return None
 
-    async def quote(self, inp: str, out: str, amount: int) -> Optional[dict]:
+    async def quote(self, inp: str, out: str, amount: int, slippage_bps: int = None) -> Optional[dict]:
         params = {
             "inputMint": inp,
             "outputMint": out,
             "amount": str(amount),
-            "slippageBps": str(SLIPPAGE_BPS),
+            "slippageBps": str(slippage_bps if slippage_bps is not None else SLIPPAGE_BPS),
             "onlyDirectRoutes": "false",
         }
         try:
             async with aiohttp.ClientSession(connector=self._conn(), headers=self._headers()) as s:
                 async with s.get(JUP_QUOTE, params=params, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                    if r.status == 429:
+                        log.warning("Quote 429: rate limited")
+                        raise RateLimitError()
                     if r.status == 200:
                         return await r.json()
                     log.error(f"Quote {r.status}: {(await r.text())[:120]}")
+        except RateLimitError:
+            raise
         except Exception as e:
             log.error(f"Quote error: {e}")
         return None
@@ -440,30 +456,31 @@ class SwapEngine:
 
     async def sell(self, mint: str, token_amount_raw: int, attempt: int = 1) -> Optional[dict]:
         """
-        Sell with escalating priority fee on retries.
-        Higher fee on sells = faster confirmation = dump before whales.
-        Attempt 1-2: normal fee
-        Attempt 3+:  2x fee to jump the queue
+        Sell with escalating fee + slippage on retries.
+        Handles 429 rate limits with automatic backoff.
         """
         log.info(f"[SELL] Attempt {attempt}: {mint[:16]}... amount={token_amount_raw}")
 
-        # Escalate fee on retries to guarantee getting out
-        if attempt <= 2:
-            fee = PRIORITY_FEE_SELL
-        else:
-            fee = PRIORITY_FEE_SELL * 2  # double up to jump the queue
+        # Escalate fee on retries
+        fee = PRIORITY_FEE_SELL if attempt <= 2 else PRIORITY_FEE_SELL * 2
 
-        # Also escalate slippage on retries so we always get a fill
-        slippage_bps = min(SLIPPAGE_BPS + (attempt - 1) * 200, MAX_SLIPPAGE_BPS)
+        # Escalate slippage gradually — more willing to take worse price to guarantee exit
+        slippage_bps = min(SLIPPAGE_BPS + (attempt - 1) * 300, MAX_SLIPPAGE_BPS)
 
-        q = await self.jup.quote(mint, WSOL, token_amount_raw)
+        try:
+            q = await self.jup.quote(mint, WSOL, token_amount_raw, slippage_bps=slippage_bps)
+        except RateLimitError:
+            log.warning(f"[SELL] Rate limited on attempt {attempt} — waiting 8s")
+            await asyncio.sleep(8)
+            return None
+
         if not q:
-            log.error(f"[SELL] No quote for {mint[:16]}")
+            log.error(f"[SELL] No quote for {mint[:16]} — token may have no liquidity (rugged?)")
             return None
 
         out_lamports = int(q.get("outAmount", "0"))
         if out_lamports <= 0:
-            log.error(f"[SELL] Zero out lamports for {mint[:16]}")
+            log.error(f"[SELL] Zero out lamports")
             return None
 
         tx_b64 = await self.jup.build_swap(q, self.sol.pubkey, priority_fee=fee)
@@ -478,7 +495,7 @@ class SwapEngine:
         if not sig:
             return None
 
-        log.info(f"[SELL] TX sent: {sig[:25]}... fee={fee} lamports")
+        log.info(f"[SELL] TX sent: {sig[:25]}... fee={fee} slippage={slippage_bps}bps")
         confirmed = await self.sol.confirm_tx(sig, timeout=25)
         if not confirmed:
             log.error(f"[SELL] TX not confirmed: {sig[:25]}")
@@ -507,18 +524,28 @@ class ExitEngine:
 
     async def run(self):
         log.info(f"[EXIT] Engine running | TP1={TP1_X}x TP2={TP2_X}x Stop={STOP_LOSS_PCT}% Trail={TRAILING_PCT}%")
+        self._rate_limited_until = 0
         while True:
+            # Back off polling when rate limited
+            if time.time() < self._rate_limited_until:
+                await asyncio.sleep(2)
+                continue
             for pos in [p for p in self.positions if p.status == "open"]:
                 try:
                     await self._check(pos)
                 except Exception as e:
                     log.error(f"[EXIT] Check error {pos.token.symbol}: {e}")
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
 
     async def _check(self, pos: Position):
         # Use actual tokens held for price check
         test_raw = max(int(pos.tokens_held * 1e6 * 0.01), 100_000)  # 1% of holdings
-        price = await self.jup.get_price(pos.token.mint, test_raw)
+        try:
+            price = await self.jup.get_price(pos.token.mint, test_raw)
+        except RateLimitError:
+            log.warning("[EXIT] Rate limited by Jupiter — backing off 10s")
+            self._rate_limited_until = time.time() + 10
+            return
 
         # ── PRICE DEAD CHECK ──
         if not price or price <= 0:
@@ -599,7 +626,7 @@ class ExitEngine:
         pos.exit_price = price
         pos.exit_reason = reason
 
-        # Retry loop
+        # Retry loop — progressive delays to avoid 429s
         for attempt in range(1, SELL_RETRIES + 1):
             result = await self.swap.sell(pos.token.mint, raw_amount, attempt)
             if result:
@@ -616,8 +643,10 @@ class ExitEngine:
                 await self.discord.sold(pos, reason, pct)
                 return
 
-            log.warning(f"[SELL] Attempt {attempt}/{SELL_RETRIES} failed for {pos.token.symbol} — retrying in 2s")
-            await asyncio.sleep(2)
+            # Progressive backoff: 3s, 5s, 8s, 8s, 8s...
+            delay = 3 if attempt == 1 else (5 if attempt == 2 else 8)
+            log.warning(f"[SELL] Attempt {attempt}/{SELL_RETRIES} failed for {pos.token.symbol} — retrying in {delay}s")
+            await asyncio.sleep(delay)
 
         # All retries failed — start emergency background retry
         log.error(f"[SELL] ❌ ALL {SELL_RETRIES} attempts failed for {pos.token.symbol} — starting emergency loop")
