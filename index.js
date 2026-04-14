@@ -1,5 +1,5 @@
 // ============================================================
-// WINSTON v20.3 — Copy Trade Bot
+// WINSTON v20.5 — Copy Trade Bot
 // ⚠️  HIGH RISK — for educational/personal use only
 // ============================================================
 // SELLING IS THE #1 PRIORITY. Everything else is secondary.
@@ -52,9 +52,12 @@ const CONFIG = {
   BUY_SOL: 0.120,
 
   // ── Exit rules ───────────────────────────────────────────
-  TP_PCT:           20,   // cash at +20% profit
-  SL_PCT:          -20,   // stop loss at -20%
-  EXIT_SECONDS:    600,   // 10 minute hard exit
+  //   1. He sells     → emergency exit instantly
+  //   2. TP at +20%   → take profit, don't be greedy
+  //   3. SL at -50%   → lost half, cut it
+  // No timer — let it ride as long as it needs to
+  TP_PCT:           20,   // cash at +20%
+  SL_PCT:          -50,   // stop loss at -50% (lost half)
 
   // ── Fees ─────────────────────────────────────────────────
   BUY_PRIORITY_LAMPORTS:       3000000,
@@ -313,7 +316,7 @@ async function execSell(w, mint, reason, emergency=false, attempt=1) {
       const label = emergency           ? `🚨 **EMERGENCY EXIT** [${w.label}]`
         : reason.startsWith('TP')       ? `🎯 **TAKE PROFIT** [${w.label}]`
         : reason.startsWith('SL')       ? `🛑 **STOP LOSS** [${w.label}]`
-        : reason.startsWith('10min')    ? `⏱ **10MIN EXIT** [${w.label}]`
+        : reason.startsWith('TP')       ? `🎯 **TAKE PROFIT** [${w.label}]`
         : `🔴 **SELL** [${w.label}]`;
 
       await discord(
@@ -385,11 +388,11 @@ async function execBuy(w, mint, whaleSol, sol, attempt=1) {
         isSelling: false, highestRoi: -Infinity,
       });
       w.stats.buys++;
-      log('BUY', `✅ [${w.label}] ${info.sym} ${sol.toFixed(4)} SOL | TP:+${CONFIG.TP_PCT}% SL:${CONFIG.SL_PCT}% Timer:${CONFIG.EXIT_SECONDS/60}min`);
+      log('BUY', `✅ [${w.label}] ${info.sym} ${sol.toFixed(4)} SOL | TP:+${CONFIG.TP_PCT}% SL:${CONFIG.SL_PCT}%`);
       await discord(
         `🪞  **COPY BUY** [${w.label}] \`${mint}\`\n` +
         `💸  **${sol.toFixed(4)} SOL** | Whale: **${whaleSol.toFixed(2)} SOL**\n` +
-        `🎯  TP: **+${CONFIG.TP_PCT}%** | SL: **${CONFIG.SL_PCT}%** | Timer: **${CONFIG.EXIT_SECONDS/60}min**\n` +
+        `🎯  TP: **+${CONFIG.TP_PCT}%** | SL: **${CONFIG.SL_PCT}%** | Exit on whale sell\n` +
         `🔗  https://solscan.io/tx/${sig}`
       );
       return true;
@@ -411,7 +414,7 @@ async function execBuy(w, mint, whaleSol, sol, attempt=1) {
 // Emergency queue checked first — no RPC calls, immediate fire
 
 async function exitManager(w) {
-  log('INFO', `[${w.label}] 🎯 Exit | TP:+${CONFIG.TP_PCT}% SL:${CONFIG.SL_PCT}% Timer:${CONFIG.EXIT_SECONDS/60}min`);
+  log('INFO', `[${w.label}] 🎯 Exit | TP:+${CONFIG.TP_PCT}% SL:${CONFIG.SL_PCT}% — no timer`);
 
   while(shared.isRunning) {
     await sleep(CONFIG.EXIT_CHECK_MS);
@@ -432,17 +435,7 @@ async function exitManager(w) {
         continue;
       }
 
-      // ── PRIORITY 2: 10min timer — no RPC needed ───────────
-      if(ageSec >= CONFIG.EXIT_SECONDS) {
-        pos.isSelling = true;
-        log('EXIT', `[${w.label}] ⏱ 10MIN TIMER EXIT ${pos.sym}`);
-        execSell(w, mint, `10min_timer`, false)
-          .catch(e => log('ERROR', `[${w.label}] Timer exit error: ${e.message}`));
-        await discord(`⏱  **10MIN EXIT** [${w.label}] \`${mint.slice(0,16)}...\`\nHeld **${ageMin}min** — exiting now`);
-        continue;
-      }
-
-      // ── PRIORITY 3+4: TP / SL — needs ROI quote ───────────
+      // ── PRIORITY 2: SL / he sells — needs ROI quote ─────────
       const roi = await getCurrentRoi(mint, pos, w.keypair);
       if(roi === null) continue; // rate limited or error — skip, try next cycle
       if(roi > pos.highestRoi) pos.highestRoi = roi;
@@ -454,7 +447,7 @@ async function exitManager(w) {
         : '▓'.repeat(Math.min(Math.floor(Math.abs(roi)/2), 20));
       console.log(`  [${w.label}][${pos.sym}] ${roi>=0?'+':''}${roi.toFixed(1)}% [${bar}] peak:${pos.highestRoi.toFixed(0)}% | ${ageMin}min | ${timeLeft}s left`);
 
-      // TP at +20%
+      // ── TP at +20% — take profit ─────────────────────────
       if(roi >= CONFIG.TP_PCT) {
         pos.isSelling = true;
         log('EXIT', `[${w.label}] 🎯 TAKE PROFIT ${pos.sym} at +${roi.toFixed(1)}%`);
@@ -464,7 +457,7 @@ async function exitManager(w) {
         continue;
       }
 
-      // SL at -20%
+      // ── SL at -50% — lost half, get out ──────────────────
       if(roi <= CONFIG.SL_PCT) {
         pos.isSelling = true;
         log('EXIT', `[${w.label}] 🛑 STOP LOSS ${pos.sym} at ${roi.toFixed(1)}%`);
@@ -554,10 +547,10 @@ async function poll() {
 async function health() {
   while(shared.isRunning) {
     console.log('\n' + '═'.repeat(64));
-    console.log('  🪞 WINSTON v20.3 — Copy Trade Bot');
+    console.log('  🪞 WINSTON v20.5 — Copy Trade Bot');
     console.log('═'.repeat(64));
     console.log(`  👀 ${CONFIG.TARGET.slice(0,20)}...`);
-    console.log(`  🎯 TP:+${CONFIG.TP_PCT}%  SL:${CONFIG.SL_PCT}%  Timer:${CONFIG.EXIT_SECONDS/60}min  Min:${CONFIG.MIN_BUY_SOL_SIGNAL}SOL`);
+    console.log(`  🎯 TP:+${CONFIG.TP_PCT}%  SL:${CONFIG.SL_PCT}%  Exit:whale-or-TP  Min:${CONFIG.MIN_BUY_SOL_SIGNAL}SOL`);
     for(const w of wallets) {
       const bal = await solBal(w.keypair);
       const pnl = bal - w.stats.startBal;
@@ -579,7 +572,7 @@ async function health() {
 
 async function main() {
   console.log('\n╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  🪞 WINSTON v20.3 — Selling is #1 Priority                   ║');
+  console.log('║  🪞 WINSTON v20.5 — Selling is #1 Priority                   ║');
   console.log('║  TP:+20% · SL:-20% · 10min · Rate limit safe                ║');
   console.log('╚══════════════════════════════════════════════════════════════╝\n');
 
@@ -618,11 +611,11 @@ async function main() {
 
   await discord(
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-    `🪞  **WINSTON v20.3 ONLINE**\n` +
+    `🪞  **WINSTON v20.5 ONLINE**\n` +
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
     `👀  \`${CONFIG.TARGET}\`\n` +
     `👛  ${wallets.map(w=>`[${w.label}]`).join(' + ')} · **$10–$15** per wallet\n` +
-    `🎯  TP: **+${CONFIG.TP_PCT}%** | SL: **${CONFIG.SL_PCT}%** | Timer: **${CONFIG.EXIT_SECONDS/60}min**\n` +
+    `🎯  TP: **+${CONFIG.TP_PCT}%** | SL: **${CONFIG.SL_PCT}%** | Exit on whale sell\n` +
     `🚨  Emergency exit if whale sells\n` +
     `📡  Rate-limit safe: poll ${CONFIG.POLL_MS}ms · ROI check ${CONFIG.EXIT_CHECK_MS}ms\n` +
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬`
@@ -640,7 +633,7 @@ async function main() {
       return `[${w.label}] **${f.toFixed(4)} SOL** · PnL:**${p>=0?'+':''}${p.toFixed(4)}** · ${w.stats.wins}W/${w.stats.losses}L (${wr}% WR)`;
     }));
     await discord(
-      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON v20.3 OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
+      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON v20.5 OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
       lines.join('\n') + '\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬'
     );
     process.exit(0);
