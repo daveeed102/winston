@@ -56,7 +56,7 @@ const CONFIG = {
   //   2. TP at +20%   → take profit, don't be greedy
   //   3. SL at -50%   → lost half, cut it
   // No timer — let it ride as long as it needs to
-  TP_PCT:           20,   // cash at +20%
+  TP_PCT:           30,   // cash at +30%
   SL_PCT:          -50,   // stop loss at -50% (lost half)
 
   // ── Fees ─────────────────────────────────────────────────
