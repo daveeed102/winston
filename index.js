@@ -63,7 +63,7 @@ const CONFIG = {
   TP_SOL:               0.070,  // take profit: ~$6 (27% on 0.26 SOL)
   SL_PCT:                 -50,  // normal stop loss
   POST_SELL_SL_PCT:       -35,  // tighter SL once whale has sold
-  POST_SELL_TIMER_MS:  240000,  // 4 minutes max after whale sells
+  POST_SELL_TIMER_MS:  600000,  // 10 minutes max after whale sells
 
   // ── Fees ─────────────────────────────────────────────────
   // ── Fees — lowered to reduce cost per trade ─────────────
@@ -483,7 +483,7 @@ async function exitManager(w) {
             `📊  Riding the bounce for up to **4 minutes**\n` +
             `🎯  Still targeting: **+$${SOL_USD(CONFIG.TP_SOL)}** profit\n` +
             `🛑  Bail if down: **-${Math.abs(CONFIG.POST_SELL_SL_PCT)}%** from entry\n` +
-            `⏱  Hard exit in: **4 minutes**`
+            `⏱  Hard exit in: **10 minutes**`
           );
         }
         continue;
@@ -496,10 +496,10 @@ async function exitManager(w) {
         // 4 minute hard exit after whale sold
         if(postSellAge >= CONFIG.POST_SELL_TIMER_MS) {
           pos.isSelling = true;
-          log('EXIT', `[${w.label}] ⏱ POST-SELL TIMER — 4min elapsed, exiting ${pos.sym}`);
+          log('EXIT', `[${w.label}] ⏱ POST-SELL TIMER — 10min elapsed, exiting ${pos.sym}`);
           const labelIndex = wallets.indexOf(w);
           setTimeout(() => {
-            execSell(w, mint, 'post_sell_4min', false)
+            execSell(w, mint, 'post_sell_10min', false)
               .catch(e => log('ERROR', `[${w.label}] Post-sell timer exit error: ${e.message}`));
           }, labelIndex * 1500);
           continue;
