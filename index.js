@@ -1,5 +1,5 @@
 // ============================================================
-// WINSTON v20.7 — Copy Trade Bot
+// WINSTON v20.8 — Copy Trade Bot
 // ⚠️  HIGH RISK — for educational/personal use only
 // ============================================================
 // SELLING IS THE #1 PRIORITY. Everything else is secondary.
@@ -350,16 +350,26 @@ async function execSell(w, mint, reason, emergency=false, attempt=1) {
     log('ERROR', `[${w.label}] Sell fail (${attempt}/${maxRetries}): ${e.message}`);
     if(attempt < maxRetries) {
       // Back off longer each retry — critical to get through rate limits
-      const delay = emergency ? 1500 : 2000 + (attempt * 500);
+      // Exponential backoff + jitter to avoid synchronized retries across wallets
+      const base  = emergency ? 2000 : 3000;
+      const jitter = Math.floor(Math.random() * 1000); // 0-1000ms random
+      const delay  = base * attempt + jitter;
+      log('ERROR', `[${w.label}] Retrying in ${delay}ms...`);
       await sleep(delay);
       return execSell(w, mint, reason, emergency, attempt+1);
     }
     // All retries exhausted — alert loudly
     w.stats.errors++;
     await discord(
-      `🆘  **SELL EXHAUSTED** [${w.label}] — all ${maxRetries} attempts failed!\n` +
-      `\`${mint}\` — **CHECK WALLET MANUALLY**\n` +
-      `Reason: ${e.message}`
+      `🆘  **SELL EXHAUSTED** — ${wName(w.label)}\n` +
+      `All ${maxRetries} attempts failed — **ACT NOW**\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `🪙  Token: \`${mint}\`\n` +
+      `❌  Reason: ${e.message}\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `🔗  **Sell manually on Jupiter:**\n` +
+      `https://jup.ag/swap/${mint}-SOL\n` +
+      `(paste link in browser — works even if Phantom shows spam)`
     );
     return false;
   }
@@ -447,13 +457,19 @@ async function exitManager(w) {
       const ageSec = (Date.now() - pos.time) / 1000;
       const ageMin = (ageSec / 60).toFixed(1);
 
-      // ── PRIORITY 1: Emergency — whale sold, fire instantly ─
+      // ── PRIORITY 1: Emergency — whale sold, staggered to avoid 429 ─
+      // W1 fires immediately, W2 waits 1.5s, W3 waits 3s
+      // Prevents all 3 wallets hammering Jupiter at the same instant
       if(w.emergencyQueue.has(mint)) {
         w.emergencyQueue.delete(mint);
         pos.isSelling = true;
-        log('EMERGENCY', `🚨 [${w.label}] WHALE SOLD — EMERGENCY EXIT ${pos.sym}`);
-        execSell(w, mint, 'emergency_whale_sold', true)
-          .catch(e => log('ERROR', `[${w.label}] Emergency sell error: ${e.message}`));
+        const labelIndex = wallets.indexOf(w);
+        const staggerMs  = labelIndex * 1500; // 0ms, 1500ms, 3000ms
+        log('EMERGENCY', `🚨 [${w.label}] WHALE SOLD — emergency exit in ${staggerMs}ms`);
+        setTimeout(() => {
+          execSell(w, mint, 'emergency_whale_sold', true)
+            .catch(e => log('ERROR', `[${w.label}] Emergency sell error: ${e.message}`));
+        }, staggerMs);
         continue;
       }
 
@@ -580,7 +596,7 @@ async function poll() {
 async function health() {
   while(shared.isRunning) {
     console.log('\n' + '═'.repeat(64));
-    console.log('  🪞 WINSTON v20.7 — Copy Trade Bot');
+    console.log('  🪞 WINSTON v20.8 — Copy Trade Bot');
     console.log('═'.repeat(64));
     console.log(`  👀 ${CONFIG.TARGET.slice(0,20)}...`);
     console.log(`  🎯 TP:+${CONFIG.TP_SOL}SOL($4)  SL:${CONFIG.SL_PCT}%  Buy:${CONFIG.BUY_SOL}SOL  Min:${CONFIG.MIN_BUY_SOL_SIGNAL}SOL`);
@@ -605,7 +621,7 @@ async function health() {
 
 async function main() {
   console.log('\n╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  🪞 WINSTON v20.7 — Selling is #1 Priority                   ║');
+  console.log('║  🪞 WINSTON v20.8 — Selling is #1 Priority                   ║');
   console.log('║  TP:+20% · SL:-20% · 10min · Rate limit safe                ║');
   console.log('╚══════════════════════════════════════════════════════════════╝\n');
 
@@ -644,7 +660,7 @@ async function main() {
 
   await discord(
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-    `🪞  **WINSTON v20.7 ONLINE**\n` +
+    `🪞  **WINSTON v20.8 ONLINE**\n` +
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
     `👀  \`${CONFIG.TARGET}\`\n` +
     `👛  ${wallets.map(w=>wName(w.label)).join(' + ')}\n` +
@@ -667,7 +683,7 @@ async function main() {
       return `**${wName(w.label)}**: ${f.toFixed(3)} SOL (~$${SOL_USD(f)}) · PnL: **${p>=0?'+':''}$${SOL_USD(Math.abs(p))}** · ${w.stats.wins}W/${w.stats.losses}L (${wr}% WR)`;
     }));
     await discord(
-      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON v20.7 OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
+      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON v20.8 OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
       lines.join('\n') + '\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬'
     );
     process.exit(0);
