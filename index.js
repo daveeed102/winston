@@ -1,5 +1,5 @@
 // ============================================================
-// WINSTON v20.6 — Copy Trade Bot
+// WINSTON v20.7 — Copy Trade Bot
 // ⚠️  HIGH RISK — for educational/personal use only
 // ============================================================
 // SELLING IS THE #1 PRIORITY. Everything else is secondary.
@@ -25,8 +25,9 @@ const fetch = require('node-fetch');
 
 const CONFIG = {
   HELIUS_API_KEY:  process.env.HELIUS_API_KEY  || '',
-  PRIVATE_KEY_1:   process.env.WALLET_PRIVATE_KEY || process.env.PRIVATE_KEY || '',
+  PRIVATE_KEY_1:   process.env.WALLET_PRIVATE_KEY  || process.env.PRIVATE_KEY || '',
   PRIVATE_KEY_2:   process.env.WALLET_PRIVATE_KEY_2 || '',
+  PRIVATE_KEY_3:   process.env.WALLET_PRIVATE_KEY_3 || '',
   DISCORD_WEBHOOK: process.env.DISCORD_WEBHOOK_URL || process.env.DISCORD_WEBHOOK || '',
 
   get HELIUS_RPC() { return `https://mainnet.helius-rpc.com/?api-key=${this.HELIUS_API_KEY}`; },
@@ -121,6 +122,7 @@ const SOL_USD = (sol) => (sol / 0.012).toFixed(2);
 const WALLET_NAMES = {
   W1: "Daveeeed's Account",
   W2: "Kinduuuuude's Account",
+  W3: "Maxxxxxwell's Account",
 };
 const wName = (label) => WALLET_NAMES[label] || label;
 
@@ -578,7 +580,7 @@ async function poll() {
 async function health() {
   while(shared.isRunning) {
     console.log('\n' + '═'.repeat(64));
-    console.log('  🪞 WINSTON v20.6 — Copy Trade Bot');
+    console.log('  🪞 WINSTON v20.7 — Copy Trade Bot');
     console.log('═'.repeat(64));
     console.log(`  👀 ${CONFIG.TARGET.slice(0,20)}...`);
     console.log(`  🎯 TP:+${CONFIG.TP_SOL}SOL($4)  SL:${CONFIG.SL_PCT}%  Buy:${CONFIG.BUY_SOL}SOL  Min:${CONFIG.MIN_BUY_SOL_SIGNAL}SOL`);
@@ -603,14 +605,14 @@ async function health() {
 
 async function main() {
   console.log('\n╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  🪞 WINSTON v20.6 — Selling is #1 Priority                   ║');
+  console.log('║  🪞 WINSTON v20.7 — Selling is #1 Priority                   ║');
   console.log('║  TP:+20% · SL:-20% · 10min · Rate limit safe                ║');
   console.log('╚══════════════════════════════════════════════════════════════╝\n');
 
   if(!CONFIG.HELIUS_API_KEY) { log('ERROR', 'HELIUS_API_KEY missing'); process.exit(1); }
   if(!CONFIG.PRIVATE_KEY_1)  { log('ERROR', 'WALLET_PRIVATE_KEY missing'); process.exit(1); }
 
-  for(const [label, key] of [['W1', CONFIG.PRIVATE_KEY_1], ['W2', CONFIG.PRIVATE_KEY_2]]) {
+  for(const [label, key] of [['W1', CONFIG.PRIVATE_KEY_1], ['W2', CONFIG.PRIVATE_KEY_2], ['W3', CONFIG.PRIVATE_KEY_3]]) {
     if(!key) { log('INFO', `[${label}] No key — skipping`); continue; }
     try {
       const w   = makeWallet(label);
@@ -642,7 +644,7 @@ async function main() {
 
   await discord(
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-    `🪞  **WINSTON v20.6 ONLINE**\n` +
+    `🪞  **WINSTON v20.7 ONLINE**\n` +
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
     `👀  \`${CONFIG.TARGET}\`\n` +
     `👛  ${wallets.map(w=>wName(w.label)).join(' + ')}\n` +
@@ -665,7 +667,7 @@ async function main() {
       return `**${wName(w.label)}**: ${f.toFixed(3)} SOL (~$${SOL_USD(f)}) · PnL: **${p>=0?'+':''}$${SOL_USD(Math.abs(p))}** · ${w.stats.wins}W/${w.stats.losses}L (${wr}% WR)`;
     }));
     await discord(
-      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON v20.6 OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
+      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON v20.7 OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
       lines.join('\n') + '\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬'
     );
     process.exit(0);
