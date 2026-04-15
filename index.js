@@ -1,5 +1,5 @@
 // ============================================================
-// WINSTON v20.8 — Copy Trade Bot
+// WINSTON v20.9 — Copy Trade Bot
 // ⚠️  HIGH RISK — for educational/personal use only
 // ============================================================
 // SELLING IS THE #1 PRIORITY. Everything else is secondary.
@@ -53,12 +53,17 @@ const CONFIG = {
   BUY_SOL: 0.260, // ~$22 flat every trade
 
   // ── Exit rules ───────────────────────────────────────────
-  //   1. He sells            → emergency exit instantly
-  //   2. Profit = +0.046 SOL → take $4 profit and leave
-  //   3. Down -50%           → lost half, cut it
-  // No timer — ride until one of these fires
-  TP_SOL:          0.070,  // take profit when up ~$6 (0.070 SOL) = 27% on 0.26 SOL
-  SL_PCT:           -50,   // stop loss at -50%
+  //   1. Normal hold:
+  //      - TP: +0.070 SOL profit (~$6) → cash out
+  //      - SL: -50% → cut the loss
+  //   2. After whale sells (post-sell mode):
+  //      - Still riding the bounce, trying to hit TP
+  //      - If drops -35% from entry → bail immediately
+  //      - Hard exit after 4 minutes regardless
+  TP_SOL:               0.070,  // take profit: ~$6 (27% on 0.26 SOL)
+  SL_PCT:                 -50,  // normal stop loss
+  POST_SELL_SL_PCT:       -35,  // tighter SL once whale has sold
+  POST_SELL_TIMER_MS:  240000,  // 4 minutes max after whale sells
 
   // ── Fees ─────────────────────────────────────────────────
   // ── Fees — lowered to reduce cost per trade ─────────────
@@ -413,8 +418,12 @@ async function execBuy(w, mint, whaleSol, sol, attempt=1) {
 
     if(await confirm(sig)) {
       w.positions.set(mint, {
-        time: Date.now(), sol, sym: info.sym,
-        isSelling: false, highestRoi: -Infinity,
+        time:          Date.now(),
+        sol,
+        sym:           info.sym,
+        isSelling:     false,
+        highestRoi:    -Infinity,
+        whaleSoldAt:   null,   // timestamp when whale sold — activates post-sell mode
       });
       w.stats.buys++;
       log('BUY', `✅ [${w.label}] ${info.sym} ${sol.toFixed(4)} SOL | TP:+${CONFIG.TP_SOL}SOL SL:${CONFIG.SL_PCT}%`);
@@ -457,20 +466,44 @@ async function exitManager(w) {
       const ageSec = (Date.now() - pos.time) / 1000;
       const ageMin = (ageSec / 60).toFixed(1);
 
-      // ── PRIORITY 1: Emergency — whale sold, staggered to avoid 429 ─
-      // W1 fires immediately, W2 waits 1.5s, W3 waits 3s
-      // Prevents all 3 wallets hammering Jupiter at the same instant
+      // ── PRIORITY 1: Whale sold → enter post-sell mode ───────
+      // Don't panic sell — ride the bounce, but with tighter rules:
+      //   - SL tightens from -50% to -35%
+      //   - Hard exit after 4 minutes no matter what
+      //   - Still trying to hit TP during this window
       if(w.emergencyQueue.has(mint)) {
         w.emergencyQueue.delete(mint);
-        pos.isSelling = true;
-        const labelIndex = wallets.indexOf(w);
-        const staggerMs  = labelIndex * 1500; // 0ms, 1500ms, 3000ms
-        log('EMERGENCY', `🚨 [${w.label}] WHALE SOLD — emergency exit in ${staggerMs}ms`);
-        setTimeout(() => {
-          execSell(w, mint, 'emergency_whale_sold', true)
-            .catch(e => log('ERROR', `[${w.label}] Emergency sell error: ${e.message}`));
-        }, staggerMs);
+        if(!pos.whaleSoldAt) {
+          pos.whaleSoldAt = Date.now();
+          log('EMERGENCY', `🚨 [${w.label}] WHALE SOLD — entering post-sell mode (4min window, SL:-35%)`);
+          await discord(
+            `⚠️  **WHALE SOLD — POST-SELL MODE** — ${wName(w.label)}\n` +
+            `\`${mint}\`\n` +
+            `━━━━━━━━━━━━━━━━━━━━\n` +
+            `📊  Riding the bounce for up to **4 minutes**\n` +
+            `🎯  Still targeting: **+$${SOL_USD(CONFIG.TP_SOL)}** profit\n` +
+            `🛑  Bail if down: **-${Math.abs(CONFIG.POST_SELL_SL_PCT)}%** from entry\n` +
+            `⏱  Hard exit in: **4 minutes**`
+          );
+        }
         continue;
+      }
+
+      // ── POST-SELL MODE checks ────────────────────────────────
+      if(pos.whaleSoldAt) {
+        const postSellAge = Date.now() - pos.whaleSoldAt;
+
+        // 4 minute hard exit after whale sold
+        if(postSellAge >= CONFIG.POST_SELL_TIMER_MS) {
+          pos.isSelling = true;
+          log('EXIT', `[${w.label}] ⏱ POST-SELL TIMER — 4min elapsed, exiting ${pos.sym}`);
+          const labelIndex = wallets.indexOf(w);
+          setTimeout(() => {
+            execSell(w, mint, 'post_sell_4min', false)
+              .catch(e => log('ERROR', `[${w.label}] Post-sell timer exit error: ${e.message}`));
+          }, labelIndex * 1500);
+          continue;
+        }
       }
 
       // ── PRIORITY 2: SL / he sells — needs ROI quote ─────────
@@ -484,7 +517,9 @@ async function exitManager(w) {
         ? '█'.repeat(Math.min(Math.floor(roi/2), 20)) + '░'.repeat(Math.max(20-Math.floor(roi/2),0))
         : '▓'.repeat(Math.min(Math.floor(Math.abs(roi)/2), 20));
       const profitSolDisplay = (pos.sol * (1 + roi/100) - pos.sol);
-      console.log(`  [${w.label}][${pos.sym}] ${roi>=0?'+':''}${roi.toFixed(1)}% [${bar}] profit:${profitSolDisplay>=0?'+':''}${profitSolDisplay.toFixed(4)} SOL | ${ageMin}min`);
+      const modeTag = pos.whaleSoldAt ? ` 🔄BOUNCE(${((Date.now()-pos.whaleSoldAt)/1000).toFixed(0)}s)` : '';
+      const activeSLDisplay = pos.whaleSoldAt ? CONFIG.POST_SELL_SL_PCT : CONFIG.SL_PCT;
+      console.log(`  [${w.label}][${pos.sym}] ${roi>=0?'+':''}${roi.toFixed(1)}% [${bar}] profit:${profitSolDisplay>=0?'+':''}${profitSolDisplay.toFixed(4)} SOL | ${ageMin}min | SL:${activeSLDisplay}%${modeTag}`);
 
       // ── TP: up $4 (0.046 SOL) → take profit ─────────────
       const currentVal = pos.sol * (1 + roi / 100);
@@ -596,7 +631,7 @@ async function poll() {
 async function health() {
   while(shared.isRunning) {
     console.log('\n' + '═'.repeat(64));
-    console.log('  🪞 WINSTON v20.8 — Copy Trade Bot');
+    console.log('  🪞 WINSTON v20.9 — Copy Trade Bot');
     console.log('═'.repeat(64));
     console.log(`  👀 ${CONFIG.TARGET.slice(0,20)}...`);
     console.log(`  🎯 TP:+${CONFIG.TP_SOL}SOL($4)  SL:${CONFIG.SL_PCT}%  Buy:${CONFIG.BUY_SOL}SOL  Min:${CONFIG.MIN_BUY_SOL_SIGNAL}SOL`);
@@ -621,7 +656,7 @@ async function health() {
 
 async function main() {
   console.log('\n╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  🪞 WINSTON v20.8 — Selling is #1 Priority                   ║');
+  console.log('║  🪞 WINSTON v20.9 — Selling is #1 Priority                   ║');
   console.log('║  TP:+20% · SL:-20% · 10min · Rate limit safe                ║');
   console.log('╚══════════════════════════════════════════════════════════════╝\n');
 
@@ -660,7 +695,7 @@ async function main() {
 
   await discord(
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-    `🪞  **WINSTON v20.8 ONLINE**\n` +
+    `🪞  **WINSTON v20.9 ONLINE**\n` +
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
     `👀  \`${CONFIG.TARGET}\`\n` +
     `👛  ${wallets.map(w=>wName(w.label)).join(' + ')}\n` +
@@ -683,7 +718,7 @@ async function main() {
       return `**${wName(w.label)}**: ${f.toFixed(3)} SOL (~$${SOL_USD(f)}) · PnL: **${p>=0?'+':''}$${SOL_USD(Math.abs(p))}** · ${w.stats.wins}W/${w.stats.losses}L (${wr}% WR)`;
     }));
     await discord(
-      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON v20.8 OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
+      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON v20.9 OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
       lines.join('\n') + '\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬'
     );
     process.exit(0);
