@@ -1,5 +1,5 @@
 // ============================================================
-// WINSTON v20.5 — Copy Trade Bot
+// WINSTON v20.6 — Copy Trade Bot
 // ⚠️  HIGH RISK — for educational/personal use only
 // ============================================================
 // SELLING IS THE #1 PRIORITY. Everything else is secondary.
@@ -49,14 +49,14 @@ const CONFIG = {
     { maxWhaleSol: 8.0,      ourSol: 0.140 }, // ~$12
     { maxWhaleSol: Infinity, ourSol: 0.170 }, // ~$15
   ],
-  BUY_SOL: 0.170, // ~$15 flat every trade
+  BUY_SOL: 0.260, // ~$22 flat every trade
 
   // ── Exit rules ───────────────────────────────────────────
   //   1. He sells            → emergency exit instantly
   //   2. Profit = +0.046 SOL → take $4 profit and leave
   //   3. Down -50%           → lost half, cut it
   // No timer — ride until one of these fires
-  TP_SOL:          0.046,  // take profit when up $4 (0.046 SOL)
+  TP_SOL:          0.070,  // take profit when up ~$6 (0.070 SOL) = 27% on 0.26 SOL
   SL_PCT:           -50,   // stop loss at -50%
 
   // ── Fees ─────────────────────────────────────────────────
@@ -113,6 +113,16 @@ function log(lv, msg, d={}) {
   console.log(`[${ts}] ${ic[lv]||'📋'} [${lv}] ${msg}${Object.keys(d).length?' '+JSON.stringify(d):''}`);
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// USD conversion — 1 USD = 0.012 SOL → 1 SOL = $83.33
+const SOL_USD = (sol) => (sol / 0.012).toFixed(2);
+
+// Wallet display names
+const WALLET_NAMES = {
+  W1: "Daveeeed's Account",
+  W2: "Kinduuuuude's Account",
+};
+const wName = (label) => WALLET_NAMES[label] || label;
 
 // Safe fetch — handles 429 by sleeping and throwing retryable error
 async function safeFetch(url, opts={}, label='') {
@@ -315,18 +325,23 @@ async function execSell(w, mint, reason, emergency=false, attempt=1) {
       const wr = w.stats.sells > 0 ? ((w.stats.wins/w.stats.sells)*100).toFixed(0) : '0';
       log('SELL', `✅ [${w.label}] ${info.sym} → ${solBack.toFixed(4)} SOL (${pnlSign}${pnl.toFixed(4)}) | ${reason} | WR:${wr}%`);
 
-      const label = emergency           ? `🚨 **EMERGENCY EXIT** [${w.label}]`
-        : reason.startsWith('TP')       ? `🎯 **TAKE PROFIT** [${w.label}]`
-        : reason.startsWith('SL')       ? `🛑 **STOP LOSS** [${w.label}]`
-        : reason.startsWith('TP')       ? `🎯 **TAKE PROFIT** [${w.label}]`
-        : `🔴 **SELL** [${w.label}]`;
+      const exitType = emergency ? '🚨 EMERGENCY EXIT'
+        : reason.startsWith('TP') ? '🎯 TAKE PROFIT'
+        : reason.startsWith('SL') ? '🛑 STOP LOSS'
+        : '🔴 SELL';
 
-      await discord(
-        `${label} \`${mint}\`\n` +
-        `💰  **${solBack.toFixed(4)} SOL** back · ${pnlEmoji} **${pnlSign}${pnl.toFixed(4)} SOL** (**${pnlSign}${roiPct.toFixed(1)}%**)\n` +
-        `📊  Session: **${w.stats.wins}W/${w.stats.losses}L** (${wr}% WR) · Total PnL: **${w.stats.totalPnl>=0?'+':''}${w.stats.totalPnl.toFixed(4)} SOL**\n` +
-        `🔗  https://solscan.io/tx/${sig}`
-      );
+      const dMsg = [
+        exitType + ' — **' + wName(w.label) + '**',
+        '━━━━━━━━━━━━━━━━━━━━',
+        '📥  Bought at: **$' + SOL_USD(pos.sol) + '** (' + pos.sol.toFixed(3) + ' SOL)',
+        '📤  Sold at:   **$' + SOL_USD(solBack) + '** (' + solBack.toFixed(3) + ' SOL)',
+        pnlEmoji + '  Profit:    **' + pnlSign + '$' + SOL_USD(Math.abs(pnl)) + '** (' + pnlSign + pnl.toFixed(4) + ' SOL / ' + pnlSign + roiPct.toFixed(1) + '%)',
+        '━━━━━━━━━━━━━━━━━━━━',
+        '📊  Session: **' + w.stats.wins + 'W / ' + w.stats.losses + 'L** (' + wr + '% WR)',
+        '💰  Total PnL: **' + (w.stats.totalPnl>=0?'+':'') + '$' + SOL_USD(Math.abs(w.stats.totalPnl)) + '** (' + (w.stats.totalPnl>=0?'+':'') + w.stats.totalPnl.toFixed(4) + ' SOL)',
+        '🔗  https://solscan.io/tx/' + sig,
+      ].join('\n');
+      await discord(dMsg);
       return true;
     } else { throw new Error('Confirm timeout'); }
   } catch(e) {
@@ -392,9 +407,12 @@ async function execBuy(w, mint, whaleSol, sol, attempt=1) {
       w.stats.buys++;
       log('BUY', `✅ [${w.label}] ${info.sym} ${sol.toFixed(4)} SOL | TP:+${CONFIG.TP_SOL}SOL SL:${CONFIG.SL_PCT}%`);
       await discord(
-        `🪞  **COPY BUY** [${w.label}] \`${mint}\`\n` +
-        `💸  **${sol.toFixed(4)} SOL** | Whale: **${whaleSol.toFixed(2)} SOL**\n` +
-        `🎯  TP: **+0.046 SOL (~$4)** | SL: **${CONFIG.SL_PCT}%** | Exit on whale sell\n` +
+        `🪞  **COPY BUY — ${wName(w.label)}**\n` +
+        `\`${mint}\`\n` +
+        `💸  Bought: **${sol.toFixed(3)} SOL** (~$${SOL_USD(sol)})\n` +
+        `🐋  Whale spent: **${whaleSol.toFixed(2)} SOL** (~$${SOL_USD(whaleSol)})\n` +
+        `🎯  TP: **+${CONFIG.TP_SOL} SOL** (~$${SOL_USD(CONFIG.TP_SOL)} profit) | SL: **${CONFIG.SL_PCT}%**\n` +
+        `🚨  Emergency exit if whale sells\n` +
         `🔗  https://solscan.io/tx/${sig}`
       );
       return true;
@@ -469,7 +487,7 @@ async function exitManager(w) {
         log('EXIT', `[${w.label}] 🛑 STOP LOSS ${pos.sym} at ${roi.toFixed(1)}%`);
         execSell(w, mint, `SL_${roi.toFixed(0)}%`, false)
           .catch(e => log('ERROR', `[${w.label}] SL error: ${e.message}`));
-        await discord(`🛑  **STOP LOSS** [${w.label}] \`${mint.slice(0,16)}...\`\n📊  **${roi.toFixed(1)}%** after **${ageMin}min**`);
+        await discord(`🛑  **STOP LOSS** — ${wName(w.label)}\n\`${mint.slice(0,16)}...\`\n📉  **${roi.toFixed(1)}%** (~-$${SOL_USD(Math.abs(pos.sol * roi/100))}) after **${ageMin}min**`);
         continue;
       }
     }
@@ -524,6 +542,13 @@ async function poll() {
             if(IGNORE.has(t.mint)) continue;
             if(t.sol < CONFIG.MIN_BUY_SOL_SIGNAL) {
               log('INFO', `⏭ SKIP ${t.mint.slice(0,10)}... whale only ${t.sol.toFixed(2)} SOL (min: ${CONFIG.MIN_BUY_SOL_SIGNAL})`);
+              await discord(
+                `⏭  **SKIPPED TRADE**\n` +
+                `\`${t.mint}\`\n` +
+                `🐋  Whale spent **${t.sol.toFixed(3)} SOL** (~$${SOL_USD(t.sol)})\n` +
+                `❌  Reason: below **${CONFIG.MIN_BUY_SOL_SIGNAL} SOL** minimum signal\n` +
+                `🔗  https://solscan.io/account/${CONFIG.TARGET}`
+              );
               continue;
             }
             const ourSize = scaleBuy(t.sol);
@@ -553,7 +578,7 @@ async function poll() {
 async function health() {
   while(shared.isRunning) {
     console.log('\n' + '═'.repeat(64));
-    console.log('  🪞 WINSTON v20.5 — Copy Trade Bot');
+    console.log('  🪞 WINSTON v20.6 — Copy Trade Bot');
     console.log('═'.repeat(64));
     console.log(`  👀 ${CONFIG.TARGET.slice(0,20)}...`);
     console.log(`  🎯 TP:+${CONFIG.TP_SOL}SOL($4)  SL:${CONFIG.SL_PCT}%  Buy:${CONFIG.BUY_SOL}SOL  Min:${CONFIG.MIN_BUY_SOL_SIGNAL}SOL`);
@@ -578,7 +603,7 @@ async function health() {
 
 async function main() {
   console.log('\n╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  🪞 WINSTON v20.5 — Selling is #1 Priority                   ║');
+  console.log('║  🪞 WINSTON v20.6 — Selling is #1 Priority                   ║');
   console.log('║  TP:+20% · SL:-20% · 10min · Rate limit safe                ║');
   console.log('╚══════════════════════════════════════════════════════════════╝\n');
 
@@ -617,10 +642,11 @@ async function main() {
 
   await discord(
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-    `🪞  **WINSTON v20.5 ONLINE**\n` +
+    `🪞  **WINSTON v20.6 ONLINE**\n` +
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
     `👀  \`${CONFIG.TARGET}\`\n` +
-    `👛  ${wallets.map(w=>`[${w.label}]`).join(' + ')} · **$10–$15** per wallet\n` +
+    `👛  ${wallets.map(w=>wName(w.label)).join(' + ')}\n` +
+    `💸  Buy: **0.26 SOL (~$22)** per wallet | TP: **+$${SOL_USD(CONFIG.TP_SOL)}** profit\n` +
     `🎯  TP: **+0.046 SOL (~$4)** | SL: **${CONFIG.SL_PCT}%** | Exit on whale sell\n` +
     `🚨  Emergency exit if whale sells\n` +
     `📡  Rate-limit safe: poll ${CONFIG.POLL_MS}ms · ROI check ${CONFIG.EXIT_CHECK_MS}ms\n` +
@@ -636,10 +662,10 @@ async function main() {
       const f  = await solBal(w.keypair);
       const p  = f - w.stats.startBal;
       const wr = w.stats.sells>0 ? ((w.stats.wins/w.stats.sells)*100).toFixed(0) : '0';
-      return `[${w.label}] **${f.toFixed(4)} SOL** · PnL:**${p>=0?'+':''}${p.toFixed(4)}** · ${w.stats.wins}W/${w.stats.losses}L (${wr}% WR)`;
+      return `**${wName(w.label)}**: ${f.toFixed(3)} SOL (~$${SOL_USD(f)}) · PnL: **${p>=0?'+':''}$${SOL_USD(Math.abs(p))}** · ${w.stats.wins}W/${w.stats.losses}L (${wr}% WR)`;
     }));
     await discord(
-      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON v20.5 OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
+      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON v20.6 OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
       lines.join('\n') + '\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬'
     );
     process.exit(0);
