@@ -1,5 +1,5 @@
 // ============================================================
-// WINSTON v21.0 — Copy Trade Bot
+// WINSTON v21.1 — Copy Trade Bot
 // ⚠️  HIGH RISK — for educational/personal use only
 // ============================================================
 // SELLING IS THE #1 PRIORITY. Everything else is secondary.
@@ -61,8 +61,8 @@ const CONFIG = {
   //      - If drops -35% from entry → bail immediately
   //      - Hard exit after 4 minutes regardless
   TP_SOL:               0.070,  // take profit: ~$6 (27% on 0.26 SOL)
-  SL_PCT:                 -50,  // normal stop loss
-  POST_SELL_SL_PCT:       -35,  // tighter SL once whale has sold
+  SL_PCT:                 -70,  // stop loss — lost 70%, emergency exit
+  POST_SELL_SL_PCT:       -70,  // same SL in post-sell mode — let it ride
   POST_SELL_TIMER_MS:  600000,  // 10 minutes max after whale sells
   MAX_HOLD_MS:         900000,  // 15 minutes absolute max from buy — no exceptions
 
@@ -483,7 +483,7 @@ async function exitManager(w) {
             `━━━━━━━━━━━━━━━━━━━━\n` +
             `📊  Riding the bounce for up to **4 minutes**\n` +
             `🎯  Still targeting: **+$${SOL_USD(CONFIG.TP_SOL)}** profit\n` +
-            `🛑  Bail if down: **-${Math.abs(CONFIG.POST_SELL_SL_PCT)}%** from entry\n` +
+            `🛑  Bail if down: **-${Math.abs(CONFIG.POST_SELL_SL_PCT)}%** from entry\n` + +
             `⏱  Hard exit in: **10 minutes**`
           );
         }
@@ -654,7 +654,7 @@ async function poll() {
 async function health() {
   while(shared.isRunning) {
     console.log('\n' + '═'.repeat(64));
-    console.log('  🪞 WINSTON v21.0 — Copy Trade Bot');
+    console.log('  🪞 WINSTON v21.1 — Copy Trade Bot');
     console.log('═'.repeat(64));
     console.log(`  👀 ${CONFIG.TARGET.slice(0,20)}...`);
     console.log(`  🎯 TP:+${CONFIG.TP_SOL}SOL($4)  SL:${CONFIG.SL_PCT}%  Buy:${CONFIG.BUY_SOL}SOL  Min:${CONFIG.MIN_BUY_SOL_SIGNAL}SOL`);
@@ -679,7 +679,7 @@ async function health() {
 
 async function main() {
   console.log('\n╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  🪞 WINSTON v21.0 — Selling is #1 Priority                   ║');
+  console.log('║  🪞 WINSTON v21.1 — Selling is #1 Priority                   ║');
   console.log('║  TP:+20% · SL:-20% · 10min · Rate limit safe                ║');
   console.log('╚══════════════════════════════════════════════════════════════╝\n');
 
@@ -718,7 +718,7 @@ async function main() {
 
   await discord(
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-    `🪞  **WINSTON v21.0 ONLINE**\n` +
+    `🪞  **WINSTON v21.1 ONLINE**\n` +
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
     `👀  \`${CONFIG.TARGET}\`\n` +
     `👛  ${wallets.map(w=>wName(w.label)).join(' + ')}\n` +
@@ -741,7 +741,7 @@ async function main() {
       return `**${wName(w.label)}**: ${f.toFixed(3)} SOL (~$${SOL_USD(f)}) · PnL: **${p>=0?'+':''}$${SOL_USD(Math.abs(p))}** · ${w.stats.wins}W/${w.stats.losses}L (${wr}% WR)`;
     }));
     await discord(
-      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON v21.0 OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
+      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON v21.1 OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
       lines.join('\n') + '\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬'
     );
     process.exit(0);
