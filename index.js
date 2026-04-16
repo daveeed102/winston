@@ -1,5 +1,5 @@
 // ============================================================
-// WINSTON v21.1 — Copy Trade Bot
+// WINSTON v21.3 — Copy Trade Bot
 // ⚠️  HIGH RISK — for educational/personal use only
 // ============================================================
 // SELLING IS THE #1 PRIORITY. Everything else is secondary.
@@ -60,11 +60,11 @@ const CONFIG = {
   //      - Still riding the bounce, trying to hit TP
   //      - If drops -35% from entry → bail immediately
   //      - Hard exit after 4 minutes regardless
-  TP_SOL:               0.070,  // take profit: ~$6 (27% on 0.26 SOL)
+  TP_SOL:               0.130,  // take profit: ~$11 (50% on 0.26 SOL)
   SL_PCT:                 -70,  // stop loss — lost 70%, emergency exit
   POST_SELL_SL_PCT:       -70,  // same SL in post-sell mode — let it ride
   POST_SELL_TIMER_MS:  600000,  // 10 minutes max after whale sells
-  MAX_HOLD_MS:         900000,  // 15 minutes absolute max from buy — no exceptions
+  MAX_HOLD_MS:        1800000,  // 30 minutes absolute max from buy — no exceptions
 
   // ── Fees ─────────────────────────────────────────────────
   // ── Fees — lowered to reduce cost per trade ─────────────
@@ -131,6 +131,21 @@ const WALLET_NAMES = {
   W3: "Maxxxxxwell's Account",
 };
 const wName = (label) => WALLET_NAMES[label] || label;
+
+// Random profit celebration GIFs — auto-embed on Discord via Tenor
+const PROFIT_GIFS = [
+  'https://media.tenor.com/LxMBBtB7SWIAAAAC/lets-go-kevin-hart.gif',
+  'https://media.tenor.com/7PMPpHm3tnsAAAAC/money-cash.gif',
+  'https://media.tenor.com/g1jMbTKW_LEAAAAC/hell-yeah-yes.gif',
+  'https://media.tenor.com/OVcRpMBMOdAAAAAC/spongebob-money.gif',
+  'https://media.tenor.com/pGDRfuafJikAAAAC/lets-go-celebrate.gif',
+  'https://media.tenor.com/GfxAlL4YPRYAAAAC/make-it-rain-money.gif',
+  'https://media.tenor.com/NHlHGCeHgkoAAAAC/wolf-of-wall-street-money.gif',
+  'https://media.tenor.com/zJtdH9fRx8QAAAAC/happy-dance-celebrate.gif',
+  'https://media.tenor.com/SqchBooBSMIAAAAC/money-cash-money.gif',
+  'https://media.tenor.com/vxSLMNJoJlgAAAAC/yes-hell-yeah.gif',
+];
+const randomGif = () => PROFIT_GIFS[Math.floor(Math.random() * PROFIT_GIFS.length)];
 
 // Safe fetch — handles 429 by sleeping and throwing retryable error
 async function safeFetch(url, opts={}, label='') {
@@ -348,8 +363,9 @@ async function execSell(w, mint, reason, emergency=false, attempt=1) {
         '📊  Session: **' + w.stats.wins + 'W / ' + w.stats.losses + 'L** (' + wr + '% WR)',
         '💰  Total PnL: **' + (w.stats.totalPnl>=0?'+':'') + '$' + SOL_USD(Math.abs(w.stats.totalPnl)) + '** (' + (w.stats.totalPnl>=0?'+':'') + w.stats.totalPnl.toFixed(4) + ' SOL)',
         '🔗  https://solscan.io/tx/' + sig,
-      ].join('\n');
-      await discord(dMsg);
+      ];
+      if(pnl > 0) dMsg.push(randomGif());
+      await discord(dMsg.join('\n'));
       return true;
     } else { throw new Error('Confirm timeout'); }
   } catch(e) {
@@ -507,17 +523,17 @@ async function exitManager(w) {
         }
       }
 
-      // ── PRIORITY 2: 15min absolute max hold ─────────────────
+      // ── PRIORITY 2: 30min absolute max hold ─────────────────
       const totalAgeMs = Date.now() - pos.time;
       if(totalAgeMs >= CONFIG.MAX_HOLD_MS) {
         pos.isSelling = true;
-        log('EXIT', `[${w.label}] ⏱ 15MIN MAX HOLD ${pos.sym} — exiting`);
+        log('EXIT', `[${w.label}] ⏱ 30MIN MAX HOLD ${pos.sym} — exiting`);
         const labelIndex = wallets.indexOf(w);
         setTimeout(() => {
-          execSell(w, mint, 'max_hold_15min', false)
+          execSell(w, mint, 'max_hold_30min', false)
             .catch(e => log('ERROR', `[${w.label}] Max hold exit error: ${e.message}`));
         }, labelIndex * 1500);
-        await discord(`⏱  **15MIN MAX HOLD** — ${wName(w.label)}\n\`${mint.slice(0,16)}...\`\nAutomatic exit after 15 minutes`);
+        await discord(`⏱  **30MIN MAX HOLD** — ${wName(w.label)}\n\`${mint.slice(0,16)}...\`\nAutomatic exit after 30 minutes`);
         continue;
       }
 
@@ -654,7 +670,7 @@ async function poll() {
 async function health() {
   while(shared.isRunning) {
     console.log('\n' + '═'.repeat(64));
-    console.log('  🪞 WINSTON v21.1 — Copy Trade Bot');
+    console.log('  🪞 WINSTON v21.3 — Copy Trade Bot');
     console.log('═'.repeat(64));
     console.log(`  👀 ${CONFIG.TARGET.slice(0,20)}...`);
     console.log(`  🎯 TP:+${CONFIG.TP_SOL}SOL($4)  SL:${CONFIG.SL_PCT}%  Buy:${CONFIG.BUY_SOL}SOL  Min:${CONFIG.MIN_BUY_SOL_SIGNAL}SOL`);
@@ -679,7 +695,7 @@ async function health() {
 
 async function main() {
   console.log('\n╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  🪞 WINSTON v21.1 — Selling is #1 Priority                   ║');
+  console.log('║  🪞 WINSTON v21.3 — Selling is #1 Priority                   ║');
   console.log('║  TP:+20% · SL:-20% · 10min · Rate limit safe                ║');
   console.log('╚══════════════════════════════════════════════════════════════╝\n');
 
@@ -718,7 +734,7 @@ async function main() {
 
   await discord(
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-    `🪞  **WINSTON v21.1 ONLINE**\n` +
+    `🪞  **WINSTON v21.3 ONLINE**\n` +
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
     `👀  \`${CONFIG.TARGET}\`\n` +
     `👛  ${wallets.map(w=>wName(w.label)).join(' + ')}\n` +
@@ -741,7 +757,7 @@ async function main() {
       return `**${wName(w.label)}**: ${f.toFixed(3)} SOL (~$${SOL_USD(f)}) · PnL: **${p>=0?'+':''}$${SOL_USD(Math.abs(p))}** · ${w.stats.wins}W/${w.stats.losses}L (${wr}% WR)`;
     }));
     await discord(
-      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON v21.1 OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
+      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON v21.3 OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
       lines.join('\n') + '\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬'
     );
     process.exit(0);
