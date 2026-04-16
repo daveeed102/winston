@@ -1,5 +1,5 @@
 // ============================================================
-// WINSTON v20.9 — Copy Trade Bot
+// WINSTON v21.0 — Copy Trade Bot
 // ⚠️  HIGH RISK — for educational/personal use only
 // ============================================================
 // SELLING IS THE #1 PRIORITY. Everything else is secondary.
@@ -64,6 +64,7 @@ const CONFIG = {
   SL_PCT:                 -50,  // normal stop loss
   POST_SELL_SL_PCT:       -35,  // tighter SL once whale has sold
   POST_SELL_TIMER_MS:  600000,  // 10 minutes max after whale sells
+  MAX_HOLD_MS:         900000,  // 15 minutes absolute max from buy — no exceptions
 
   // ── Fees ─────────────────────────────────────────────────
   // ── Fees — lowered to reduce cost per trade ─────────────
@@ -493,7 +494,7 @@ async function exitManager(w) {
       if(pos.whaleSoldAt) {
         const postSellAge = Date.now() - pos.whaleSoldAt;
 
-        // 4 minute hard exit after whale sold
+        // 10 minute hard exit after whale sold
         if(postSellAge >= CONFIG.POST_SELL_TIMER_MS) {
           pos.isSelling = true;
           log('EXIT', `[${w.label}] ⏱ POST-SELL TIMER — 10min elapsed, exiting ${pos.sym}`);
@@ -506,7 +507,21 @@ async function exitManager(w) {
         }
       }
 
-      // ── PRIORITY 2: SL / he sells — needs ROI quote ─────────
+      // ── PRIORITY 2: 15min absolute max hold ─────────────────
+      const totalAgeMs = Date.now() - pos.time;
+      if(totalAgeMs >= CONFIG.MAX_HOLD_MS) {
+        pos.isSelling = true;
+        log('EXIT', `[${w.label}] ⏱ 15MIN MAX HOLD ${pos.sym} — exiting`);
+        const labelIndex = wallets.indexOf(w);
+        setTimeout(() => {
+          execSell(w, mint, 'max_hold_15min', false)
+            .catch(e => log('ERROR', `[${w.label}] Max hold exit error: ${e.message}`));
+        }, labelIndex * 1500);
+        await discord(`⏱  **15MIN MAX HOLD** — ${wName(w.label)}\n\`${mint.slice(0,16)}...\`\nAutomatic exit after 15 minutes`);
+        continue;
+      }
+
+      // ── PRIORITY 3: SL / he sells — needs ROI quote ─────────
       const roi = await getCurrentRoi(mint, pos, w.keypair);
       if(roi === null) continue; // rate limited or error — skip, try next cycle
       if(roi > pos.highestRoi) pos.highestRoi = roi;
@@ -605,15 +620,23 @@ async function poll() {
               continue;
             }
             const ourSize = scaleBuy(t.sol);
+
+            // Blacklist on ALL wallets immediately — prevents re-triggering
+            // on next poll cycle while buys are still confirming
+            for(const w of wallets) w.tradedMints.add(t.mint);
+
             Promise.allSettled(wallets.map(async (w) => {
-              if(w.tradedMints.has(t.mint)) return;
               if(w.positions.has(t.mint)) return;
               const bal = await solBal(w.keypair);
-              if(bal < ourSize + 0.02) {
-                log('INFO', `[${w.label}] 💸 Balance too low (${bal.toFixed(4)} SOL)`);
+              if(bal < ourSize + 0.01) {
+                log('INFO', `[${w.label}] 💸 Balance too low (${bal.toFixed(4)} SOL) — skipping`);
+                await discord(
+                  `⚠️  **LOW BALANCE SKIP** — ${wName(w.label)}\n` +
+                  `💰  Has **${bal.toFixed(4)} SOL** (~$${SOL_USD(bal)}) — needs **${(ourSize+0.01).toFixed(3)} SOL**\n` +
+                  `📥  Top up to trade · missed: \`${t.mint.slice(0,16)}...\``
+                );
                 return;
               }
-              w.tradedMints.add(t.mint);
               log('MIRROR', `🟢 [${w.label}] BUYING ${t.mint.slice(0,10)}... ${ourSize.toFixed(3)} SOL`);
               return execBuy(w, t.mint, t.sol, ourSize);
             })).catch(e => log('ERROR', `allSettled: ${e.message}`));
@@ -631,7 +654,7 @@ async function poll() {
 async function health() {
   while(shared.isRunning) {
     console.log('\n' + '═'.repeat(64));
-    console.log('  🪞 WINSTON v20.9 — Copy Trade Bot');
+    console.log('  🪞 WINSTON v21.0 — Copy Trade Bot');
     console.log('═'.repeat(64));
     console.log(`  👀 ${CONFIG.TARGET.slice(0,20)}...`);
     console.log(`  🎯 TP:+${CONFIG.TP_SOL}SOL($4)  SL:${CONFIG.SL_PCT}%  Buy:${CONFIG.BUY_SOL}SOL  Min:${CONFIG.MIN_BUY_SOL_SIGNAL}SOL`);
@@ -656,7 +679,7 @@ async function health() {
 
 async function main() {
   console.log('\n╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  🪞 WINSTON v20.9 — Selling is #1 Priority                   ║');
+  console.log('║  🪞 WINSTON v21.0 — Selling is #1 Priority                   ║');
   console.log('║  TP:+20% · SL:-20% · 10min · Rate limit safe                ║');
   console.log('╚══════════════════════════════════════════════════════════════╝\n');
 
@@ -695,7 +718,7 @@ async function main() {
 
   await discord(
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-    `🪞  **WINSTON v20.9 ONLINE**\n` +
+    `🪞  **WINSTON v21.0 ONLINE**\n` +
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
     `👀  \`${CONFIG.TARGET}\`\n` +
     `👛  ${wallets.map(w=>wName(w.label)).join(' + ')}\n` +
@@ -718,7 +741,7 @@ async function main() {
       return `**${wName(w.label)}**: ${f.toFixed(3)} SOL (~$${SOL_USD(f)}) · PnL: **${p>=0?'+':''}$${SOL_USD(Math.abs(p))}** · ${w.stats.wins}W/${w.stats.losses}L (${wr}% WR)`;
     }));
     await discord(
-      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON v20.9 OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
+      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON v21.0 OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
       lines.join('\n') + '\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬'
     );
     process.exit(0);
