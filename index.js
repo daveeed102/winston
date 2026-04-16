@@ -1,5 +1,5 @@
 // ============================================================
-// WINSTON v21.3 — Copy Trade Bot
+// WINSTON v21.4 — Copy Trade Bot
 // ⚠️  HIGH RISK — for educational/personal use only
 // ============================================================
 // SELLING IS THE #1 PRIORITY. Everything else is secondary.
@@ -60,7 +60,15 @@ const CONFIG = {
   //      - Still riding the bounce, trying to hit TP
   //      - If drops -35% from entry → bail immediately
   //      - Hard exit after 4 minutes regardless
-  TP_SOL:               0.130,  // take profit: ~$11 (50% on 0.26 SOL)
+  // ── Tiered exits — scale out, ride with house money ─────
+  // Each tier: [roi% trigger, % of REMAINING position to sell]
+  // After each partial sell, cost basis is covered — pure house money
+  TP_TIERS: [
+    { roi: 50,  sellPct: 50 },  // +50%  → sell half,    50% still riding free
+    { roi: 100, sellPct: 50 },  // +100% → sell half of remaining (25% total), 25% riding
+    { roi: 200, sellPct: 50 },  // +200% → sell half of remaining (12.5% total), 12.5% riding
+  ],
+  // Remaining position rides until 30min timer or SL — no forced final exit on profit
   SL_PCT:                 -70,  // stop loss — lost 70%, emergency exit
   POST_SELL_SL_PCT:       -70,  // same SL in post-sell mode — let it ride
   POST_SELL_TIMER_MS:  600000,  // 10 minutes max after whale sells
@@ -397,6 +405,98 @@ async function execSell(w, mint, reason, emergency=false, attempt=1) {
   }
 }
 
+// ── PARTIAL SELL BY FRACTION ────────────────────────────────
+// Sells a fraction (0.0-1.0) of the current token balance
+// Used for tiered exits — keeps the rest riding
+
+async function execPartialSellByFraction(w, mint, fraction, reason, emergency=false, attempt=1) {
+  const info     = await tokenInfo(mint);
+  const pos      = w.positions.get(mint);
+  if(!pos) return false;
+
+  const slippage = emergency ? CONFIG.EMERGENCY_SLIPPAGE_BPS : CONFIG.SELL_SLIPPAGE_BPS;
+  const priority = emergency ? CONFIG.EMERGENCY_PRIORITY_LAMPORTS : CONFIG.SELL_PRIORITY_LAMPORTS;
+  const maxRetries = CONFIG.SELL_MAX_RETRIES;
+
+  log('EXEC', `🔴 [${w.label}] PARTIAL SELL ${(fraction*100).toFixed(0)}% ${info.sym} — ${reason} (attempt ${attempt})`);
+
+  try {
+    const accts = await shared.connection.getParsedTokenAccountsByOwner(
+      w.keypair.publicKey, { mint: new PublicKey(mint) }
+    );
+    const acct = accts?.value?.[0];
+    if(!acct) return false;
+    const bal = parseFloat(acct.account.data.parsed.info.tokenAmount.uiAmount||0);
+    if(bal <= 0) return false;
+    const dec    = acct.account.data.parsed.info.tokenAmount.decimals;
+    const sellAmt = bal * fraction;
+    const raw    = BigInt(Math.floor(sellAmt * Math.pow(10, dec)));
+    if(raw <= 0n) return false;
+
+    const qr = await safeFetch(
+      `${CONFIG.JUPITER_QUOTE}?inputMint=${mint}&outputMint=${CONFIG.SOL_MINT}&amount=${raw.toString()}&slippageBps=${slippage}`,
+      {}, 'partial-sell-quote'
+    );
+    if(!qr.ok) throw new Error(`Partial sell quote ${qr.status}`);
+    const q = await qr.json();
+    if(!q.outAmount) throw new Error('No sell route');
+
+    const sr = await safeFetch(CONFIG.JUPITER_SWAP, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        quoteResponse: q,
+        userPublicKey: w.keypair.publicKey.toString(),
+        wrapAndUnwrapSol: true,
+        dynamicSlippage: { minBps: 50, maxBps: slippage },
+        prioritizationFeeLamports: priority
+      })
+    }, 'partial-sell-swap');
+    if(!sr.ok) throw new Error(`Partial sell swap ${sr.status}`);
+    const sd = await sr.json();
+    if(!sd.swapTransaction) throw new Error('No sell tx');
+
+    const buf = Buffer.from(sd.swapTransaction, 'base64');
+    const tx  = VersionedTransaction.deserialize(buf);
+    tx.sign([w.keypair]);
+    const sig = await shared.connection.sendRawTransaction(tx.serialize(), { skipPreflight:true, maxRetries:8 });
+
+    if(await confirm(sig)) {
+      const solBack  = parseFloat(q.outAmount) / 1e9;
+      const costBasis = pos.sol * fraction;
+      const pnl      = solBack - costBasis;
+      const pnlSign  = pnl >= 0 ? '+' : '';
+      const pnlEmoji = pnl >= 0 ? '📈' : '📉';
+
+      pos.totalProfitSol = (pos.totalProfitSol || 0) + pnl;
+      w.stats.totalPnl  += pnl;
+      if(pnl >= 0) w.stats.wins++;
+      w.stats.sells++;
+
+      log('SELL', `✅ [${w.label}] PARTIAL ${(fraction*100).toFixed(0)}% ${info.sym} → ${solBack.toFixed(4)} SOL (${pnlSign}${pnl.toFixed(4)}) | ${reason}`);
+
+      await discord(
+        `🎯  **PARTIAL SELL ${(fraction*100).toFixed(0)}%** — ${wName(w.label)}\n` +
+        `💰  Got back: **$${SOL_USD(solBack)}** (${solBack.toFixed(4)} SOL)\n` +
+        `${pnlEmoji}  This chunk: **${pnlSign}$${SOL_USD(Math.abs(pnl))}** profit\n` +
+        `🏇  Locked so far: **+$${SOL_USD(pos.totalProfitSol)}** total\n` +
+        `🔗  https://solscan.io/tx/${sig}` +
+        (pnl > 0 ? '\n' + randomGif() : '')
+      );
+      return true;
+    } else { throw new Error('Confirm timeout'); }
+  } catch(e) {
+    log('ERROR', `[${w.label}] Partial sell fail (${attempt}/${maxRetries}): ${e.message}`);
+    if(attempt < maxRetries) {
+      const jitter = Math.floor(Math.random() * 1000);
+      await sleep(2000 * attempt + jitter);
+      return execPartialSellByFraction(w, mint, fraction, reason, emergency, attempt+1);
+    }
+    w.stats.errors++;
+    await discord(`❌ [${w.label}] Partial sell FAILED: ${info.sym} \`${mint.slice(0,16)}\` — ${e.message}`);
+    return false;
+  }
+}
+
 // ── BUY ──────────────────────────────────────────────────────
 
 async function execBuy(w, mint, whaleSol, sol, attempt=1) {
@@ -436,11 +536,14 @@ async function execBuy(w, mint, whaleSol, sol, attempt=1) {
     if(await confirm(sig)) {
       w.positions.set(mint, {
         time:          Date.now(),
-        sol,
+        sol,                   // original buy amount
+        solRemaining:  sol,    // tracks remaining position size as we scale out
         sym:           info.sym,
         isSelling:     false,
         highestRoi:    -Infinity,
-        whaleSoldAt:   null,   // timestamp when whale sold — activates post-sell mode
+        whaleSoldAt:   null,
+        tiersFired:    [],     // which TP tiers have already fired e.g. [50, 100]
+        totalProfitSol: 0,     // running profit locked in so far
       });
       w.stats.buys++;
       log('BUY', `✅ [${w.label}] ${info.sym} ${sol.toFixed(4)} SOL | TP:+${CONFIG.TP_SOL}SOL SL:${CONFIG.SL_PCT}%`);
@@ -547,10 +650,11 @@ async function exitManager(w) {
       const bar = roi >= 0
         ? '█'.repeat(Math.min(Math.floor(roi/2), 20)) + '░'.repeat(Math.max(20-Math.floor(roi/2),0))
         : '▓'.repeat(Math.min(Math.floor(Math.abs(roi)/2), 20));
-      const profitSolDisplay = (pos.sol * (1 + roi/100) - pos.sol);
-      const modeTag = pos.whaleSoldAt ? ` 🔄BOUNCE(${((Date.now()-pos.whaleSoldAt)/1000).toFixed(0)}s)` : '';
+      const profitSolDisplay = (pos.solRemaining * (1 + roi/100) - pos.solRemaining);
+      const modeTag    = pos.whaleSoldAt ? ` 🔄BOUNCE(${((Date.now()-pos.whaleSoldAt)/1000).toFixed(0)}s)` : '';
+      const tiersTag   = pos.tiersFired && pos.tiersFired.length > 0 ? ` tiers:${pos.tiersFired.join(',')}%` : '';
       const activeSLDisplay = pos.whaleSoldAt ? CONFIG.POST_SELL_SL_PCT : CONFIG.SL_PCT;
-      console.log(`  [${w.label}][${pos.sym}] ${roi>=0?'+':''}${roi.toFixed(1)}% [${bar}] profit:${profitSolDisplay>=0?'+':''}${profitSolDisplay.toFixed(4)} SOL | ${ageMin}min | SL:${activeSLDisplay}%${modeTag}`);
+      console.log(`  [${w.label}][${pos.sym}] ${roi>=0?'+':''}${roi.toFixed(1)}% [${bar}] riding:${pos.solRemaining.toFixed(4)} SOL | ${ageMin}min | SL:${activeSLDisplay}%${modeTag}${tiersTag}`);
 
       // ── TP: up $4 (0.046 SOL) → take profit ─────────────
       const currentVal = pos.sol * (1 + roi / 100);
@@ -670,7 +774,7 @@ async function poll() {
 async function health() {
   while(shared.isRunning) {
     console.log('\n' + '═'.repeat(64));
-    console.log('  🪞 WINSTON v21.3 — Copy Trade Bot');
+    console.log('  🪞 WINSTON v21.4 — Copy Trade Bot');
     console.log('═'.repeat(64));
     console.log(`  👀 ${CONFIG.TARGET.slice(0,20)}...`);
     console.log(`  🎯 TP:+${CONFIG.TP_SOL}SOL($4)  SL:${CONFIG.SL_PCT}%  Buy:${CONFIG.BUY_SOL}SOL  Min:${CONFIG.MIN_BUY_SOL_SIGNAL}SOL`);
@@ -695,7 +799,7 @@ async function health() {
 
 async function main() {
   console.log('\n╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  🪞 WINSTON v21.3 — Selling is #1 Priority                   ║');
+  console.log('║  🪞 WINSTON v21.4 — Selling is #1 Priority                   ║');
   console.log('║  TP:+20% · SL:-20% · 10min · Rate limit safe                ║');
   console.log('╚══════════════════════════════════════════════════════════════╝\n');
 
@@ -734,7 +838,7 @@ async function main() {
 
   await discord(
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-    `🪞  **WINSTON v21.3 ONLINE**\n` +
+    `🪞  **WINSTON v21.4 ONLINE**\n` +
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
     `👀  \`${CONFIG.TARGET}\`\n` +
     `👛  ${wallets.map(w=>wName(w.label)).join(' + ')}\n` +
@@ -757,7 +861,7 @@ async function main() {
       return `**${wName(w.label)}**: ${f.toFixed(3)} SOL (~$${SOL_USD(f)}) · PnL: **${p>=0?'+':''}$${SOL_USD(Math.abs(p))}** · ${w.stats.wins}W/${w.stats.losses}L (${wr}% WR)`;
     }));
     await discord(
-      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON v21.3 OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
+      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON v21.4 OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
       lines.join('\n') + '\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬'
     );
     process.exit(0);
