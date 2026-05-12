@@ -56,7 +56,7 @@ const CONFIG = {
   MIN_BUY_SOL_SIGNAL: 0.8,
 
   // ── Buy size: $4 flat ─────────────────────────────────────
-  BUY_SOL: 0.042,  // ~$4 at current prices
+  BUY_SOL: 0.016,  // ~$1.50 at current prices
 
   // ── Tiered exits — scale out, ride with house money ──────
   // Tuned for scalper behavior — take profit earlier
