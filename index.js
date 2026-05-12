@@ -36,7 +36,7 @@ const CONFIG = {
   JUPITER_QUOTE: 'https://lite-api.jup.ag/swap/v1/quote',
   JUPITER_SWAP:  'https://lite-api.jup.ag/swap/v1/swap',
 
-  TARGET: 'CP7eVtQYsweR7vAjSvW2shgA1weszsVmxDFbpV22s5w1',
+  TARGET: '57ZJXaG4Y4CFzCNym2W3PzKSKYaayhijtTrR7TKB26x9',
 
   // ── Entry filter ─────────────────────────────────────────
   MIN_BUY_SOL_SIGNAL: 2.0,  // only copy 2+ SOL buys
@@ -46,9 +46,9 @@ const CONFIG = {
   // Whale 4-8 SOL   → 0.14 SOL (~$12)
   // Whale 8+ SOL    → 0.17 SOL (~$15)
   BUY_TIERS: [
-    { maxWhaleSol: 4.0,      ourSol: 0.120 }, // ~$10
-    { maxWhaleSol: 8.0,      ourSol: 0.140 }, // ~$12
-    { maxWhaleSol: Infinity, ourSol: 0.170 }, // ~$15
+    { maxWhaleSol: 2.0,      ourSol: 0.032 }, // ~$10
+    { maxWhaleSol: 4.0,      ourSol: 0.032 }, // ~$12
+    { maxWhaleSol: Infinity, ourSol: 0.032 }, // ~$15
   ],
   BUY_SOL: 0.260, // ~$22 flat every trade
 
