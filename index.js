@@ -1,5 +1,5 @@
 // ============================================================
-// WINSTON v22.0 — Copy Trade Bot
+// WINSTON v22.1 — Copy Trade Bot
 // ⚠️  HIGH RISK — for educational/personal use only
 // ============================================================
 // Target: 57ZJXaG4Y4CFzCNym2W3PzKSKYaayhijtTrR7TKB26x9
@@ -68,11 +68,11 @@ const CONFIG = {
   ],
 
   SL_PCT:           -70,   // stop loss — lost 70%, bail
-  POST_SELL_SL_PCT: -70,   // same SL in post-sell mode
+  POST_SELL_SL_PCT: -50,   // looser in post-sell — riding the bounce
 
   // ── Timers tuned for scalper ─────────────────────────────
   // This whale exits in minutes, not hours — stay tight
-  POST_SELL_TIMER_MS:  120000,  // 2 min after whale sells (was 10min)
+  POST_SELL_TIMER_MS:  300000,  // 5 min after whale sells — stay in for the bounce
   MAX_HOLD_MS:         600000,  // 10 min absolute max (was 30min)
 
   // ── Fees ─────────────────────────────────────────────────
@@ -534,7 +534,7 @@ async function execBuy(w, mint, whaleSol, sol, attempt=1) {
         `💸  Bought: **${sol.toFixed(4)} SOL** (~$${SOL_USD(sol)})\n` +
         `🐋  Whale spent: **${whaleSol.toFixed(2)} SOL** (~$${SOL_USD(whaleSol)})\n` +
         `🎯  TP tiers: **+50% / +100% / +200%** | SL: **${CONFIG.SL_PCT}%**\n` +
-        `⏱  Max hold: **${CONFIG.MAX_HOLD_MS/60000}min** | Post-sell: **${CONFIG.POST_SELL_TIMER_MS/60000}min**\n` +
+        `⏱  Max hold: **${CONFIG.MAX_HOLD_MS/60000}min** | Post-sell window: **${CONFIG.POST_SELL_TIMER_MS/60000}min**\n` +
         `🚨  Emergency exit if whale sells\n` +
         `🔗  https://solscan.io/tx/${sig}`
       );
@@ -577,9 +577,9 @@ async function exitManager(w) {
             `⚠️  **WHALE SOLD — POST-SELL MODE** — ${wName(w.label)}\n` +
             `\`${mint}\`\n` +
             `━━━━━━━━━━━━━━━━━━━━\n` +
-            `📊  This whale scalps fast — riding max **2 minutes**\n` +
+            `📊  This whale scalps fast — riding max **5 minutes**\n` +
             `🛑  Bail if down: **-${Math.abs(CONFIG.POST_SELL_SL_PCT)}%** from entry\n` +
-            `⏱  Hard exit in: **2 minutes**`
+            `⏱  Hard exit in: **5 minutes**`
           );
         }
         continue;
@@ -590,10 +590,10 @@ async function exitManager(w) {
         const postSellAge = Date.now() - pos.whaleSoldAt;
         if(postSellAge >= CONFIG.POST_SELL_TIMER_MS) {
           pos.isSelling = true;
-          log('EXIT', `[${w.label}] ⏱ POST-SELL TIMER — 2min elapsed, exiting ${pos.sym}`);
+          log('EXIT', `[${w.label}] ⏱ POST-SELL TIMER — 5min elapsed, exiting ${pos.sym}`);
           const labelIndex = wallets.indexOf(w);
           setTimeout(() => {
-            execSell(w, mint, 'post_sell_2min', false)
+            execSell(w, mint, 'post_sell_5min', false)
               .catch(e => log('ERROR', `[${w.label}] Post-sell timer exit error: ${e.message}`));
           }, labelIndex * 1500);
           continue;
@@ -742,7 +742,7 @@ async function poll() {
 async function health() {
   while(shared.isRunning) {
     console.log('\n' + '═'.repeat(64));
-    console.log('  🪞 WINSTON v22.0 — Scalper Copy Bot');
+    console.log('  🪞 WINSTON v22.1 — Scalper Copy Bot');
     console.log('═'.repeat(64));
     console.log(`  👀 ${CONFIG.TARGET.slice(0,20)}... (scalper profile)`);
     console.log(`  💸 Buy:${CONFIG.BUY_SOL}SOL($${SOL_USD(CONFIG.BUY_SOL)})  Min:${CONFIG.MIN_BUY_SOL_SIGNAL}SOL  SL:${CONFIG.SL_PCT}%  Max:${CONFIG.MAX_HOLD_MS/60000}min`);
@@ -768,8 +768,8 @@ async function health() {
 
 async function main() {
   console.log('\n╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  🪞 WINSTON v22.0 — Scalper Copy Bot                         ║');
-  console.log('║  Buy:$4 · Min:0.8SOL signal · SL:-70% · 10min max           ║');
+  console.log('║  🪞 WINSTON v22.1 — Scalper Copy Bot                         ║');
+  console.log('║  Buy:$4 · Min:0.8SOL · SL:-70% · Post-sell:5min           ║');
   console.log('╚══════════════════════════════════════════════════════════════╝\n');
 
   if(!CONFIG.HELIUS_API_KEY) { log('ERROR', 'HELIUS_API_KEY missing'); process.exit(1); }
@@ -807,7 +807,7 @@ async function main() {
 
   await discord(
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-    `🪞  **WINSTON v22.0 ONLINE**\n` +
+    `🪞  **WINSTON v22.1 ONLINE**\n` +
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
     `👀  \`${CONFIG.TARGET}\`\n` +
     `🎯  Profile: **High-frequency scalper** (1–1.5 SOL buys)\n` +
@@ -832,7 +832,7 @@ async function main() {
       return `**${wName(w.label)}**: ${f.toFixed(4)} SOL (~$${SOL_USD(f)}) · PnL: **${p>=0?'+':''}$${SOL_USD(Math.abs(p))}** · ${w.stats.wins}W/${w.stats.losses}L (${wr}% WR)`;
     }));
     await discord(
-      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON v22.0 OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
+      `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔴  **WINSTON v22.1 OFFLINE**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
       lines.join('\n') + '\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬'
     );
     process.exit(0);
