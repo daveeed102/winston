@@ -1,6 +1,6 @@
 {
-  "name": "winston-v25",
-  "version": "25.0.0",
+  "name": "winston-v28",
+  "version": "28.0.0",
   "main": "index.js",
   "scripts": { "start": "node index.js" },
   "dependencies": {
@@ -8,7 +8,8 @@
     "bs58": "5.0.0",
     "dotenv": "16.4.5",
     "node-fetch": "2.7.0",
-    "rpc-websockets": "7.5.1"
+    "rpc-websockets": "7.5.1",
+    "ws": "8.18.0"
   },
   "overrides": {
     "uuid": "8.3.2",
