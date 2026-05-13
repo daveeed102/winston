@@ -1,6 +1,6 @@
 {
-  "name": "winston-v24",
-  "version": "24.0.0",
+  "name": "winston-v25",
+  "version": "25.0.0",
   "main": "index.js",
   "scripts": { "start": "node index.js" },
   "dependencies": {
