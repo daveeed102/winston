@@ -77,12 +77,12 @@ const CONFIG = {
   //     b) Moon: +200% from original entry (take the win)
   //     c) Target sells while moonbag active → optional exit
   //   Moonbag SL is measured from moonbagEntryRoi (not entry)
-  TP_ROI_PCT:            35,    // take profit trigger
-  TP_SELL_FRACTION:      0.75,  // sell 75% at TP
-  SL_PCT:               -35,   // full stop loss before TP
-  MOONBAG_DUMP_PCT:     -40,   // moonbag SL: -40% FROM moonbag-entry price
-  MOONBAG_MOON_PCT:     200,   // moonbag final exit: +200% from original entry
-  NO_TP_TIMEOUT_MS:   600000,  // 10min timeout ONLY if TP never fired
+  TP_ROI_PCT:           37,    // take profit trigger: +35–40% range, set at 37%
+  TP_FULL_EXIT_PCT:     50,    // if +50% before TP executes → sell 100% immediately
+  TP_SELL_FRACTION:     0.75,  // sell 75% at TP, keep 25% moonbag
+  SL_PCT:              -35,   // stop loss: -30% to -40% range, set at -35%
+  MOONBAG_DUMP_PCT:    -40,   // moonbag SL: -40% DROP from moonbag-entry price
+  MOONBAG_MOON_PCT:    300,   // moonbag moon exit: +300% from original entry
 
   // ── No-chase check ───────────────────────────────────────
   NO_CHASE_CHECK_DELAY_MS: 8000,
@@ -576,8 +576,7 @@ async function execBuy(mint, whaleSol, attempt=1) {
         `━━━━━━━━━━━━━━━━━━━━\n` +
         `🎯  TP: **+${CONFIG.TP_ROI_PCT}%** → sell 75%, moonbag 25% (no time limit)\n` +
         `🛑  SL: **${CONFIG.SL_PCT}%** → full exit\n` +
-        `⏱  **10min timeout** ONLY if TP never fires\n` +
-        `🌙  Moonbag exits: dump **-40%** | moon **+200%** | target sells\n` +
+        `🌙  Moonbag exits: dump **-40% from TP** | moon **+${CONFIG.MOONBAG_MOON_PCT}%** | NO timer\n` +
         `🚫  No-chase check in 8s\n` +
         `🔗  https://solscan.io/tx/${sig}`
       );
@@ -617,7 +616,7 @@ async function execBuy(mint, whaleSol, attempt=1) {
 // ── EXIT MANAGER ──────────────────────────────────────────────
 
 async function exitManager() {
-  log('INFO', `🎯 Exit manager | TP:+${CONFIG.TP_ROI_PCT}% SL:${CONFIG.SL_PCT}% | Moonbag: no time limit`);
+  log('INFO', `🎯 Exit manager | TP:+${CONFIG.TP_ROI_PCT}% SL:${CONFIG.SL_PCT}% | NO time-based exits`);
 
   while(shared.isRunning) {
     await sleep(CONFIG.EXIT_CHECK_MS);
@@ -625,8 +624,7 @@ async function exitManager() {
     for(const [mint, pos] of wallet.positions) {
       if(pos.isSelling) continue;
 
-      const ageMs  = Date.now() - pos.time;
-      const ageMin = (ageMs / 60000).toFixed(1);
+      const ageMin = ((Date.now() - pos.time) / 60000).toFixed(1);
 
       // ── TARGET SOLD ───────────────────────────────────────
       if(wallet.emergencyQueue.has(mint)) {
@@ -641,54 +639,52 @@ async function exitManager() {
             execSell(mint, 'target_sold_before_TP', true)
               .catch(e => log('ERROR', `Target-sold exit: ${e.message}`));
           } else {
-            // In moonbag — riding free money
-            // Option: sell moonbag too when target sells (conservative)
-            // Keeping moonbag alive — it's free money, let it ride
-            log('MOONBAG', `🌙 Target sold but moonbag is free money on ${pos.sym} — continuing to ride`);
+            // Moonbag is free money — keep riding, ignore target sell
+            log('MOONBAG', `🌙 Target sold — moonbag on ${pos.sym} rides on (free money)`);
             await discord(
               `🌙  **Target sold — ${pos.sym}**\n` +
               `Moonbag is pure profit — continuing to ride\n` +
-              `Exits only on: dump **-40%** | moon **+200%**`
+              `Exits: dump **-40% from TP** | moon **+${CONFIG.MOONBAG_MOON_PCT}%**`
             );
           }
         }
         continue;
       }
 
-      // ── MOONBAG MODE (no time limit) ──────────────────────
+      // ── MOONBAG MODE — no time limit ──────────────────────
+      // Only exits on: hard dump OR moon target OR manual
       if(pos.moonbagMode) {
         const roi = await getCurrentRoi(mint, pos);
         if(roi === null) continue;
 
-        // Moonbag dump SL: -40% DROP from moonbag entry ROI
-        // e.g. TP fired at +35%, moonbagEntryRoi=35
-        // Dump SL triggers if roi drops to 35 - 40 = -5% (back near breakeven)
+        // dumpSLThreshold: if TP fired at +50%, threshold = 50 - 40 = +10%
+        // Protects profit — won't let it fall back below ~breakeven
         const dumpSLThreshold = (pos.moonbagEntryRoi || CONFIG.TP_ROI_PCT) - CONFIG.MOONBAG_DUMP_PCT;
         const moonbagAge      = ((Date.now() - pos.moonbagStartMs) / 60000).toFixed(1);
 
         const bar = roi >= 0
           ? '█'.repeat(Math.min(Math.floor(roi/5),20)) + '░'.repeat(Math.max(20-Math.floor(roi/5),0))
           : '▓'.repeat(Math.min(Math.floor(Math.abs(roi)/5),20));
-        console.log(`  🌙 [MOONBAG][${pos.sym}] ${pctStr(roi)} [${bar}] | ${moonbagAge}min riding | DumpSL@${pctStr(dumpSLThreshold)} Moon@+${CONFIG.MOONBAG_MOON_PCT}%`);
+        console.log(`  🌙 [MOONBAG][${pos.sym}] ${pctStr(roi)} [${bar}] | ${moonbagAge}min | DumpSL@${pctStr(dumpSLThreshold)} Moon@+${CONFIG.MOONBAG_MOON_PCT}%`);
 
-        // Moon target: +200% from original entry
+        // Moon target: pumped hard — take the win
         if(roi >= CONFIG.MOONBAG_MOON_PCT) {
           pos.isSelling = true;
-          log('MOONBAG', `🚀 MOON TARGET +${roi.toFixed(1)}% on ${pos.sym} — cashing moonbag`);
+          log('MOONBAG', `🚀 MOON TARGET ${pctStr(roi)} on ${pos.sym} — cashing moonbag`);
           await discord(`🌙🚀  **MOONBAG MOON EXIT — ${pos.sym}**\n🎉  **${pctStr(roi)}** from entry — cashing out!`);
           execSell(mint, `moonbag_moon_${roi.toFixed(0)}pct`, false)
             .catch(e => log('ERROR', `Moonbag moon exit: ${e.message}`));
           continue;
         }
 
-        // Dump SL: dropped -40% from where TP fired
+        // Dump SL: fell -40% from where TP fired — cut before profit evaporates
         if(roi <= dumpSLThreshold) {
           pos.isSelling = true;
-          log('MOONBAG', `🛑 MOONBAG DUMP SL — ${pos.sym} at ${pctStr(roi)} (threshold: ${pctStr(dumpSLThreshold)})`);
+          log('MOONBAG', `🛑 MOONBAG DUMP SL ${pos.sym} at ${pctStr(roi)} (threshold: ${pctStr(dumpSLThreshold)})`);
           await discord(
             `🌙🛑  **MOONBAG DUMP SL — ${pos.sym}**\n` +
-            `📉  Now at **${pctStr(roi)}** — dropped 40% from TP entry\n` +
-            `Cutting moonbag before it erases profit`
+            `📉  Now **${pctStr(roi)}** — dropped 40% from TP entry\n` +
+            `Cutting before profit erases`
           );
           execSell(mint, `moonbag_dump_SL_${roi.toFixed(0)}pct`, false)
             .catch(e => log('ERROR', `Moonbag dump SL: ${e.message}`));
@@ -696,21 +692,8 @@ async function exitManager() {
         continue;
       }
 
-      // ── 10MIN TIMEOUT — only if TP never fired ────────────
-      if(!pos.tpFired && ageMs >= CONFIG.NO_TP_TIMEOUT_MS) {
-        pos.isSelling = true;
-        log('EXIT', `⏱ 10MIN NO-PROFIT TIMEOUT ${pos.sym} — TP never hit, exiting`);
-        await discord(
-          `⏱  **NO-PROFIT TIMEOUT — ${pos.sym}**\n` +
-          `10 minutes and TP (+${CONFIG.TP_ROI_PCT}%) never fired\n` +
-          `Exiting to free up capital`
-        );
-        execSell(mint, 'no_tp_timeout_10min', false)
-          .catch(e => log('ERROR', `Timeout exit: ${e.message}`));
-        continue;
-      }
-
-      // ── LIVE ROI CHECK ────────────────────────────────────
+      // ── LIVE ROI CHECK (main position) ───────────────────
+      // NO time-based exit — hold until TP or SL, period
       const roi = await getCurrentRoi(mint, pos);
       if(roi === null) continue;
       if(roi > pos.highestRoi) pos.highestRoi = roi;
@@ -718,23 +701,36 @@ async function exitManager() {
       const bar = roi >= 0
         ? '█'.repeat(Math.min(Math.floor(roi/5),20)) + '░'.repeat(Math.max(20-Math.floor(roi/5),0))
         : '▓'.repeat(Math.min(Math.floor(Math.abs(roi)/5),20));
-      const timeLeft = Math.max(0, CONFIG.NO_TP_TIMEOUT_MS - ageMs);
-      console.log(`  [${pos.sym}] ${pctStr(roi)} [${bar}] | ${ageMin}min | SL:${CONFIG.SL_PCT}% TP:+${CONFIG.TP_ROI_PCT}% | timeout:${(timeLeft/60000).toFixed(1)}min`);
+      console.log(`  [${pos.sym}] ${pctStr(roi)} [${bar}] | ${ageMin}min | SL:${CONFIG.SL_PCT}% TP:+${CONFIG.TP_ROI_PCT}% | holding until TP/SL`);
 
-      // ── TAKE PROFIT → 75% sell + moonbag 25% ─────────────
+      // ── FULL EXIT if +50% before TP executes ─────────────
+      // Rocket case — don't wait for partial, just take everything
+      if(roi >= CONFIG.TP_FULL_EXIT_PCT && !pos.tpFired) {
+        pos.isSelling = true;
+        log('EXIT', `🚀 FULL EXIT ${pctStr(roi)} on ${pos.sym} — hit +${CONFIG.TP_FULL_EXIT_PCT}% before TP, selling 100%`);
+        await discord(
+          `🚀  **ROCKET EXIT — ${pos.sym}**\n` +
+          `📈  Hit **${pctStr(roi)}** before TP could execute\n` +
+          `Selling **100%** immediately`
+        );
+        execSell(mint, `rocket_${roi.toFixed(0)}pct`, false)
+          .catch(e => log('ERROR', `Rocket exit: ${e.message}`));
+        continue;
+      }
+
+      // ── TAKE PROFIT at +37% → sell 75%, moonbag 25% ──────
       if(roi >= CONFIG.TP_ROI_PCT && !pos.tpFired) {
         pos.tpFired = true;
-        log('EXIT', `🎯 TP ${pctStr(roi)} on ${pos.sym} — selling 75%, moonbag 25% (NO time limit)`);
+        log('EXIT', `🎯 TP ${pctStr(roi)} on ${pos.sym} — selling 75%, moonbag 25% rides free`);
         execPartialSell(mint, CONFIG.TP_SELL_FRACTION, roi)
           .catch(e => {
-            // If partial sell fails entirely, reset tpFired so we try again next cycle
-            pos.tpFired = false;
+            pos.tpFired = false; // reset so we retry next cycle
             log('ERROR', `TP partial sell failed: ${e.message}`);
           });
         continue;
       }
 
-      // ── STOP LOSS ─────────────────────────────────────────
+      // ── STOP LOSS at -35% ─────────────────────────────────
       if(roi <= CONFIG.SL_PCT) {
         pos.isSelling = true;
         log('EXIT', `🛑 STOP LOSS ${pos.sym} at ${pctStr(roi)}`);
@@ -945,7 +941,7 @@ async function main() {
     `🎯  TP: **+${CONFIG.TP_ROI_PCT}%** → sell 75%, moonbag 25% **(no time limit)**\n` +
     `🌙  Moonbag exits: dump **-40%** from TP price | moon **+${CONFIG.MOONBAG_MOON_PCT}%** from entry\n` +
     `🛑  Main SL: **${CONFIG.SL_PCT}%** → full exit\n` +
-    `⏱  **10min timeout** only if TP never fires\n` +
+    `⏳  **No time-based exits** — holds until TP or SL\n` +
     `🚫  No-chase: exits if target sold before our fill\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `💰  Balance: **${wallet.stats.startBal.toFixed(4)} SOL** (~$${SOL_USD(wallet.stats.startBal)})\n` +
