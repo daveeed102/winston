@@ -1,10 +1,10 @@
 // ============================================================
-// WINSTON v24.0 — Copy Trade Bot
+// WINSTON v25.0 — Copy Trade Bot
 // ⚠️  HIGH RISK — for educational/personal use only
 // ============================================================
 // Target: 57ZJXaG4Y4CFzCNym2W3PzKSKYaayhijtTrR7TKB26x9
-// Signal: Only copy buys of 0.9–3.0 SOL from target wallet
-// Buy size: 0.026 SOL (~$2.50) — never increases
+// Signal: Only copy buys of 0.9–2.0 SOL from target wallet
+// Buy size: 0.11 SOL (~$10) — never increases
 //
 // Strategy:
 //   1. Target buys 0.9–3.0 SOL → we buy 0.026 SOL immediately
@@ -49,19 +49,19 @@ const CONFIG = {
 
   // ── Signal filter ────────────────────────────────────────
   MIN_BUY_SOL_SIGNAL: 0.9,
-  MAX_BUY_SOL_SIGNAL: 3.0,
+  MAX_BUY_SOL_SIGNAL: 2.0,  // tightened — his bread-and-butter range
 
   // ── Buy size — NEVER changes ──────────────────────────────
-  BUY_SOL: 0.026,
+  BUY_SOL: 0.11,  // ~$10
 
   // ── Fee safety ───────────────────────────────────────────
-  MIN_SOL_BALANCE:        0.031,   // 0.026 buy + 0.005 fee buffer
+  MIN_SOL_BALANCE:        0.12,    // 0.11 buy + 0.01 fee buffer
   MAX_FEE_PCT_OF_TRADE:   15,      // skip if total fees > 15% of trade value
-  BUY_PRIORITY_LAMPORTS:  200000,  // 0.0002 SOL — low intentionally
+  BUY_PRIORITY_LAMPORTS:  300000,  // 0.0003 SOL — slightly higher for $10 buys
   BUY_SLIPPAGE_BPS:        300,    // 3%
-  SELL_PRIORITY_LAMPORTS:  300000, // 0.0003 SOL
+  SELL_PRIORITY_LAMPORTS:  400000, // 0.0004 SOL
   SELL_SLIPPAGE_BPS:        500,   // 5%
-  EMERGENCY_PRIORITY_LAMPORTS: 1000000, // 0.001 SOL
+  EMERGENCY_PRIORITY_LAMPORTS: 2000000, // 0.002 SOL
   EMERGENCY_SLIPPAGE_BPS:  2000,   // 20%
 
   // ── Exit strategy ────────────────────────────────────────
@@ -77,7 +77,7 @@ const CONFIG = {
   //     b) Moon: +200% from original entry (take the win)
   //     c) Target sells while moonbag active → optional exit
   //   Moonbag SL is measured from moonbagEntryRoi (not entry)
-  TP_ROI_PCT:           37,    // take profit trigger: +35–40% range, set at 37%
+  TP_ROI_PCT:           35,    // take profit at +35%
   TP_FULL_EXIT_PCT:     50,    // if +50% before TP executes → sell 100% immediately
   TP_SELL_FRACTION:     0.75,  // sell 75% at TP, keep 25% moonbag
   SL_PCT:              -35,   // stop loss: -30% to -40% range, set at -35%
@@ -858,7 +858,7 @@ async function health() {
     const feesUsed = wallet.stats.feesTotal.toFixed(4);
 
     console.log('\n' + '═'.repeat(62));
-    console.log('  🪞 WINSTON v24.0 — Moonbag Copy Bot');
+    console.log('  🪞 WINSTON v25.0 — Moonbag Copy Bot');
     console.log('═'.repeat(62));
     console.log(`  👀 ${CONFIG.TARGET.slice(0,24)}...`);
     console.log(`  📏 Signal: ${CONFIG.MIN_BUY_SOL_SIGNAL}–${CONFIG.MAX_BUY_SOL_SIGNAL} SOL | Buy: ${CONFIG.BUY_SOL} SOL ($${SOL_USD(CONFIG.BUY_SOL)})`);
@@ -885,8 +885,8 @@ async function health() {
 
 async function main() {
   console.log('\n╔════════════════════════════════════════════════════════════╗');
-  console.log('║  🪞 WINSTON v24.0 — Moonbag Copy Bot                       ║');
-  console.log('║  $2.50 buy · 0.9–3 SOL signal · TP+35% · SL-35%          ║');
+  console.log('║  🪞 WINSTON v25.0 — Moonbag Copy Bot                       ║');
+  console.log('║  $10 buy · 0.9–2.0 SOL signal · TP+35% · SL-35%          ║');
   console.log('║  Moonbag: no time limit · dumps -40% · moons +200%        ║');
   console.log('╚════════════════════════════════════════════════════════════╝\n');
 
@@ -930,7 +930,7 @@ async function main() {
 
   await discord(
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-    `🪞  **WINSTON v24.0 ONLINE**\n` +
+    `🪞  **WINSTON v25.0 ONLINE**\n` +
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
     `👀  \`${CONFIG.TARGET}\`\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
@@ -959,7 +959,7 @@ async function main() {
     const wr       = wallet.stats.sells > 0 ? ((wallet.stats.wins/wallet.stats.sells)*100).toFixed(0) : '0';
     await discord(
       `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-      `🔴  **WINSTON v24.0 OFFLINE**\n` +
+      `🔴  **WINSTON v25.0 OFFLINE**\n` +
       `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
       `💰  Final: **${finalBal.toFixed(4)} SOL** (~$${SOL_USD(finalBal)})\n` +
       `📈  PnL: **${pnl>=0?'+':''}$${SOL_USD(Math.abs(pnl))}** (${pnl>=0?'+':''}${pnl.toFixed(4)} SOL)\n` +
