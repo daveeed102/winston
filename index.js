@@ -14,7 +14,7 @@
 // Why this works:
 //   - Graduation injects ~$12K liquidity into a fresh pool
 //   - Creates immediate price discovery pump as traders pile in
-//   - We detect it at the SOURCE (PumpPortal WS) not by
+//   - We detect it at the SOURCE (Helius WS) not by
 //     polling someone else's wallet — faster than copy trading
 //
 // Detection method:
@@ -46,8 +46,14 @@ const CONFIG = {
   JUPITER_QUOTE: 'https://lite-api.jup.ag/swap/v1/quote',
   JUPITER_SWAP:  'https://lite-api.jup.ag/swap/v1/swap',
 
-  // PumpPortal WebSocket — free, no API key needed
-  PUMPPORTAL_WS: 'wss://pumpportal.fun/api/data',
+  // Helius WebSocket — uses your existing env var
+  get HELIUS_WS() { return process.env.HELIUS_WS_URL || `wss://mainnet.helius-rpc.com/?api-key=${this.HELIUS_API_KEY}`; },
+
+  // Pump.fun program IDs — both old (Raydium) and new (PumpSwap) graduation
+  PUMPFUN_PROGRAM:  '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+  PUMPSWAP_PROGRAM: 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
+  // Migration account — triggers when bonding curve completes
+  MIGRATION_ACCOUNT: '39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg',
 
   // ── Trade config ─────────────────────────────────────────
   BUY_SOL:         0.055,   // ~$5
@@ -475,138 +481,181 @@ async function exitManager() {
   }
 }
 
-// ── PUMPPORTAL WEBSOCKET ──────────────────────────────────────
-// Connects to PumpPortal and subscribes to migration events
-// Migration = graduation from bonding curve → PumpSwap/Raydium
+// ── HELIUS WEBSOCKET ─────────────────────────────────────────
+// ── HELIUS WEBSOCKET — GRADUATION DETECTOR ────────────────────
+// Uses logsSubscribe to watch the Pump.fun migration account
+// Fires the instant a token completes its bonding curve
 
-function connectPumpPortal() {
-  log('INFO', `🎓 Connecting to PumpPortal WebSocket...`);
+function connectHelius() {
+  log('INFO', `🎓 Connecting to Helius WebSocket...`);
 
-  const ws = new WebSocket(CONFIG.PUMPPORTAL_WS);
+  const ws = new WebSocket(CONFIG.HELIUS_WS);
   shared.ws = ws;
+  let subId = null;
 
   ws.on('open', () => {
-    log('INFO', `✅ PumpPortal connected — subscribing to migrations`);
-    // Subscribe to graduation/migration events
-    ws.send(JSON.stringify({ method: 'subscribeMigration' }));
-    log('INFO', `📡 Listening for Pump.fun graduations...`);
+    log('INFO', `✅ Helius WS connected — subscribing to Pump.fun migration logs`);
+    ws.send(JSON.stringify({
+      jsonrpc: '2.0', id: 1,
+      method: 'logsSubscribe',
+      params: [
+        { mentions: [CONFIG.MIGRATION_ACCOUNT] },
+        { commitment: 'confirmed' },
+      ],
+    }));
+    log('INFO', `📡 Watching migration account: ${CONFIG.MIGRATION_ACCOUNT.slice(0,20)}...`);
   });
 
-  ws.on('message', async (data) => {
+  ws.on('message', async (raw) => {
     shared.wsEvents++;
     try {
-      const event = JSON.parse(data.toString());
+      const msg = JSON.parse(raw.toString());
 
-      // Debug: log first 20 raw events so we can see the payload structure
-      if(shared.wsEvents <= 20) {
-        log('INFO', `📨 RAW WS EVENT #${shared.wsEvents}: ${JSON.stringify(event).slice(0,200)}`);
-      }
-
-      // Migration events can have txType:"migrate" OR just contain mint directly
-      // Handle both formats
-      const mint = event.mint || event.token;
-      if(!mint) {
-        if(shared.wsEvents <= 20) log('INFO', `⚠️  No mint field in event #${shared.wsEvents} — keys: ${Object.keys(event).join(',')}`);
+      // Subscription confirmation
+      if(msg.id === 1 && msg.result !== undefined) {
+        subId = msg.result;
+        log('INFO', `✅ logsSubscribe confirmed subId:${subId} — watching for graduations`);
         return;
       }
 
-      shared.graduations++;
-      const sym  = event.symbol || event.name || '???';
-      const name = event.name   || sym;
+      if(!msg.params?.result?.value) return;
 
-      log('GRAD', `🎓 GRADUATION #${shared.graduations}: ${sym} (${mint.slice(0,12)}...)`);
+      const value = msg.params.result.value;
+      const logs  = value.logs || [];
+      const sig   = value.signature;
 
-      // Skip if already traded this session
-      if(wallet.snipedMints.has(mint)) {
-        log('SKIP', `Already sniped ${sym} this session`);
-        return;
-      }
-
-      // Skip if too many open positions
-      if(wallet.positions.size >= CONFIG.MAX_CONCURRENT_POSITIONS) {
-        wallet.stats.skipped++;
-        log('SKIP', `Max positions (${CONFIG.MAX_CONCURRENT_POSITIONS}) reached — skipping ${sym}`);
-        await discord(
-          `⏭  **SKIPPED — max positions** (${CONFIG.MAX_CONCURRENT_POSITIONS})\n` +
-          `🎓 **${sym}** graduated but we're full\n` +
-          `\`${mint}\``
-        );
-        return;
-      }
-
-      // Balance check
-      const bal = await solBal();
-      if(bal < CONFIG.MIN_SOL_BALANCE) {
-        wallet.stats.skipped++;
-        log('SKIP', `Low balance: ${bal.toFixed(4)} SOL — need ${CONFIG.MIN_SOL_BALANCE}`);
-        await discord(
-          `⚠️  **SKIPPED — LOW BALANCE**\n` +
-          `💰  Have **${bal.toFixed(4)} SOL** | Need **${CONFIG.MIN_SOL_BALANCE} SOL**\n` +
-          `📥  Top up to resume sniping`
-        );
-        return;
-      }
-
-      wallet.stats.attempts++;
-      wallet.snipedMints.add(mint);
-
-      // Rug check — runs fast in parallel with pool opening
-      log('INFO', `🔍 Rug checking ${sym}...`);
-      const rug = await rugCheck(mint);
-      if(!rug.pass) {
-        wallet.stats.skipped++;
-        log('SKIP', `Rug check FAILED ${sym} — score:${rug.score} risks:${rug.risks}`);
-        await discord(
-          `⏭  **SKIPPED — RUG CHECK FAILED**\n` +
-          `🎓 **${sym}**\n` +
-          `🚨  Score: **${rug.score}/1000** (min: ${CONFIG.MIN_RUGCHECK_SCORE})\n` +
-          `⚠️  Risks: ${rug.risks}\n` +
-          `\`${mint}\``
-        );
-        return;
-      }
-
-      log('INFO', `✅ Rug check passed ${sym} — score:${rug.score} — BUYING`);
-
-      await discord(
-        `🎓  **GRADUATION DETECTED — ${name} (${sym})**\n` +
-        `\`${mint}\`\n` +
-        `━━━━━━━━━━━━━━━━━━━━\n` +
-        `✅  Rug score: **${rug.score}/1000**\n` +
-        `🚀  Sniping **${CONFIG.BUY_SOL} SOL** (~$${SOL_USD(CONFIG.BUY_SOL)}) NOW\n` +
-        `📊  https://dexscreener.com/solana/${mint}`
+      // Filter for graduation/migration instructions
+      const isMigration = logs.some(l =>
+        l.includes('MigrateFunds') || l.includes('migrate') || l.includes('Migrate')
       );
+      if(!isMigration) return;
 
-      // Fire the buy — don't await, let it run async
-      execBuy(mint, sym)
-        .catch(e => log('ERROR', `execBuy error: ${e.message}`));
+      log('GRAD', `🎓 GRADUATION TX — sig:${sig?.slice(0,20)}...`);
+      shared.graduations++;
 
-    } catch(e) {
-      log('ERROR', `WS message parse error: ${e.message}`);
-    }
+      fetchGraduationMint(sig)
+        .catch(e => log('ERROR', `fetchGraduationMint: ${e.message}`));
+
+    } catch(e) { log('ERROR', `WS msg error: ${e.message}`); }
   });
 
-  ws.on('error', (e) => {
-    log('ERROR', `PumpPortal WS error: ${e.message}`);
-  });
+  ws.on('error', (e) => log('ERROR', `Helius WS error: ${e.message}`));
 
-  ws.on('close', (code, reason) => {
-    log('INFO', `PumpPortal WS closed (${code}) — reconnecting in 3s...`);
+  ws.on('close', (code) => {
+    log('INFO', `Helius WS closed (${code}) — reconnecting in 3s...`);
     shared.ws = null;
-    if(shared.isRunning) {
-      setTimeout(connectPumpPortal, 3000);
-    }
+    if(shared.isRunning) setTimeout(connectHelius, 3000);
   });
 
-  // Keepalive ping every 30s
   const ping = setInterval(() => {
-    if(ws.readyState === WebSocket.OPEN) {
-      ws.ping();
-    } else {
-      clearInterval(ping);
-    }
+    if(ws.readyState === WebSocket.OPEN) ws.ping();
+    else clearInterval(ping);
   }, 30000);
 }
+
+// ── FETCH MINT FROM GRADUATION TX ─────────────────────────────
+
+async function fetchGraduationMint(sig) {
+  try {
+    const r = await safeFetch(
+      `https://api-mainnet.helius-rpc.com/v0/transactions?api-key=${CONFIG.HELIUS_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transactions: [sig] }),
+      }, 'graduation-tx'
+    );
+    if(!r.ok) throw new Error(`TX fetch ${r.status}`);
+    const txs = await r.json();
+    const tx  = txs?.[0];
+    if(!tx) throw new Error('No tx data');
+
+    const IGNORE_MINTS = new Set([
+      'So11111111111111111111111111111111111111112',
+      'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+      'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+    ]);
+
+    let mint = null;
+    for(const t of (tx.tokenTransfers||[])) {
+      if(t.mint && !IGNORE_MINTS.has(t.mint)) { mint = t.mint; break; }
+    }
+    if(!mint) {
+      for(const a of (tx.accountData||[])) {
+        for(const c of (a.tokenBalanceChanges||[])) {
+          if(c.mint && !IGNORE_MINTS.has(c.mint)) { mint = c.mint; break; }
+        }
+        if(mint) break;
+      }
+    }
+
+    if(!mint) { log('INFO', `⚠️  No mint found in graduation tx`); return; }
+    log('GRAD', `🎓 Mint: ${mint.slice(0,20)}...`);
+    await handleGraduation(mint, sig);
+  } catch(e) { log('ERROR', `fetchGraduationMint: ${e.message}`); }
+}
+
+// ── HANDLE GRADUATION ─────────────────────────────────────────
+
+async function handleGraduation(mint, sig) {
+  const info = await tokenInfo(mint);
+  const sym  = info.sym;
+  const name = info.name;
+
+  if(wallet.snipedMints.has(mint)) { log('SKIP', `Already sniped ${sym}`); return; }
+
+  if(wallet.positions.size >= CONFIG.MAX_CONCURRENT_POSITIONS) {
+    wallet.stats.skipped++;
+    log('SKIP', `Max positions — skipping ${sym}`);
+    await discord(`⏭  **SKIPPED — max positions**
+🎓 **${sym}**
+\`${mint}\``);
+    return;
+  }
+
+  const bal = await solBal();
+  if(bal < CONFIG.MIN_SOL_BALANCE) {
+    wallet.stats.skipped++;
+    log('SKIP', `Low balance ${bal.toFixed(4)} SOL`);
+    await discord(`⚠️  **LOW BALANCE — SKIPPED**
+💰  ${bal.toFixed(4)} SOL | Need ${CONFIG.MIN_SOL_BALANCE} SOL`);
+    return;
+  }
+
+  wallet.stats.attempts++;
+  wallet.snipedMints.add(mint);
+
+  log('INFO', `🔍 Rug checking ${sym}...`);
+  const rug = await rugCheck(mint);
+  if(!rug.pass) {
+    wallet.stats.skipped++;
+    log('SKIP', `Rug FAILED ${sym} score:${rug.score}`);
+    await discord(`⏭  **SKIPPED — RUG CHECK**
+🎓 **${sym}**
+🚨 Score: ${rug.score}/1000
+\`${mint}\``);
+    return;
+  }
+
+  log('INFO', `✅ Rug passed ${sym} score:${rug.score} — BUYING`);
+  await discord(
+    `🎓  **GRADUATION — ${name} (${sym})**
+` +
+    `\`${mint}\`
+━━━━━━━━━━━━━━━━━━━━
+` +
+    `✅  Rug score: **${rug.score}/1000**
+` +
+    `🚀  Sniping **${CONFIG.BUY_SOL} SOL** (~$${SOL_USD(CONFIG.BUY_SOL)}) NOW
+` +
+    `🔗  https://solscan.io/tx/${sig}
+` +
+    `📊  https://dexscreener.com/solana/${mint}`
+  );
+
+  execBuy(mint, sym).catch(e => log('ERROR', `execBuy: ${e.message}`));
+}
+
 
 // ── HEALTH ────────────────────────────────────────────────────
 
@@ -654,7 +703,7 @@ async function main() {
   console.log('\n╔════════════════════════════════════════════════════════════╗');
   console.log('║  🎓 WINSTON v28.0 — Pump.fun Graduation Sniper             ║');
   console.log('║  $5 buy · TP+35% · SL-30% · 10min max · rug check        ║');
-  console.log('║  Listens for graduations via PumpPortal WebSocket         ║');
+  console.log('║  Listens via Helius logsSubscribe — your own RPC          ║');
   console.log('╚════════════════════════════════════════════════════════════╝\n');
 
   if(!CONFIG.HELIUS_API_KEY) { log('ERROR', 'HELIUS_API_KEY missing'); process.exit(1); }
@@ -678,14 +727,14 @@ async function main() {
   shared.isRunning = true;
 
   // Connect to PumpPortal WebSocket
-  connectPumpPortal();
+  connectHelius();
 
   await discord(
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-    `🎓  **WINSTON v28.0 ONLINE**\n` +
+    `🎓  **WINSTON v28.1 ONLINE**\n` +
     `**Pump.fun Graduation Sniper**\n` +
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-    `📡  Listening for Pump.fun graduations via PumpPortal\n` +
+    `📡  Listening for Pump.fun graduations via Helius logsSubscribe\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `💸  Buy: **${CONFIG.BUY_SOL} SOL (~$${SOL_USD(CONFIG.BUY_SOL)})** per graduation\n` +
     `🏁  TP: **+${CONFIG.TP_ROI_PCT}%** → full exit\n` +
@@ -711,7 +760,7 @@ async function main() {
       ? ((wallet.stats.wins/wallet.stats.sells)*100).toFixed(0) : '0';
     await discord(
       `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-      `🔴  **WINSTON v28.0 OFFLINE**\n` +
+      `🔴  **WINSTON v28.1 OFFLINE**\n` +
       `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
       `💰  Final: **${finalBal.toFixed(4)} SOL** (~$${SOL_USD(finalBal)})\n` +
       `📈  PnL: **${pnl>=0?'+':''}$${SOL_USD(Math.abs(pnl))}** (${pnl>=0?'+':''}${pnl.toFixed(4)} SOL)\n` +
