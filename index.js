@@ -73,12 +73,20 @@ const CONFIG = {
     { roi: 80,  sellPct: 50 },   // +80%  → sell 50% of remaining
     { roi: 150, sellPct: 50 },   // +150% → sell 50% of remaining
   ],
-  SL_PCT:           -30,    // stop loss before any TP fires
+  SL_PCT:           -25,    // tighter SL — graduation rugs move fast
   MOONBAG_DUMP_PCT: -40,    // moonbag SL: -40% drop from tier3 entry ROI
   MOONBAG_MOON_PCT:  500,   // moonbag moon exit: +500% from original entry
   MAX_HOLD_MS:       600000, // 10min — only applies if NO tier has fired
 
-  // ── Rug check ────────────────────────────────────────────
+  // ── Top holder check ─────────────────────────────────────
+  // Skip if any single wallet holds > 15% of supply
+  // High concentration = dev/whale ready to dump on graduation
+  MAX_TOP_HOLDER_PCT: 15,
+
+  // ── Token age filter ─────────────────────────────────────
+  // Skip tokens older than 30 min — fresh graduates only
+  // Old tokens have bag holders ready to dump on graduation
+  MAX_TOKEN_AGE_MS: 30 * 60 * 1000,  // 30 minutes
   // Skip tokens with rugcheck score below this
   // 500+ = relatively safe, 0-499 = risky
   MIN_RUGCHECK_SCORE: 300,
@@ -746,6 +754,82 @@ async function fetchGraduationMint(sig) {
 
 // ── HANDLE GRADUATION ─────────────────────────────────────────
 
+// ── TOP HOLDER CHECK ──────────────────────────────────────────
+// Fetches largest token accounts and checks if any single wallet
+// holds more than MAX_TOP_HOLDER_PCT% of supply
+// High concentration = whale ready to dump on graduation
+
+async function checkTopHolders(mint) {
+  try {
+    const r = await shared.connection.getTokenLargestAccounts(new PublicKey(mint));
+    if(!r?.value?.length) return { pass: true, reason: 'no data' };
+
+    // Get total supply
+    const supplyR = await shared.connection.getTokenSupply(new PublicKey(mint));
+    const totalSupply = parseFloat(supplyR?.value?.uiAmount || 0);
+    if(totalSupply <= 0) return { pass: true, reason: 'no supply data' };
+
+    // Check each top holder
+    // Skip known program accounts (bonding curve, pool, etc)
+    const KNOWN_PROGRAMS = new Set([
+      CONFIG.MIGRATION_ACCOUNT,
+      '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', // pump.fun program
+      'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', // pumpswap
+      '39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg', // migration
+    ]);
+
+    let topHolderPct = 0;
+    let topHolderAddr = '';
+
+    for(const acct of r.value.slice(0, 10)) {
+      const ownerInfo = await shared.connection.getParsedAccountInfo(acct.address);
+      const owner = ownerInfo?.value?.data?.parsed?.info?.owner;
+      if(!owner || KNOWN_PROGRAMS.has(owner)) continue;
+
+      const pct = (parseFloat(acct.uiAmount || 0) / totalSupply) * 100;
+      if(pct > topHolderPct) {
+        topHolderPct  = pct;
+        topHolderAddr = owner;
+      }
+    }
+
+    const pass = topHolderPct <= CONFIG.MAX_TOP_HOLDER_PCT;
+    return { pass, topHolderPct: topHolderPct.toFixed(1), topHolderAddr };
+  } catch(e) {
+    log('ERROR', `checkTopHolders: ${e.message}`);
+    return { pass: true, reason: 'error — proceeding' }; // fail open
+  }
+}
+
+// ── TOKEN AGE CHECK ───────────────────────────────────────────
+// Fetches the token's first transaction to determine how old it is
+// Returns age in ms, or null if can't determine
+
+async function getTokenAgeMs(mint) {
+  try {
+    // Get the earliest signature for this mint address
+    const sigs = await shared.connection.getSignaturesForAddress(
+      new PublicKey(mint),
+      { limit: 1, before: undefined },
+    );
+    // getSignaturesForAddress returns newest first by default
+    // We want the oldest — fetch with limit and check last
+    const allSigs = await shared.connection.getSignaturesForAddress(
+      new PublicKey(mint),
+      { limit: 1000 },
+    );
+    if(!allSigs || allSigs.length === 0) return null;
+    // Oldest is last in the array
+    const oldest = allSigs[allSigs.length - 1];
+    if(!oldest.blockTime) return null;
+    const ageMs = Date.now() - (oldest.blockTime * 1000);
+    return ageMs;
+  } catch(e) {
+    log('ERROR', `getTokenAgeMs: ${e.message}`);
+    return null; // fail open — don't skip on error
+  }
+}
+
 async function handleGraduation(mint, sig) {
   const info = await tokenInfo(mint);
   const sym  = info.sym;
@@ -774,7 +858,43 @@ async function handleGraduation(mint, sig) {
   wallet.stats.attempts++;
   wallet.snipedMints.add(mint);
 
-  log('INFO', `🔍 Rug checking ${sym}...`);
+  // ── Token age check ───────────────────────────────────────
+  log('INFO', `🕐 Checking token age for ${sym}...`);
+  const ageMs = await getTokenAgeMs(mint);
+  if(ageMs !== null) {
+    const ageMin = (ageMs / 60000).toFixed(1);
+    if(ageMs > CONFIG.MAX_TOKEN_AGE_MS) {
+      wallet.stats.skipped++;
+      log('SKIP', `Token too old: ${sym} — ${ageMin}min (max: ${CONFIG.MAX_TOKEN_AGE_MS/60000}min)`);
+      await discord(
+        `⏭  **SKIPPED — TOKEN TOO OLD**\n` +
+        `🎓 **${sym}**\n` +
+        `⏱  Age: **${ageMin} minutes** (max: ${CONFIG.MAX_TOKEN_AGE_MS/60000}min)\n` +
+        `Old tokens dump on graduation — skipping\n` +
+        `\`${mint}\``
+      );
+      return;
+    }
+    log('INFO', `✅ Token age OK: ${ageMin}min old`);
+  }
+
+  // ── Top holder concentration check ───────────────────────
+  log('INFO', `🔎 Checking top holders for ${sym}...`);
+  const holders = await checkTopHolders(mint);
+  if(!holders.pass) {
+    wallet.stats.skipped++;
+    log('SKIP', `Whale concentration: ${sym} — ${holders.topHolderPct}% (max: ${CONFIG.MAX_TOP_HOLDER_PCT}%)`);
+    await discord(
+      `⏭  **SKIPPED — WHALE CONCENTRATION**\n` +
+      `🎓 **${sym}**\n` +
+      `🐳  Top holder: **${holders.topHolderPct}%** of supply (max: ${CONFIG.MAX_TOP_HOLDER_PCT}%)\n` +
+      `⚠️  High dump risk on graduation\n` +
+      `\`${mint}\``
+    );
+    return;
+  }
+  log('INFO', `✅ Holders OK — top: ${holders.topHolderPct}%`);
+
   const rug = await rugCheck(mint);
   if(!rug.pass) {
     wallet.stats.skipped++;
