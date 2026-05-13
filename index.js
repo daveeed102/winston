@@ -60,9 +60,23 @@ const CONFIG = {
   MIN_SOL_BALANCE: 0.065,   // 0.055 buy + 0.01 fee buffer
 
   // ── Exit ─────────────────────────────────────────────────
-  TP_ROI_PCT:   35,     // full exit at +35%
-  SL_PCT:      -30,    // full exit at -30%
-  MAX_HOLD_MS:  600000, // 10min — graduation pumps are fast
+  // ── Tiered exit strategy ─────────────────────────────────
+  // Tier 1: +40% → sell 50%, keep 50% riding
+  // Tier 2: +80% → sell 50% of remaining (25% of original), keep 25% moonbag
+  // Tier 3: +150% → sell 50% of remaining (12.5%), moonbag rides free forever
+  // Moonbag: final ~12.5% rides with NO time limit
+  //          exits only on: dump -40% from tier3 entry, or +500% moon
+  // SL: -30% before any tier fires → full exit
+  // 10min timer: only kills position if NO tier has fired yet
+  TP_TIERS: [
+    { roi: 40,  sellPct: 50 },   // +40%  → sell 50%
+    { roi: 80,  sellPct: 50 },   // +80%  → sell 50% of remaining
+    { roi: 150, sellPct: 50 },   // +150% → sell 50% of remaining
+  ],
+  SL_PCT:           -30,    // stop loss before any TP fires
+  MOONBAG_DUMP_PCT: -40,    // moonbag SL: -40% drop from tier3 entry ROI
+  MOONBAG_MOON_PCT:  500,   // moonbag moon exit: +500% from original entry
+  MAX_HOLD_MS:       600000, // 10min — only applies if NO tier has fired
 
   // ── Rug check ────────────────────────────────────────────
   // Skip tokens with rugcheck score below this
@@ -377,12 +391,17 @@ async function execBuy(mint, tokenName, attempt=1) {
 
     if(await confirm(sig)) {
       wallet.positions.set(mint, {
-        time:       Date.now(),
+        time:           Date.now(),
         sol,
         sym,
-        isSelling:  false,
-        tpFired:    false,
-        highestRoi: -Infinity,
+        isSelling:      false,
+        tpFired:        false,
+        tiersFired:     [],      // which tiers have fired e.g. [40, 80]
+        anyTierFired:   false,   // true once any tier fires — disables 10min timer
+        lastTierRoi:    0,       // ROI when last tier fired — for moonbag dump SL
+        moonbagMode:    false,   // true after last tier fires
+        moonbagStartMs: null,
+        highestRoi:     -Infinity,
       });
       wallet.stats.buys++;
       wallet.stats.feesTotal += feeSol;
@@ -420,8 +439,93 @@ async function execBuy(mint, tokenName, attempt=1) {
 
 // ── EXIT MANAGER ──────────────────────────────────────────────
 
+// ── PARTIAL SELL ──────────────────────────────────────────────
+
+async function execPartialSell(mint, fraction, reason, attempt=1) {
+  const pos      = wallet.positions.get(mint);
+  if(!pos) return false;
+  const sym      = pos.sym || '???';
+  const feeSol   = CONFIG.SELL_PRIORITY_LAMPORTS / 1e9;
+  const maxRetries = CONFIG.SELL_MAX_RETRIES;
+
+  log('EXEC', `🎯 PARTIAL ${(fraction*100).toFixed(0)}% ${sym} — ${reason} (attempt ${attempt})`);
+
+  try {
+    const accts = await shared.connection.getParsedTokenAccountsByOwner(
+      wallet.keypair.publicKey, { mint: new PublicKey(mint) }
+    );
+    const acct = accts?.value?.[0];
+    if(!acct) return false;
+    const bal = parseFloat(acct.account.data.parsed.info.tokenAmount.uiAmount||0);
+    if(bal <= 0) return false;
+    const dec = acct.account.data.parsed.info.tokenAmount.decimals;
+    const raw = BigInt(Math.floor(bal * fraction * Math.pow(10, dec)));
+    if(raw <= 0n) return false;
+
+    const qr = await safeFetch(
+      `${CONFIG.JUPITER_QUOTE}?inputMint=${mint}&outputMint=${CONFIG.SOL_MINT}&amount=${raw.toString()}&slippageBps=${CONFIG.SELL_SLIPPAGE_BPS}`,
+      {}, 'partial-sell-quote'
+    );
+    if(!qr.ok) throw new Error(`Quote ${qr.status}`);
+    const q = await qr.json();
+    if(!q.outAmount) throw new Error('No sell route');
+
+    const sr = await safeFetch(CONFIG.JUPITER_SWAP, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        quoteResponse: q,
+        userPublicKey: wallet.keypair.publicKey.toString(),
+        wrapAndUnwrapSol: true,
+        dynamicSlippage: { minBps: 50, maxBps: CONFIG.SELL_SLIPPAGE_BPS },
+        prioritizationFeeLamports: CONFIG.SELL_PRIORITY_LAMPORTS,
+      }),
+    }, 'partial-sell-swap');
+    if(!sr.ok) throw new Error(`Swap ${sr.status}`);
+    const sd = await sr.json();
+    if(!sd.swapTransaction) throw new Error('No sell tx');
+
+    const buf = Buffer.from(sd.swapTransaction, 'base64');
+    const tx  = VersionedTransaction.deserialize(buf);
+    tx.sign([wallet.keypair]);
+    const sig = await shared.connection.sendRawTransaction(tx.serialize(), { skipPreflight:true, maxRetries:8 });
+
+    if(await confirm(sig)) {
+      const solBack   = parseFloat(q.outAmount) / 1e9;
+      const costBasis = pos.sol * fraction;
+      const pnl       = solBack - costBasis;
+      const pnlSign   = pnl >= 0 ? '+' : '';
+
+      wallet.stats.totalPnl  += pnl;
+      wallet.stats.feesTotal += feeSol;
+      wallet.stats.sells++;
+      if(pnl >= 0) wallet.stats.wins++;
+
+      log('SELL', `✅ PARTIAL ${(fraction*100).toFixed(0)}% ${sym} → ${solBack.toFixed(4)} SOL (${pnlSign}${pnl.toFixed(4)}) | ${reason}`);
+      await discord(
+        `🎯  **TIER EXIT — ${sym}**\n` +
+        `💰  Sold **${(fraction*100).toFixed(0)}%** → **$${SOL_USD(solBack)}** (${solBack.toFixed(4)} SOL)\n` +
+        `📈  Chunk PnL: **${pnlSign}$${SOL_USD(Math.abs(pnl))}**\n` +
+        `🌙  Remaining position rides on\n` +
+        `🔗  https://solscan.io/tx/${sig}` +
+        (pnl > 0 ? '\n' + randomGif() : '')
+      );
+      return true;
+    } else { throw new Error('Confirm timeout'); }
+  } catch(e) {
+    log('ERROR', `Partial sell fail (${attempt}/${maxRetries}): ${e.message}`);
+    if(attempt < maxRetries) {
+      await sleep(2000 * attempt + Math.floor(Math.random()*500));
+      return execPartialSell(mint, fraction, reason, attempt+1);
+    }
+    wallet.stats.errors++;
+    await discord(`❌  Partial sell FAILED: ${sym} — ${e.message}\n🔗  https://jup.ag/swap/${mint}-SOL`);
+    return false;
+  }
+}
+
+
 async function exitManager() {
-  log('INFO', `🏁 Exit manager | TP:+${CONFIG.TP_ROI_PCT}% SL:${CONFIG.SL_PCT}% Max:10min`);
+  log('INFO', `🏁 Exit manager | Tiers: +40%/+80%/+150% | SL:${CONFIG.SL_PCT}% | 10min (pre-TP only)`);
 
   while(shared.isRunning) {
     await sleep(CONFIG.EXIT_CHECK_MS);
@@ -432,54 +536,99 @@ async function exitManager() {
       const ageMs  = Date.now() - pos.time;
       const ageMin = (ageMs / 60000).toFixed(1);
 
-      // 10min hard exit — graduation pumps fade fast
-      if(ageMs >= CONFIG.MAX_HOLD_MS) {
+      // 10min timer only kills if no tier has fired yet
+      if(ageMs >= CONFIG.MAX_HOLD_MS && !pos.anyTierFired) {
         pos.isSelling = true;
-        log('EXIT', `⏱ 10MIN EXIT ${pos.sym}`);
-        await discord(`⏱  **10MIN EXIT — ${pos.sym}**\nGraduation window expired — full exit`);
+        log('EXIT', `⏱ 10MIN EXIT ${pos.sym} — no profit taken`);
+        await discord(`⏱  **10MIN EXIT — ${pos.sym}**\nNo profit hit — exiting`);
         execSell(mint, 'max_hold_10min', false)
           .catch(e => log('ERROR', `10min exit: ${e.message}`));
         continue;
       }
 
+      // Moonbag mode — no time limit, rides free
+      if(pos.moonbagMode) {
+        const roi = await getCurrentRoi(mint, pos);
+        if(roi === null) continue;
+
+        const dumpThreshold = (pos.lastTierRoi || 0) - Math.abs(CONFIG.MOONBAG_DUMP_PCT);
+        const moonAge = ((Date.now() - pos.moonbagStartMs) / 60000).toFixed(1);
+        const bar = roi >= 0
+          ? '█'.repeat(Math.min(Math.floor(roi/10),20)) + '░'.repeat(Math.max(20-Math.floor(roi/10),0))
+          : '▓'.repeat(Math.min(Math.floor(Math.abs(roi)/10),20));
+        console.log(`  🌙 [${pos.sym}] ${pctStr(roi)} [${bar}] | moonbag ${moonAge}min | dump@${pctStr(dumpThreshold)} moon@+${CONFIG.MOONBAG_MOON_PCT}%`);
+
+        if(roi >= CONFIG.MOONBAG_MOON_PCT) {
+          pos.isSelling = true;
+          log('EXIT', `🚀 MOON ${pctStr(roi)} on ${pos.sym}`);
+          await discord(`🚀  **MOONBAG MOON — ${pos.sym}**\n🎉  **${pctStr(roi)}** — cashing out!`);
+          execSell(mint, `moonbag_moon_${roi.toFixed(0)}pct`, false)
+            .catch(e => log('ERROR', `Moon exit: ${e.message}`));
+          continue;
+        }
+
+        if(roi <= dumpThreshold) {
+          pos.isSelling = true;
+          log('EXIT', `🌙🛑 MOONBAG DUMP ${pos.sym} at ${pctStr(roi)}`);
+          await discord(`🌙🛑  **MOONBAG DUMP — ${pos.sym}**\n📉  **${pctStr(roi)}** — cutting`);
+          execSell(mint, `moonbag_dump_${roi.toFixed(0)}pct`, false)
+            .catch(e => log('ERROR', `Moonbag dump: ${e.message}`));
+        }
+        continue;
+      }
+
+      // Live ROI check
       const roi = await getCurrentRoi(mint, pos);
       if(roi === null) continue;
       if(roi > pos.highestRoi) pos.highestRoi = roi;
 
-      const timeLeft = ((CONFIG.MAX_HOLD_MS - ageMs) / 60000).toFixed(1);
+      const timeLeft = pos.anyTierFired ? '∞' : ((CONFIG.MAX_HOLD_MS - ageMs) / 60000).toFixed(1);
       const bar = roi >= 0
         ? '█'.repeat(Math.min(Math.floor(roi/5),20)) + '░'.repeat(Math.max(20-Math.floor(roi/5),0))
         : '▓'.repeat(Math.min(Math.floor(Math.abs(roi)/5),20));
-      console.log(`  🎓 [${pos.sym}] ${pctStr(roi)} [${bar}] | ${ageMin}min | SL:${CONFIG.SL_PCT}% TP:+${CONFIG.TP_ROI_PCT}% | ${timeLeft}min left`);
+      const tiersTag = pos.tiersFired?.length > 0 ? ` [T${pos.tiersFired.join('+')}fired]` : '';
+      console.log(`  🎓 [${pos.sym}] ${pctStr(roi)} [${bar}] | ${ageMin}min${tiersTag} | SL:${CONFIG.SL_PCT}% | ${timeLeft}min left`);
 
-      // Take profit
-      if(roi >= CONFIG.TP_ROI_PCT && !pos.tpFired) {
-        pos.tpFired   = true;
-        pos.isSelling = true;
-        log('EXIT', `🏁 TP ${pctStr(roi)} on ${pos.sym} — full exit`);
-        execSell(mint, `TP_${roi.toFixed(0)}pct`, false)
-          .catch(e => {
-            pos.tpFired   = false;
-            pos.isSelling = false;
-            log('ERROR', `TP sell failed, retrying: ${e.message}`);
-          });
-        continue;
+      // Tiered take profits
+      let tierFired = false;
+      for(const tier of CONFIG.TP_TIERS) {
+        if(roi >= tier.roi && !pos.tiersFired.includes(tier.roi)) {
+          pos.tiersFired.push(tier.roi);
+          pos.anyTierFired = true;
+          pos.lastTierRoi  = roi;
+          const fraction   = tier.sellPct / 100;
+          const isLastTier = tier === CONFIG.TP_TIERS[CONFIG.TP_TIERS.length - 1];
+
+          log('EXIT', `🎯 TIER +${tier.roi}% on ${pos.sym} — selling ${tier.sellPct}%${isLastTier ? ' → MOONBAG' : ''}`);
+
+          if(isLastTier) {
+            pos.moonbagMode    = true;
+            pos.moonbagStartMs = Date.now();
+          }
+
+          execPartialSell(mint, fraction, `tier_${tier.roi}pct`)
+            .catch(e => {
+              pos.tiersFired.pop();
+              log('ERROR', `Tier sell failed: ${e.message}`);
+            });
+          tierFired = true;
+          break;
+        }
       }
+      if(tierFired) continue;
 
-      // Stop loss
-      if(roi <= CONFIG.SL_PCT) {
+      // Stop loss — only before first tier fires
+      if(roi <= CONFIG.SL_PCT && !pos.anyTierFired) {
         pos.isSelling = true;
         log('EXIT', `🛑 STOP LOSS ${pos.sym} at ${pctStr(roi)}`);
-        await discord(
-          `🛑  **STOP LOSS — ${pos.sym}**\n` +
-          `📉  **${pctStr(roi)}** after **${ageMin}min**`
-        );
+        await discord(`🛑  **STOP LOSS — ${pos.sym}**\n📉  **${pctStr(roi)}** after **${ageMin}min**`);
         execSell(mint, `SL_${roi.toFixed(0)}pct`, false)
           .catch(e => log('ERROR', `SL exit: ${e.message}`));
       }
     }
   }
 }
+
 
 // ── HELIUS WEBSOCKET ─────────────────────────────────────────
 // ── HELIUS WEBSOCKET — GRADUATION DETECTOR ────────────────────
