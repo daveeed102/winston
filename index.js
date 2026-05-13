@@ -56,7 +56,7 @@ const CONFIG = {
 
   // ── Fee safety ───────────────────────────────────────────
   MIN_SOL_BALANCE:        0.031,   // 0.026 buy + 0.005 fee buffer
-  MAX_FEE_PCT_OF_TRADE:   0.15,    // skip if total fees > 15% of trade value
+  MAX_FEE_PCT_OF_TRADE:   15,      // skip if total fees > 15% of trade value
   BUY_PRIORITY_LAMPORTS:  200000,  // 0.0002 SOL — low intentionally
   BUY_SLIPPAGE_BPS:        300,    // 3%
   SELL_PRIORITY_LAMPORTS:  300000, // 0.0003 SOL
