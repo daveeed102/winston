@@ -414,7 +414,7 @@ async function execBuy(mint, tokenName, attempt=1) {
       wallet.stats.buys++;
       wallet.stats.feesTotal += feeSol;
 
-      log('BUY', `✅ SNIPED ${sym} — ${sol} SOL | TP:+${CONFIG.TP_ROI_PCT}% SL:${CONFIG.SL_PCT}% Max:10min`);
+      log('BUY', `✅ SNIPED ${sym} — ${sol} SOL | TP:+${CONFIG.TP_TIERS[0].roi}%/+${CONFIG.TP_TIERS[1].roi}%/+${CONFIG.TP_TIERS[2].roi}% SL:${CONFIG.SL_PCT}%`);
       await discord(
         `🎓  **GRADUATION SNIPE — ${sym}**\n` +
         `\`${mint}\`\n` +
@@ -714,39 +714,81 @@ function connectHelius() {
 
 async function fetchGraduationMint(sig) {
   try {
-    const r = await safeFetch(
-      `https://api-mainnet.helius-rpc.com/v0/transactions?api-key=${CONFIG.HELIUS_API_KEY}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ transactions: [sig] }),
-      }, 'graduation-tx'
-    );
-    if(!r.ok) throw new Error(`TX fetch ${r.status}`);
-    const txs = await r.json();
-    const tx  = txs?.[0];
-    if(!tx) throw new Error('No tx data');
-
     const IGNORE_MINTS = new Set([
       'So11111111111111111111111111111111111111112',
       'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
       'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+      'SysvarRent111111111111111111111111111111111',
+      '11111111111111111111111111111111',
+      'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+      'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
     ]);
 
     let mint = null;
-    for(const t of (tx.tokenTransfers||[])) {
-      if(t.mint && !IGNORE_MINTS.has(t.mint)) { mint = t.mint; break; }
-    }
-    if(!mint) {
-      for(const a of (tx.accountData||[])) {
-        for(const c of (a.tokenBalanceChanges||[])) {
-          if(c.mint && !IGNORE_MINTS.has(c.mint)) { mint = c.mint; break; }
+
+    // Method 1: Helius enhanced API (works for Raydium migrations)
+    try {
+      const r = await safeFetch(
+        `https://api-mainnet.helius-rpc.com/v0/transactions?api-key=${CONFIG.HELIUS_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ transactions: [sig] }),
+        }, 'graduation-tx'
+      );
+      if(r.ok) {
+        const txs = await r.json();
+        const tx  = txs?.[0];
+        if(tx) {
+          for(const t of (tx.tokenTransfers||[])) {
+            if(t.mint && !IGNORE_MINTS.has(t.mint)) { mint = t.mint; break; }
+          }
+          if(!mint) {
+            for(const a of (tx.accountData||[])) {
+              for(const c of (a.tokenBalanceChanges||[])) {
+                if(c.mint && !IGNORE_MINTS.has(c.mint)) { mint = c.mint; break; }
+              }
+              if(mint) break;
+            }
+          }
         }
-        if(mint) break;
       }
+    } catch(e) { log('ERROR', `Helius enhanced TX failed: ${e.message}`); }
+
+    // Method 2: Fallback — RPC getParsedTransaction (works for PumpSwap migrations)
+    if(!mint) {
+      try {
+        const tx = await shared.connection.getParsedTransaction(sig, {
+          maxSupportedTransactionVersion: 0,
+          commitment: 'confirmed',
+        });
+        if(tx) {
+          // Check token balance changes
+          const pre  = tx.meta?.preTokenBalances  || [];
+          const post = tx.meta?.postTokenBalances || [];
+          const allMints = [...pre, ...post].map(b => b.mint).filter(Boolean);
+          for(const m of allMints) {
+            if(!IGNORE_MINTS.has(m)) { mint = m; break; }
+          }
+          // Also check account keys for token mints (ends with "pump")
+          if(!mint) {
+            const keys = tx.transaction?.message?.accountKeys || [];
+            for(const k of keys) {
+              const addr = k.pubkey?.toString() || k.toString();
+              if(addr.endsWith('pump') && !IGNORE_MINTS.has(addr)) {
+                mint = addr; break;
+              }
+            }
+          }
+        }
+      } catch(e) { log('ERROR', `getParsedTransaction failed: ${e.message}`); }
     }
 
-    if(!mint) { log('INFO', `⚠️  No mint found in graduation tx`); return; }
+    if(!mint) {
+      log('INFO', `⚠️  No mint found in graduation tx ${sig.slice(0,20)}`);
+      return;
+    }
+
     log('GRAD', `🎓 Mint: ${mint.slice(0,20)}...`);
     await handleGraduation(mint, sig);
   } catch(e) { log('ERROR', `fetchGraduationMint: ${e.message}`); }
@@ -945,7 +987,7 @@ async function health() {
       '═'.repeat(62),
       `  📡 PumpPortal: ${wsStatus} | WS events: ${shared.wsEvents} | Uptime: ${uptime}min`,
       `  🎓 Graduations seen: ${shared.graduations} | Sniped: ${wallet.stats.buys} | Skipped: ${wallet.stats.skipped}`,
-      `  💸  Buy: ${CONFIG.BUY_SOL} SOL ($${SOL_USD(CONFIG.BUY_SOL)}) | TP:+${CONFIG.TP_ROI_PCT}% | SL:${CONFIG.SL_PCT}% | Max:10min`,
+      `  💸  Buy: ${CONFIG.BUY_SOL} SOL ($${SOL_USD(CONFIG.BUY_SOL)}) | TP: +${CONFIG.TP_TIERS.map(t=>t.roi).join("/+")}% | SL:${CONFIG.SL_PCT}% | Max:10min`,
       `  💰  ${bal.toFixed(4)} SOL ($${SOL_USD(bal)}) | PnL: ${pnl>=0?'+':''}${pnl.toFixed(4)} SOL`,
       `  📊  ${wallet.stats.wins}W/${wallet.stats.losses}L (${wr}% WR) | Fees: ${wallet.stats.feesTotal.toFixed(4)} SOL`,
     ];
