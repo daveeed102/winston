@@ -74,7 +74,7 @@ const CONFIG = {
 
   // ── Rate limits ──────────────────────────────────────────
   EXIT_CHECK_MS: 2000,
-  HEALTH_MS:     30000,
+  HEALTH_MS:     60000,
 
   MAX_CONCURRENT_POSITIONS: 3, // don't overextend on $5 buys
   SELL_MAX_RETRIES: 10,
@@ -90,11 +90,12 @@ const wallet = {
   stats: {
     attempts: 0, buys: 0, sells: 0,
     wins: 0, losses: 0, totalPnl: 0,
-    errors: 0, skipped: 0, feesTotal: 0, startBal: 0,
+    errors: 0, skipped: 0, feesTotal: 0,
+    startBal: 0, startTime: Date.now(),
   },
 };
 
-const shared = { connection: null, isRunning: false, ws: null };
+const shared = { connection: null, isRunning: false, ws: null, wsEvents: 0, graduations: 0 };
 
 // ── UTILS ─────────────────────────────────────────────────────
 
@@ -492,18 +493,28 @@ function connectPumpPortal() {
   });
 
   ws.on('message', async (data) => {
+    shared.wsEvents++;
     try {
       const event = JSON.parse(data.toString());
 
-      // Migration event fires when a token graduates
-      // Contains: mint, name, symbol, marketCap, etc.
-      if(!event.mint) return;
+      // Debug: log first 20 raw events so we can see the payload structure
+      if(shared.wsEvents <= 20) {
+        log('INFO', `📨 RAW WS EVENT #${shared.wsEvents}: ${JSON.stringify(event).slice(0,200)}`);
+      }
 
-      const mint = event.mint;
+      // Migration events can have txType:"migrate" OR just contain mint directly
+      // Handle both formats
+      const mint = event.mint || event.token;
+      if(!mint) {
+        if(shared.wsEvents <= 20) log('INFO', `⚠️  No mint field in event #${shared.wsEvents} — keys: ${Object.keys(event).join(',')}`);
+        return;
+      }
+
+      shared.graduations++;
       const sym  = event.symbol || event.name || '???';
       const name = event.name   || sym;
 
-      log('GRAD', `🎓 GRADUATION DETECTED: ${sym} (${mint.slice(0,12)}...)`);
+      log('GRAD', `🎓 GRADUATION #${shared.graduations}: ${sym} (${mint.slice(0,12)}...)`);
 
       // Skip if already traded this session
       if(wallet.snipedMints.has(mint)) {
@@ -601,32 +612,39 @@ function connectPumpPortal() {
 
 async function health() {
   while(shared.isRunning) {
-    const bal = await solBal();
-    const pnl = bal - wallet.stats.startBal;
-    const wr  = wallet.stats.sells > 0
+    await sleep(CONFIG.HEALTH_MS);
+    const bal      = await solBal();
+    const pnl      = bal - wallet.stats.startBal;
+    const wr       = wallet.stats.sells > 0
       ? ((wallet.stats.wins/wallet.stats.sells)*100).toFixed(0) : '0';
     const wsStatus = shared.ws?.readyState === WebSocket.OPEN ? '🟢 LIVE' : '🔴 RECONNECTING';
+    const uptime   = ((Date.now() - wallet.stats.startTime) / 60000).toFixed(0);
 
-    console.log('\n' + '═'.repeat(62));
-    console.log('  🎓 WINSTON v28.0 — Graduation Sniper');
-    console.log('═'.repeat(62));
-    console.log(`  📡 PumpPortal: ${wsStatus}`);
-    console.log(`  💸  Buy: ${CONFIG.BUY_SOL} SOL ($${SOL_USD(CONFIG.BUY_SOL)}) | TP:+${CONFIG.TP_ROI_PCT}% | SL:${CONFIG.SL_PCT}% | Max:10min`);
-    console.log(`  💰  ${bal.toFixed(4)} SOL ($${SOL_USD(bal)}) | PnL: ${pnl>=0?'+':''}${pnl.toFixed(4)} SOL ($${SOL_USD(Math.abs(pnl))})`);
-    console.log(`  📊  ${wallet.stats.buys}B ${wallet.stats.wins}W/${wallet.stats.losses}L (${wr}% WR) | Skip:${wallet.stats.skipped} | Fees:${wallet.stats.feesTotal.toFixed(4)} SOL`);
-    console.log(`  🎯  Attempts: ${wallet.stats.attempts} | Session mints: ${wallet.snipedMints.size}`);
+    const lines = [
+      '',
+      '═'.repeat(62),
+      '  🎓 WINSTON v28.0 — Graduation Sniper',
+      '═'.repeat(62),
+      `  📡 PumpPortal: ${wsStatus} | WS events: ${shared.wsEvents} | Uptime: ${uptime}min`,
+      `  🎓 Graduations seen: ${shared.graduations} | Sniped: ${wallet.stats.buys} | Skipped: ${wallet.stats.skipped}`,
+      `  💸  Buy: ${CONFIG.BUY_SOL} SOL ($${SOL_USD(CONFIG.BUY_SOL)}) | TP:+${CONFIG.TP_ROI_PCT}% | SL:${CONFIG.SL_PCT}% | Max:10min`,
+      `  💰  ${bal.toFixed(4)} SOL ($${SOL_USD(bal)}) | PnL: ${pnl>=0?'+':''}${pnl.toFixed(4)} SOL`,
+      `  📊  ${wallet.stats.wins}W/${wallet.stats.losses}L (${wr}% WR) | Fees: ${wallet.stats.feesTotal.toFixed(4)} SOL`,
+    ];
 
     if(wallet.positions.size > 0) {
       for(const [m, p] of wallet.positions) {
         const age      = ((Date.now()-p.time)/60000).toFixed(1);
         const timeLeft = ((CONFIG.MAX_HOLD_MS-(Date.now()-p.time))/60000).toFixed(1);
-        console.log(`  🎓 ${p.sym} ${m.slice(0,8)}... | ${age}min | ${timeLeft}min left | ${p.sol} SOL`);
+        lines.push(`  📦 ${p.sym} ${m.slice(0,8)}... | ${age}min | ${timeLeft}min left`);
       }
     } else {
-      console.log('  📭 No open positions — watching for graduations');
+      lines.push('  📭 Watching for graduations...');
     }
-    console.log('═'.repeat(62) + '\n');
-    await sleep(CONFIG.HEALTH_MS);
+    lines.push('═'.repeat(62));
+
+    // Print all at once to avoid interleaving
+    console.log(lines.join('\n'));
   }
 }
 
