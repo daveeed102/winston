@@ -51,8 +51,8 @@ const CONFIG = {
   PUMPFUN_PROGRAM: '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
 
   // ── Buy config ────────────────────────────────────────────
-  BUY_SOL:         0.22,  // ~$20
-  MIN_SOL_BALANCE: 0.23,  // 0.22 + 0.01 fee buffer
+  BUY_SOL:         0.16,  // ~$15
+  MIN_SOL_BALANCE: 0.17,  // 0.16 + 0.01 fee buffer
 
   // ── Exit strategy ─────────────────────────────────────────
   // Every 2x (+100%) → sell 75%, keep 25% moonbag
@@ -778,7 +778,7 @@ async function health() {
 async function main() {
   console.log('\n╔══════════════════════════════════════════════════════════════╗');
   console.log('║  🆕 WINSTON v30.0 — Pump.fun Creator Sniper                  ║');
-  console.log('║  $20 buy · 2x→sell 75% recursive · 20min hard exit          ║');
+  console.log('║  $15 buy · 2x→sell 75% recursive · 20min hard exit          ║');
   console.log('╚══════════════════════════════════════════════════════════════╝\n');
 
   if(!CONFIG.HELIUS_API_KEY) { log('ERROR', 'HELIUS_API_KEY missing'); process.exit(1); }
