@@ -98,7 +98,7 @@ const wallet = {
   },
 };
 
-const shared = { connection: null, isRunning: false, ws: null, wsEvents: 0 };
+const shared = { connection: null, isRunning: false, ws: null, wsEvents: 0, processedSigs: new Set(), buyInProgress: false };
 
 // ── UTILS ─────────────────────────────────────────────────────
 
@@ -598,17 +598,30 @@ function connectHelius() {
 
       // Detect Pump.fun token creation
       // Pump.fun logs "Instruction: Create" or "Program 6EF8rr...invoke"
-      const isCreate = logs.some(l =>
-        l.includes('Instruction: Create') ||
-        (l.includes('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P') && l.includes('invoke'))
+      // Strict check: must have BOTH Pump.fun program invoke AND Create instruction
+      // This filters out swaps, transfers, and other txs that mention the creator
+      const hasPumpfunInvoke = logs.some(l =>
+        l.includes('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P') && l.includes('invoke')
+      );
+      const hasCreateInstruction = logs.some(l =>
+        l.includes('Instruction: Create') || l.includes('Instruction: InitializeMint')
       );
 
-      if(!isCreate) return;
+      if(!hasPumpfunInvoke || !hasCreateInstruction) return;
+
+      // Deduplicate — same sig can fire from multiple subscriptions
+      if(shared.processedSigs.has(sig)) return;
+      shared.processedSigs.add(sig);
+      // Keep set from growing forever
+      if(shared.processedSigs.size > 200) {
+        const first = shared.processedSigs.values().next().value;
+        shared.processedSigs.delete(first);
+      }
 
       // Don't process if we already have an open position
       if(wallet.position) {
-        log('INFO', `⏭ Already in position (${wallet.position.sym}) — skipping`);
-        await discord(`⏭  **New token created but already in position** (${wallet.position.sym})\nWill catch next one after 20min exit`);
+        log('INFO', `⏭ Already in position (${wallet.position.sym}) — skipping new create`);
+        await discord(`⏭  **New token by creator — already in position** (${wallet.position.sym})\nWill catch next one after 20min exit`);
         return;
       }
 
@@ -740,9 +753,19 @@ async function extractMintFromCreate(sig) {
       `📊  https://dexscreener.com/solana/${mint}`
     );
 
-    // BUY IMMEDIATELY
+    // BUY IMMEDIATELY — guard against duplicate concurrent buys
+    if(shared.buyInProgress) {
+      log('INFO', `⏭ Buy already in progress — skipping duplicate`);
+      return;
+    }
+    if(wallet.position) {
+      log('INFO', `⏭ Position already exists — skipping`);
+      return;
+    }
+    shared.buyInProgress = true;
     execBuy(mint, sym)
-      .catch(e => log('ERROR', `execBuy: ${e.message}`));
+      .catch(e => log('ERROR', `execBuy: ${e.message}`))
+      .finally(() => { shared.buyInProgress = false; });
 
   } catch(e) { log('ERROR', `extractMintFromCreate: ${e.message}`); }
 }
