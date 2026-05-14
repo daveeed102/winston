@@ -82,6 +82,7 @@ const CONFIG = {
   // Skip if any single wallet holds > 15% of supply
   // High concentration = dev/whale ready to dump on graduation
   MAX_TOP_HOLDER_PCT: 15,
+  MIN_HOLDERS:         8,   // skip if fewer than 8 unique holders — too concentrated
 
   // ── Token age filter ─────────────────────────────────────
   // Skip tokens older than 30 min — fresh graduates only
@@ -796,38 +797,49 @@ async function fetchGraduationMint(sig) {
 
 // ── HANDLE GRADUATION ─────────────────────────────────────────
 
-// ── TOP HOLDER CHECK ──────────────────────────────────────────
-// Fetches largest token accounts and checks if any single wallet
-// holds more than MAX_TOP_HOLDER_PCT% of supply
-// High concentration = whale ready to dump on graduation
+// ── TOP HOLDER + HOLDER COUNT CHECK ──────────────────────────
+// Checks: 1) min unique holders  2) max top holder concentration
 
 async function checkTopHolders(mint) {
   try {
-    const r = await shared.connection.getTokenLargestAccounts(new PublicKey(mint));
-    if(!r?.value?.length) return { pass: true, reason: 'no data' };
+    const [largestAccts, supplyR] = await Promise.all([
+      shared.connection.getTokenLargestAccounts(new PublicKey(mint)),
+      shared.connection.getTokenSupply(new PublicKey(mint)),
+    ]);
 
-    // Get total supply
-    const supplyR = await shared.connection.getTokenSupply(new PublicKey(mint));
+    if(!largestAccts?.value?.length) return { pass: true, reason: 'no data' };
+
     const totalSupply = parseFloat(supplyR?.value?.uiAmount || 0);
     if(totalSupply <= 0) return { pass: true, reason: 'no supply data' };
 
-    // Check each top holder
-    // Skip known program accounts (bonding curve, pool, etc)
     const KNOWN_PROGRAMS = new Set([
       CONFIG.MIGRATION_ACCOUNT,
-      '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', // pump.fun program
-      'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', // pumpswap
-      '39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg', // migration
+      '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+      'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
+      '39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg',
+      'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+      'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
     ]);
 
-    let topHolderPct = 0;
-    let topHolderAddr = '';
+    // Fetch all owner infos in parallel — much faster
+    const ownerInfos = await Promise.all(
+      largestAccts.value.slice(0, 10).map(acct =>
+        shared.connection.getParsedAccountInfo(acct.address)
+          .catch(() => null)
+      )
+    );
 
-    for(const acct of r.value.slice(0, 10)) {
-      const ownerInfo = await shared.connection.getParsedAccountInfo(acct.address);
-      const owner = ownerInfo?.value?.data?.parsed?.info?.owner;
+    let topHolderPct  = 0;
+    let topHolderAddr = '';
+    let realHolders   = 0;
+
+    for(let i = 0; i < largestAccts.value.slice(0, 10).length; i++) {
+      const acct  = largestAccts.value[i];
+      const info  = ownerInfos[i];
+      const owner = info?.value?.data?.parsed?.info?.owner;
       if(!owner || KNOWN_PROGRAMS.has(owner)) continue;
 
+      realHolders++;
       const pct = (parseFloat(acct.uiAmount || 0) / totalSupply) * 100;
       if(pct > topHolderPct) {
         topHolderPct  = pct;
@@ -835,11 +847,31 @@ async function checkTopHolders(mint) {
       }
     }
 
-    const pass = topHolderPct <= CONFIG.MAX_TOP_HOLDER_PCT;
-    return { pass, topHolderPct: topHolderPct.toFixed(1), topHolderAddr };
+    // Check minimum holders
+    if(realHolders < CONFIG.MIN_HOLDERS) {
+      return {
+        pass: false,
+        reason: 'too_few_holders',
+        holderCount: realHolders,
+        topHolderPct: topHolderPct.toFixed(1),
+      };
+    }
+
+    // Check top holder concentration
+    if(topHolderPct > CONFIG.MAX_TOP_HOLDER_PCT) {
+      return {
+        pass: false,
+        reason: 'whale_concentration',
+        holderCount: realHolders,
+        topHolderPct: topHolderPct.toFixed(1),
+        topHolderAddr,
+      };
+    }
+
+    return { pass: true, holderCount: realHolders, topHolderPct: topHolderPct.toFixed(1) };
   } catch(e) {
     log('ERROR', `checkTopHolders: ${e.message}`);
-    return { pass: true, reason: 'error — proceeding' }; // fail open
+    return { pass: true, reason: 'error — proceeding' };
   }
 }
 
@@ -900,55 +932,49 @@ async function handleGraduation(mint, sig) {
   wallet.stats.attempts++;
   wallet.snipedMints.add(mint);
 
-  // ── Token age check ───────────────────────────────────────
-  log('INFO', `🕐 Checking token age for ${sym}...`);
-  const ageMs = await getTokenAgeMs(mint);
+  // ── All checks run in PARALLEL — saves 2-3 seconds ───────
+  log('INFO', `⚡ Running checks in parallel for ${sym}...`);
+  const [ageMs, holders, rug] = await Promise.all([
+    getTokenAgeMs(mint),
+    checkTopHolders(mint),
+    rugCheck(mint),
+  ]);
+
+  // Age check
   if(ageMs !== null) {
     const ageMin = (ageMs / 60000).toFixed(1);
     if(ageMs > CONFIG.MAX_TOKEN_AGE_MS) {
       wallet.stats.skipped++;
-      log('SKIP', `Token too old: ${sym} — ${ageMin}min (max: ${CONFIG.MAX_TOKEN_AGE_MS/60000}min)`);
-      await discord(
-        `⏭  **SKIPPED — TOKEN TOO OLD**\n` +
-        `🎓 **${sym}**\n` +
-        `⏱  Age: **${ageMin} minutes** (max: ${CONFIG.MAX_TOKEN_AGE_MS/60000}min)\n` +
-        `Old tokens dump on graduation — skipping\n` +
-        `\`${mint}\``
-      );
+      log('SKIP', `Too old: ${sym} — ${ageMin}min`);
+      await discord(`⏭  **SKIPPED — TOKEN TOO OLD**\n🎓 **${sym}**\n⏱  **${ageMin}min** old (max: ${CONFIG.MAX_TOKEN_AGE_MS/60000}min)\n\`${mint}\``);
       return;
     }
-    log('INFO', `✅ Token age OK: ${ageMin}min old`);
+    log('INFO', `✅ Age OK: ${ageMin}min`);
   }
 
-  // ── Top holder concentration check ───────────────────────
-  log('INFO', `🔎 Checking top holders for ${sym}...`);
-  const holders = await checkTopHolders(mint);
+  // Holder count + concentration check
   if(!holders.pass) {
     wallet.stats.skipped++;
-    log('SKIP', `Whale concentration: ${sym} — ${holders.topHolderPct}% (max: ${CONFIG.MAX_TOP_HOLDER_PCT}%)`);
-    await discord(
-      `⏭  **SKIPPED — WHALE CONCENTRATION**\n` +
-      `🎓 **${sym}**\n` +
-      `🐳  Top holder: **${holders.topHolderPct}%** of supply (max: ${CONFIG.MAX_TOP_HOLDER_PCT}%)\n` +
-      `⚠️  High dump risk on graduation\n` +
-      `\`${mint}\``
-    );
+    if(holders.reason === 'too_few_holders') {
+      log('SKIP', `Too few holders: ${sym} — ${holders.holderCount} (min: ${CONFIG.MIN_HOLDERS})`);
+      await discord(`⏭  **SKIPPED — TOO FEW HOLDERS**\n🎓 **${sym}**\n👥  Only **${holders.holderCount} holders** (min: ${CONFIG.MIN_HOLDERS})\n\`${mint}\``);
+    } else {
+      log('SKIP', `Whale: ${sym} — ${holders.topHolderPct}% (max: ${CONFIG.MAX_TOP_HOLDER_PCT}%)`);
+      await discord(`⏭  **SKIPPED — WHALE CONCENTRATION**\n🎓 **${sym}**\n🐳  Top holder: **${holders.topHolderPct}%** (max: ${CONFIG.MAX_TOP_HOLDER_PCT}%)\n\`${mint}\``);
+    }
     return;
   }
-  log('INFO', `✅ Holders OK — top: ${holders.topHolderPct}%`);
+  log('INFO', `✅ Holders OK — ${holders.holderCount} holders, top: ${holders.topHolderPct}%`);
 
-  const rug = await rugCheck(mint);
+  // Rug check
   if(!rug.pass) {
     wallet.stats.skipped++;
     log('SKIP', `Rug FAILED ${sym} score:${rug.score}`);
-    await discord(`⏭  **SKIPPED — RUG CHECK**
-🎓 **${sym}**
-🚨 Score: ${rug.score}/1000
-\`${mint}\``);
+    await discord(`⏭  **SKIPPED — RUG CHECK**\n🎓 **${sym}**\n🚨 Score: **${rug.score}/1000**\n\`${mint}\``);
     return;
   }
 
-  log('INFO', `✅ Rug passed ${sym} score:${rug.score} — BUYING`);
+  log('INFO', `✅ All checks passed — age✅ holders:${holders.holderCount}✅ rug:${rug.score}✅ — BUYING`);
   await discord(
     `🎓  **GRADUATION — ${name} (${sym})**
 ` +
