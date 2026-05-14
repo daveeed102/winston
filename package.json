@@ -1,6 +1,6 @@
 {
-  "name": "winston-v28",
-  "version": "28.0.0",
+  "name": "winston-v30",
+  "version": "30.0.0",
   "main": "index.js",
   "scripts": { "start": "node index.js" },
   "dependencies": {
