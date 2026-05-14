@@ -1,32 +1,25 @@
 // ============================================================
-// WINSTON v28.0 — Pump.fun Graduation Sniper
+// WINSTON v29.0 — Wallet Copy Bot
 // ⚠️  HIGH RISK — for educational/personal use only
 // ============================================================
+// Target: EqiFgyNw6kgrmYstWyrP8VjKhka7XEmKTZzHSmwpr1Zb
 // Strategy:
-//   1. Listen to PumpPortal WebSocket for graduation events
-//      (fires the instant a token completes its bonding curve)
-//   2. Buy 0.055 SOL (~$5) immediately via Jupiter
-//   3. TP at +35% → full exit
-//   4. SL at -30% → full exit
-//   5. 10min max hold → full exit (graduation pumps are fast)
-//   6. Skip token if rug check fails
+//   1. Watch target wallet via Helius logsSubscribe (WebSocket)
+//   2. When target buys 1.0–2.1 SOL → we buy 0.055 SOL immediately
+//   3. TP at +25% → full exit (small quick profit, get out clean)
+//   4. SL at -20% → full exit (tight, don't let losers run)
+//   5. 15min max hold → exit regardless
+//   6. No-chase: if target already sold before our fill → exit
 //
-// Why this works:
-//   - Graduation injects ~$12K liquidity into a fresh pool
-//   - Creates immediate price discovery pump as traders pile in
-//   - We detect it at the SOURCE (Helius WS) not by
-//     polling someone else's wallet — faster than copy trading
+// Why these numbers:
+//   Target buys exactly 1.01 or 2.02 SOL every time (it's a bot)
+//   We take +25% before he exits, cutting our losses tighter than him
+//   15min max because his average hold is 5-20 minutes
 //
-// Detection method:
-//   PumpPortal subscribeMigration WebSocket — fires instantly
-//   on graduation, no polling delay
+// Fees — minimum viable:
+//   Buy:  0.0002 SOL | Sell: 0.0003 SOL | Emergency: 0.001 SOL
 //
-// Fee config — minimum viable for $5 buys:
-//   Buy:       0.0002 SOL
-//   Sell:      0.0003 SOL
-//   Emergency: 0.001  SOL
-//
-// Crash failsafe: auto-restarts on any unhandled error
+// Crash failsafe: auto-restarts on any error
 // Single wallet — WALLET_PRIVATE_KEY only
 // ============================================================
 
@@ -42,104 +35,88 @@ const CONFIG = {
   DISCORD_WEBHOOK: process.env.DISCORD_WEBHOOK_URL || process.env.DISCORD_WEBHOOK || '',
 
   get HELIUS_RPC() { return `https://mainnet.helius-rpc.com/?api-key=${this.HELIUS_API_KEY}`; },
+  get HELIUS_TX()  { return `https://api-mainnet.helius-rpc.com/v0/transactions?api-key=${this.HELIUS_API_KEY}`; },
+  get HELIUS_WS()  { return process.env.HELIUS_WS_URL || `wss://mainnet.helius-rpc.com/?api-key=${this.HELIUS_API_KEY}`; },
 
   JUPITER_QUOTE: 'https://lite-api.jup.ag/swap/v1/quote',
   JUPITER_SWAP:  'https://lite-api.jup.ag/swap/v1/swap',
 
-  // Helius WebSocket — uses your existing env var
-  get HELIUS_WS() { return process.env.HELIUS_WS_URL || `wss://mainnet.helius-rpc.com/?api-key=${this.HELIUS_API_KEY}`; },
+  // ── Target wallet to copy ────────────────────────────────
+  TARGET: 'EqiFgyNw6kgrmYstWyrP8VjKhka7XEmKTZzHSmwpr1Zb',
 
-  // Pump.fun program IDs — both old (Raydium) and new (PumpSwap) graduation
-  PUMPFUN_PROGRAM:  '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
-  PUMPSWAP_PROGRAM: 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
-  // Migration account — triggers when bonding curve completes
-  MIGRATION_ACCOUNT: '39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg',
+  // ── Signal filter — only copy his intentional buys ───────
+  // He buys exactly 1.01 or 2.02 SOL — filter for that range
+  // Ignore tiny 0.002115 SOL fee transactions
+  MIN_BUY_SOL_SIGNAL: 0.9,
+  MAX_BUY_SOL_SIGNAL: 2.1,
 
-  // ── Trade config ─────────────────────────────────────────
-  BUY_SOL:         0.055,   // ~$5
-  MIN_SOL_BALANCE: 0.065,   // 0.055 buy + 0.01 fee buffer
+  // ── Our buy size — fixed ──────────────────────────────────
+  BUY_SOL: 0.055, // ~$5
 
-  // ── Exit ─────────────────────────────────────────────────
-  // ── Tiered exit strategy ─────────────────────────────────
-  // Tier 1: +40% → sell 50%, keep 50% riding
-  // Tier 2: +80% → sell 50% of remaining (25% of original), keep 25% moonbag
-  // Tier 3: +150% → sell 50% of remaining (12.5%), moonbag rides free forever
-  // Moonbag: final ~12.5% rides with NO time limit
-  //          exits only on: dump -40% from tier3 entry, or +500% moon
-  // SL: -30% before any tier fires → full exit
-  // 10min timer: only kills position if NO tier has fired yet
-  TP_TIERS: [
-    { roi: 40,  sellPct: 50 },   // +40%  → sell 50%
-    { roi: 80,  sellPct: 50 },   // +80%  → sell 50% of remaining
-    { roi: 150, sellPct: 50 },   // +150% → sell 50% of remaining
-  ],
-  SL_PCT:           -25,    // tighter SL — graduation rugs move fast
-  MOONBAG_DUMP_PCT: -40,    // moonbag SL: -40% drop from tier3 entry ROI
-  MOONBAG_MOON_PCT:  500,   // moonbag moon exit: +500% from original entry
-  MAX_HOLD_MS:       600000, // 10min — only applies if NO tier has fired
+  // ── Fee config ───────────────────────────────────────────
+  MIN_SOL_BALANCE:             0.065,  // 0.055 + 0.01 buffer
+  BUY_PRIORITY_LAMPORTS:       200000, // 0.0002 SOL
+  BUY_SLIPPAGE_BPS:             300,   // 3%
+  SELL_PRIORITY_LAMPORTS:      300000, // 0.0003 SOL
+  SELL_SLIPPAGE_BPS:            500,   // 5%
+  EMERGENCY_PRIORITY_LAMPORTS: 1000000,// 0.001 SOL
+  EMERGENCY_SLIPPAGE_BPS:      2000,   // 20%
 
-  // ── Top holder check ─────────────────────────────────────
-  // Skip if any single wallet holds > 15% of supply
-  // High concentration = dev/whale ready to dump on graduation
-  MAX_TOP_HOLDER_PCT: 15,
-  MIN_HOLDERS:         8,   // skip if fewer than 8 unique holders — too concentrated
+  // ── Exit strategy ────────────────────────────────────────
+  // Simple: get in, take small profit fast, get out clean
+  // No tiers — just a clean +25% exit
+  TP_PCT:       25,    // take profit — get out before he does
+  SL_PCT:      -20,   // stop loss — tight, don't let losers run
+  MAX_HOLD_MS:  900000, // 15min max hold
 
-  // ── Token age filter ─────────────────────────────────────
-  // Skip tokens older than 30 min — fresh graduates only
-  // Old tokens have bag holders ready to dump on graduation
-  MAX_TOKEN_AGE_MS: 30 * 60 * 1000,  // 30 minutes
-  // Skip tokens with rugcheck score below this
-  // 500+ = relatively safe, 0-499 = risky
-  MIN_RUGCHECK_SCORE: 300,
-  RUGCHECK_ENABLED:   true,
-
-  // ── Fees — minimum viable ────────────────────────────────
-  BUY_PRIORITY_LAMPORTS:       200000,  // 0.0002 SOL
-  BUY_SLIPPAGE_BPS:             500,    // 5% — graduation pools have low liquidity initially
-  SELL_PRIORITY_LAMPORTS:      300000,  // 0.0003 SOL
-  SELL_SLIPPAGE_BPS:            800,    // 8%
-  EMERGENCY_PRIORITY_LAMPORTS: 1000000, // 0.001 SOL
-  EMERGENCY_SLIPPAGE_BPS:      2500,    // 25% — get out no matter what
+  // ── No-chase ─────────────────────────────────────────────
+  NO_CHASE_CHECK_DELAY_MS: 6000, // check 6s after our fill
 
   // ── Rate limits ──────────────────────────────────────────
+  POLL_MS:       1200,
   EXIT_CHECK_MS: 2000,
   HEALTH_MS:     60000,
 
-  MAX_CONCURRENT_POSITIONS: 3, // don't overextend on $5 buys
+  MAX_CONCURRENT_POSITIONS: 3,
   SELL_MAX_RETRIES: 10,
-  BUY_MAX_RETRIES:   2,   // fast fail on buys — graduation window is short
+  BUY_MAX_RETRIES:   3,
   SOL_MINT: 'So11111111111111111111111111111111111111112',
 };
 
-// ── State ─────────────────────────────────────────────────────
+const IGNORE_MINTS = new Set([
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+  'USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB',
+  'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So',
+  'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn',
+  'bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1',
+]);
+
 const wallet = {
   keypair:        null,
-  positions:      new Map(),   // mint → position
-  snipedMints:    new Set(),   // mints already attempted this session
+  positions:      new Map(),
+  tradedMints:    new Set(),
+  emergencyQueue: new Set(),
   stats: {
-    attempts: 0, buys: 0, sells: 0,
-    wins: 0, losses: 0, totalPnl: 0,
-    errors: 0, skipped: 0, feesTotal: 0,
-    startBal: 0, startTime: Date.now(),
+    buys: 0, sells: 0, wins: 0, losses: 0,
+    totalPnl: 0, errors: 0, skipped: 0,
+    feesTotal: 0, startBal: 0, startTime: Date.now(),
   },
 };
 
-const shared = { connection: null, isRunning: false, ws: null, wsEvents: 0, graduations: 0 };
+const shared = { connection: null, isRunning: false, ws: null, wsEvents: 0, copiedBuys: 0 };
 
 // ── UTILS ─────────────────────────────────────────────────────
 
 function log(lv, msg, d={}) {
   const ts = new Date().toISOString();
-  const ic = {
-    INFO:'📡', BUY:'🟢', SELL:'🔴', EXEC:'⚡', ERROR:'❌',
-    SNIPE:'🎯', EXIT:'🏁', EMERGENCY:'🚨', SKIP:'⏭', GRAD:'🎓',
-  };
+  const ic = { INFO:'📡',BUY:'🟢',SELL:'🔴',EXEC:'⚡',ERROR:'❌',COPY:'🪞',EXIT:'🎯',SKIP:'⏭',EMERGENCY:'🚨' };
   console.log(`[${ts}] ${ic[lv]||'📋'} [${lv}] ${msg}${Object.keys(d).length?' '+JSON.stringify(d):''}`);
 }
 
-const sleep  = ms => new Promise(r => setTimeout(r, ms));
-const SOL_USD = (sol) => (sol * 96).toFixed(2);
-const pctStr  = (n)   => `${n >= 0 ? '+' : ''}${n.toFixed(1)}%`;
+const sleep   = ms  => new Promise(r => setTimeout(r, ms));
+const SOL_USD = sol => (sol * 96).toFixed(2);
+const pctStr  = n   => `${n >= 0 ? '+' : ''}${n.toFixed(1)}%`;
 
 const PROFIT_GIFS = [
   'https://media.tenor.com/LxMBBtB7SWIAAAAC/lets-go-kevin-hart.gif',
@@ -153,7 +130,7 @@ const randomGif = () => PROFIT_GIFS[Math.floor(Math.random() * PROFIT_GIFS.lengt
 async function safeFetch(url, opts={}, label='') {
   const r = await fetch(url, opts);
   if(r.status === 429) {
-    log('ERROR', `429 on ${label || url.slice(0,40)} — sleeping 3s`);
+    log('ERROR', `429 on ${label||url.slice(0,40)} — sleeping 3s`);
     await sleep(3000);
     throw new Error('429 rate limit');
   }
@@ -177,37 +154,15 @@ async function discord(msg) {
   if(!CONFIG.DISCORD_WEBHOOK) return;
   try {
     await fetch(CONFIG.DISCORD_WEBHOOK, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content: msg.slice(0, 1990) }),
     });
   } catch(e) {}
 }
 
-// ── RUG CHECK ─────────────────────────────────────────────────
-// Uses rugcheck.xyz — free, no API key needed
-// Returns score 0-1000 (higher = safer)
-
-async function rugCheck(mint) {
-  if(!CONFIG.RUGCHECK_ENABLED) return { pass: true, score: 999, reason: 'disabled' };
-  try {
-    const r = await fetch(`https://api.rugcheck.xyz/v1/tokens/${mint}/report/summary`, {
-      headers: { 'Accept': 'application/json' },
-    });
-    if(!r.ok) return { pass: true, score: 500, reason: 'rugcheck unavailable' }; // fail open
-    const d = await r.json();
-    const score = d?.score || 0;
-    const risks = (d?.risks || []).map(r => r.name).join(', ');
-    const pass  = score >= CONFIG.MIN_RUGCHECK_SCORE;
-    return { pass, score, risks: risks || 'none' };
-  } catch(e) {
-    return { pass: true, score: 500, reason: 'rugcheck error — proceeding' }; // fail open
-  }
-}
-
 // ── CONFIRM TX ────────────────────────────────────────────────
 
-async function confirm(sig, timeout=60000) {
+async function confirm(sig, timeout=90000) {
   const start = Date.now();
   while(Date.now()-start < timeout) {
     try {
@@ -216,7 +171,7 @@ async function confirm(sig, timeout=60000) {
       if(v?.err) return false;
       if(v?.confirmationStatus==='confirmed'||v?.confirmationStatus==='finalized') return true;
     } catch(e) {}
-    await sleep(1000);
+    await sleep(1500);
   }
   return false;
 }
@@ -234,8 +189,7 @@ async function getCurrentRoi(mint, pos) {
     if(bal <= 0) return null;
     const dec = acct.account.data.parsed.info.tokenAmount.decimals;
     const raw = BigInt(Math.floor(bal * Math.pow(10, dec)));
-
-    const qr = await safeFetch(
+    const qr  = await safeFetch(
       `${CONFIG.JUPITER_QUOTE}?inputMint=${mint}&outputMint=${CONFIG.SOL_MINT}&amount=${raw.toString()}&slippageBps=1000`,
       {}, 'roi-quote'
     );
@@ -246,7 +200,7 @@ async function getCurrentRoi(mint, pos) {
   } catch(e) { return null; }
 }
 
-// ── SELL ──────────────────────────────────────────────────────
+// ── FULL SELL ─────────────────────────────────────────────────
 
 async function execSell(mint, reason, emergency=false, attempt=1) {
   const info     = await tokenInfo(mint);
@@ -297,9 +251,7 @@ async function execSell(mint, reason, emergency=false, attempt=1) {
     const buf = Buffer.from(sd.swapTransaction, 'base64');
     const tx  = VersionedTransaction.deserialize(buf);
     tx.sign([wallet.keypair]);
-    const sig = await shared.connection.sendRawTransaction(tx.serialize(), {
-      skipPreflight: true, maxRetries: 8,
-    });
+    const sig = await shared.connection.sendRawTransaction(tx.serialize(), { skipPreflight:true, maxRetries:8 });
 
     if(await confirm(sig)) {
       const solBack  = parseFloat(q.outAmount) / 1e9;
@@ -314,25 +266,24 @@ async function execSell(mint, reason, emergency=false, attempt=1) {
       wallet.stats.sells++;
       wallet.positions.delete(mint);
 
-      const wr = wallet.stats.sells > 0
-        ? ((wallet.stats.wins/wallet.stats.sells)*100).toFixed(0) : '0';
-
+      const wr = wallet.stats.sells > 0 ? ((wallet.stats.wins/wallet.stats.sells)*100).toFixed(0) : '0';
       log('SELL', `✅ ${info.sym} → ${solBack.toFixed(4)} SOL (${pnlSign}${pnl.toFixed(4)}) | ${reason} | WR:${wr}%`);
 
       const exitLabel =
-          reason.startsWith('TP')         ? '🏁 TAKE PROFIT'
-        : reason.startsWith('SL')         ? '🛑 STOP LOSS'
-        : reason.startsWith('max_hold')   ? '⏱ 10MIN EXIT'
-        : reason.startsWith('emergency')  ? '🚨 EMERGENCY'
+          reason.startsWith('TP')           ? '🎯 TAKE PROFIT'
+        : reason.startsWith('SL')           ? '🛑 STOP LOSS'
+        : reason.startsWith('target_sold')  ? '🚨 TARGET SOLD'
+        : reason.startsWith('max_hold')     ? '⏱ 15MIN EXIT'
+        : reason.startsWith('no_chase')     ? '🚫 NO-CHASE'
         : '🔴 SELL';
 
       const dMsg = [
-        `${exitLabel} — **${info.sym}** 🎓`,
+        `${exitLabel} — **${info.sym}**`,
         '━━━━━━━━━━━━━━━━━━━━',
-        `📥  Entry:  **$${SOL_USD(pos.sol)}** (${pos.sol.toFixed(4)} SOL)`,
-        `📤  Exit:   **$${SOL_USD(solBack)}** (${solBack.toFixed(4)} SOL)`,
-        `${pnlEmoji}  PnL:    **${pnlSign}$${SOL_USD(Math.abs(pnl))}** (${pnlSign}${pnl.toFixed(4)} SOL / ${pctStr(roiPct)})`,
-        `💸  Fee:    ~$${SOL_USD(feeSol)}`,
+        `📥  Entry: **$${SOL_USD(pos.sol)}** (${pos.sol.toFixed(4)} SOL)`,
+        `📤  Exit:  **$${SOL_USD(solBack)}** (${solBack.toFixed(4)} SOL)`,
+        `${pnlEmoji}  PnL:   **${pnlSign}$${SOL_USD(Math.abs(pnl))}** (${pnlSign}${pnl.toFixed(4)} SOL / ${pctStr(roiPct)})`,
+        `💸  Fee:   ~$${SOL_USD(feeSol)}`,
         '━━━━━━━━━━━━━━━━━━━━',
         `📊  Session: **${wallet.stats.wins}W / ${wallet.stats.losses}L** (${wr}% WR)`,
         `💰  Total PnL: **${wallet.stats.totalPnl>=0?'+':''}$${SOL_USD(Math.abs(wallet.stats.totalPnl))}**`,
@@ -345,28 +296,24 @@ async function execSell(mint, reason, emergency=false, attempt=1) {
   } catch(e) {
     log('ERROR', `Sell fail (${attempt}/${maxRetries}): ${e.message}`);
     if(attempt < maxRetries) {
-      await sleep((emergency ? 1500 : 2500) * attempt + Math.floor(Math.random()*500));
+      await sleep((emergency?2000:3000)*attempt + Math.floor(Math.random()*1000));
       return execSell(mint, reason, emergency, attempt+1);
     }
     wallet.stats.errors++;
-    await discord(
-      `🆘  **SELL EXHAUSTED — ${info.sym}**\n` +
-      `All ${maxRetries} retries failed — **SELL MANUALLY NOW**\n` +
-      `🔗  https://jup.ag/swap/${mint}-SOL`
-    );
+    await discord(`🆘  **SELL EXHAUSTED — ${info.sym}**\nAll retries failed — **SELL MANUALLY**\n🔗  https://jup.ag/swap/${mint}-SOL`);
     return false;
   }
 }
 
 // ── BUY ───────────────────────────────────────────────────────
 
-async function execBuy(mint, tokenName, attempt=1) {
+async function execBuy(mint, targetSol, attempt=1) {
+  const info     = await tokenInfo(mint);
   const sol      = CONFIG.BUY_SOL;
   const lamports = Math.floor(sol * 1e9);
   const feeSol   = CONFIG.BUY_PRIORITY_LAMPORTS / 1e9;
-  const sym      = tokenName || '???';
 
-  log('SNIPE', `⚡ SNIPING ${sym} ${sol} SOL (attempt ${attempt})`, { mint: mint.slice(0,12) });
+  log('COPY', `🪞 COPYING ${info.sym} ${sol} SOL (target spent: ${targetSol.toFixed(3)})`, { mint: mint.slice(0,12) });
 
   try {
     const qr = await safeFetch(
@@ -375,7 +322,7 @@ async function execBuy(mint, tokenName, attempt=1) {
     );
     if(!qr.ok) throw new Error(`Quote ${qr.status}`);
     const q = await qr.json();
-    if(!q.outAmount || q.outAmount==='0') throw new Error('No route yet — pool may not be live');
+    if(!q.outAmount || q.outAmount==='0') throw new Error('No route');
 
     const sr = await safeFetch(CONFIG.JUPITER_SWAP, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -394,147 +341,76 @@ async function execBuy(mint, tokenName, attempt=1) {
     const buf = Buffer.from(sd.swapTransaction, 'base64');
     const tx  = VersionedTransaction.deserialize(buf);
     tx.sign([wallet.keypair]);
-    const sig = await shared.connection.sendRawTransaction(tx.serialize(), {
-      skipPreflight: true, maxRetries: 5,
-    });
+    const sig = await shared.connection.sendRawTransaction(tx.serialize(), { skipPreflight:true, maxRetries:5 });
 
     if(await confirm(sig)) {
       wallet.positions.set(mint, {
-        time:           Date.now(),
+        time:        Date.now(),
         sol,
-        sym,
-        isSelling:      false,
-        tpFired:        false,
-        tiersFired:     [],      // which tiers have fired e.g. [40, 80]
-        anyTierFired:   false,   // true once any tier fires — disables 10min timer
-        lastTierRoi:    0,       // ROI when last tier fired — for moonbag dump SL
-        moonbagMode:    false,   // true after last tier fires
-        moonbagStartMs: null,
-        highestRoi:     -Infinity,
+        sym:         info.sym,
+        isSelling:   false,
+        tpFired:     false,
+        highestRoi:  -Infinity,
+        whaleSoldAt: null,
       });
       wallet.stats.buys++;
       wallet.stats.feesTotal += feeSol;
 
-      log('BUY', `✅ SNIPED ${sym} — ${sol} SOL | TP:+${CONFIG.TP_TIERS[0].roi}%/+${CONFIG.TP_TIERS[1].roi}%/+${CONFIG.TP_TIERS[2].roi}% SL:${CONFIG.SL_PCT}%`);
+      log('BUY', `✅ ${info.sym} ${sol} SOL | TP:+${CONFIG.TP_PCT}% SL:${CONFIG.SL_PCT}% Max:15min`);
+
       await discord(
-        `🎓  **GRADUATION SNIPE — ${sym}**\n` +
+        `🪞  **COPY BUY — ${info.sym}**\n` +
         `\`${mint}\`\n` +
         `━━━━━━━━━━━━━━━━━━━━\n` +
         `💸  Bought: **${sol} SOL** (~$${SOL_USD(sol)})\n` +
-        `💸  Buy fee: ~$${SOL_USD(feeSol)}\n` +
+        `🎯  Target spent: **${targetSol.toFixed(3)} SOL** (~$${SOL_USD(targetSol)})\n` +
+        `💸  Fee: ~$${SOL_USD(feeSol)}\n` +
         `━━━━━━━━━━━━━━━━━━━━\n` +
-        `🏁  TP: **+${CONFIG.TP_ROI_PCT}%** → full exit\n` +
+        `🎯  TP: **+${CONFIG.TP_PCT}%** → full exit\n` +
         `🛑  SL: **${CONFIG.SL_PCT}%** → full exit\n` +
-        `⏱  Max hold: **10 minutes**\n` +
+        `⏱  Max hold: **15 minutes**\n` +
         `🔗  https://solscan.io/tx/${sig}\n` +
         `📊  https://dexscreener.com/solana/${mint}`
       );
+
+      // No-chase: 6s after fill, check target still holds
+      setTimeout(async () => {
+        const pos = wallet.positions.get(mint);
+        if(!pos || pos.isSelling || pos.tpFired) return;
+        try {
+          const accts = await shared.connection.getParsedTokenAccountsByOwner(
+            new PublicKey(CONFIG.TARGET), { mint: new PublicKey(mint) }
+          );
+          const acct = accts?.value?.[0];
+          const targetBal = parseFloat(acct?.account?.data?.parsed?.info?.tokenAmount?.uiAmount||0);
+          if(targetBal <= 0) {
+            log('EMERGENCY', `🚫 NO-CHASE — target already sold ${info.sym}`);
+            pos.isSelling = true;
+            await discord(`🚫  **NO-CHASE EXIT — ${info.sym}**\nTarget sold before our fill — exiting`);
+            execSell(mint, 'no_chase_target_sold', true)
+              .catch(e => log('ERROR', `No-chase: ${e.message}`));
+          }
+        } catch(e) {}
+      }, CONFIG.NO_CHASE_CHECK_DELAY_MS);
+
       return true;
     } else { throw new Error('Confirm timeout'); }
   } catch(e) {
     log('ERROR', `Buy fail (attempt ${attempt}): ${e.message}`);
-    // If "no route" — pool not live yet, retry quickly
-    const isNoRoute = e.message.includes('No route') || e.message.includes('no route');
     if(attempt < CONFIG.BUY_MAX_RETRIES) {
-      const delay = isNoRoute ? 1500 : 2000; // faster retry for no-route
-      await sleep(delay);
-      return execBuy(mint, tokenName, attempt+1);
+      await sleep(2000 * attempt);
+      return execBuy(mint, targetSol, attempt+1);
     }
     wallet.stats.errors++;
-    await discord(`❌  **SNIPE FAILED** — ${sym}\n\`${mint.slice(0,20)}\`\n${e.message}`);
+    await discord(`❌  **BUY FAILED** — ${info.sym}\n${e.message}`);
     return false;
   }
 }
 
 // ── EXIT MANAGER ──────────────────────────────────────────────
 
-// ── PARTIAL SELL ──────────────────────────────────────────────
-
-async function execPartialSell(mint, fraction, reason, attempt=1) {
-  const pos      = wallet.positions.get(mint);
-  if(!pos) return false;
-  const sym      = pos.sym || '???';
-  const feeSol   = CONFIG.SELL_PRIORITY_LAMPORTS / 1e9;
-  const maxRetries = CONFIG.SELL_MAX_RETRIES;
-
-  log('EXEC', `🎯 PARTIAL ${(fraction*100).toFixed(0)}% ${sym} — ${reason} (attempt ${attempt})`);
-
-  try {
-    const accts = await shared.connection.getParsedTokenAccountsByOwner(
-      wallet.keypair.publicKey, { mint: new PublicKey(mint) }
-    );
-    const acct = accts?.value?.[0];
-    if(!acct) return false;
-    const bal = parseFloat(acct.account.data.parsed.info.tokenAmount.uiAmount||0);
-    if(bal <= 0) return false;
-    const dec = acct.account.data.parsed.info.tokenAmount.decimals;
-    const raw = BigInt(Math.floor(bal * fraction * Math.pow(10, dec)));
-    if(raw <= 0n) return false;
-
-    const qr = await safeFetch(
-      `${CONFIG.JUPITER_QUOTE}?inputMint=${mint}&outputMint=${CONFIG.SOL_MINT}&amount=${raw.toString()}&slippageBps=${CONFIG.SELL_SLIPPAGE_BPS}`,
-      {}, 'partial-sell-quote'
-    );
-    if(!qr.ok) throw new Error(`Quote ${qr.status}`);
-    const q = await qr.json();
-    if(!q.outAmount) throw new Error('No sell route');
-
-    const sr = await safeFetch(CONFIG.JUPITER_SWAP, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        quoteResponse: q,
-        userPublicKey: wallet.keypair.publicKey.toString(),
-        wrapAndUnwrapSol: true,
-        dynamicSlippage: { minBps: 50, maxBps: CONFIG.SELL_SLIPPAGE_BPS },
-        prioritizationFeeLamports: CONFIG.SELL_PRIORITY_LAMPORTS,
-      }),
-    }, 'partial-sell-swap');
-    if(!sr.ok) throw new Error(`Swap ${sr.status}`);
-    const sd = await sr.json();
-    if(!sd.swapTransaction) throw new Error('No sell tx');
-
-    const buf = Buffer.from(sd.swapTransaction, 'base64');
-    const tx  = VersionedTransaction.deserialize(buf);
-    tx.sign([wallet.keypair]);
-    const sig = await shared.connection.sendRawTransaction(tx.serialize(), { skipPreflight:true, maxRetries:8 });
-
-    if(await confirm(sig)) {
-      const solBack   = parseFloat(q.outAmount) / 1e9;
-      const costBasis = pos.sol * fraction;
-      const pnl       = solBack - costBasis;
-      const pnlSign   = pnl >= 0 ? '+' : '';
-
-      wallet.stats.totalPnl  += pnl;
-      wallet.stats.feesTotal += feeSol;
-      wallet.stats.sells++;
-      if(pnl >= 0) wallet.stats.wins++;
-
-      log('SELL', `✅ PARTIAL ${(fraction*100).toFixed(0)}% ${sym} → ${solBack.toFixed(4)} SOL (${pnlSign}${pnl.toFixed(4)}) | ${reason}`);
-      await discord(
-        `🎯  **TIER EXIT — ${sym}**\n` +
-        `💰  Sold **${(fraction*100).toFixed(0)}%** → **$${SOL_USD(solBack)}** (${solBack.toFixed(4)} SOL)\n` +
-        `📈  Chunk PnL: **${pnlSign}$${SOL_USD(Math.abs(pnl))}**\n` +
-        `🌙  Remaining position rides on\n` +
-        `🔗  https://solscan.io/tx/${sig}` +
-        (pnl > 0 ? '\n' + randomGif() : '')
-      );
-      return true;
-    } else { throw new Error('Confirm timeout'); }
-  } catch(e) {
-    log('ERROR', `Partial sell fail (${attempt}/${maxRetries}): ${e.message}`);
-    if(attempt < maxRetries) {
-      await sleep(2000 * attempt + Math.floor(Math.random()*500));
-      return execPartialSell(mint, fraction, reason, attempt+1);
-    }
-    wallet.stats.errors++;
-    await discord(`❌  Partial sell FAILED: ${sym} — ${e.message}\n🔗  https://jup.ag/swap/${mint}-SOL`);
-    return false;
-  }
-}
-
-
 async function exitManager() {
-  log('INFO', `🏁 Exit manager | Tiers: +40%/+80%/+150% | SL:${CONFIG.SL_PCT}% | 10min (pre-TP only)`);
+  log('INFO', `🎯 Exit manager | TP:+${CONFIG.TP_PCT}% SL:${CONFIG.SL_PCT}% Max:15min`);
 
   while(shared.isRunning) {
     await sleep(CONFIG.EXIT_CHECK_MS);
@@ -545,92 +421,63 @@ async function exitManager() {
       const ageMs  = Date.now() - pos.time;
       const ageMin = (ageMs / 60000).toFixed(1);
 
-      // 10min timer only kills if no tier has fired yet
-      if(ageMs >= CONFIG.MAX_HOLD_MS && !pos.anyTierFired) {
+      // Target sold → exit immediately
+      if(wallet.emergencyQueue.has(mint)) {
+        wallet.emergencyQueue.delete(mint);
+        if(!pos.whaleSoldAt) {
+          pos.whaleSoldAt = Date.now();
+          pos.isSelling   = true;
+          log('EMERGENCY', `🚨 TARGET SOLD ${pos.sym} — exiting`);
+          await discord(`🚨  **TARGET SOLD — ${pos.sym}**\nExiting immediately`);
+          execSell(mint, 'target_sold', true)
+            .catch(e => log('ERROR', `Target-sold: ${e.message}`));
+        }
+        continue;
+      }
+
+      // 15min hard exit
+      if(ageMs >= CONFIG.MAX_HOLD_MS) {
         pos.isSelling = true;
-        log('EXIT', `⏱ 10MIN EXIT ${pos.sym} — no profit taken`);
-        await discord(`⏱  **10MIN EXIT — ${pos.sym}**\nNo profit hit — exiting`);
-        execSell(mint, 'max_hold_10min', false)
-          .catch(e => log('ERROR', `10min exit: ${e.message}`));
+        log('EXIT', `⏱ 15MIN EXIT ${pos.sym}`);
+        await discord(`⏱  **15MIN EXIT — ${pos.sym}**\nMax hold reached — full exit`);
+        execSell(mint, 'max_hold_15min', false)
+          .catch(e => log('ERROR', `15min exit: ${e.message}`));
         continue;
       }
 
-      // Moonbag mode — no time limit, rides free
-      if(pos.moonbagMode) {
-        const roi = await getCurrentRoi(mint, pos);
-        if(roi === null) continue;
-
-        const dumpThreshold = (pos.lastTierRoi || 0) - Math.abs(CONFIG.MOONBAG_DUMP_PCT);
-        const moonAge = ((Date.now() - pos.moonbagStartMs) / 60000).toFixed(1);
-        const bar = roi >= 0
-          ? '█'.repeat(Math.min(Math.floor(roi/10),20)) + '░'.repeat(Math.max(20-Math.floor(roi/10),0))
-          : '▓'.repeat(Math.min(Math.floor(Math.abs(roi)/10),20));
-        console.log(`  🌙 [${pos.sym}] ${pctStr(roi)} [${bar}] | moonbag ${moonAge}min | dump@${pctStr(dumpThreshold)} moon@+${CONFIG.MOONBAG_MOON_PCT}%`);
-
-        if(roi >= CONFIG.MOONBAG_MOON_PCT) {
-          pos.isSelling = true;
-          log('EXIT', `🚀 MOON ${pctStr(roi)} on ${pos.sym}`);
-          await discord(`🚀  **MOONBAG MOON — ${pos.sym}**\n🎉  **${pctStr(roi)}** — cashing out!`);
-          execSell(mint, `moonbag_moon_${roi.toFixed(0)}pct`, false)
-            .catch(e => log('ERROR', `Moon exit: ${e.message}`));
-          continue;
-        }
-
-        if(roi <= dumpThreshold) {
-          pos.isSelling = true;
-          log('EXIT', `🌙🛑 MOONBAG DUMP ${pos.sym} at ${pctStr(roi)}`);
-          await discord(`🌙🛑  **MOONBAG DUMP — ${pos.sym}**\n📉  **${pctStr(roi)}** — cutting`);
-          execSell(mint, `moonbag_dump_${roi.toFixed(0)}pct`, false)
-            .catch(e => log('ERROR', `Moonbag dump: ${e.message}`));
-        }
-        continue;
-      }
-
-      // Live ROI check
+      // ROI check
       const roi = await getCurrentRoi(mint, pos);
       if(roi === null) continue;
       if(roi > pos.highestRoi) pos.highestRoi = roi;
 
-      const timeLeft = pos.anyTierFired ? '∞' : ((CONFIG.MAX_HOLD_MS - ageMs) / 60000).toFixed(1);
+      const timeLeft = ((CONFIG.MAX_HOLD_MS - ageMs) / 60000).toFixed(1);
       const bar = roi >= 0
-        ? '█'.repeat(Math.min(Math.floor(roi/5),20)) + '░'.repeat(Math.max(20-Math.floor(roi/5),0))
-        : '▓'.repeat(Math.min(Math.floor(Math.abs(roi)/5),20));
-      const tiersTag = pos.tiersFired?.length > 0 ? ` [T${pos.tiersFired.join('+')}fired]` : '';
-      console.log(`  🎓 [${pos.sym}] ${pctStr(roi)} [${bar}] | ${ageMin}min${tiersTag} | SL:${CONFIG.SL_PCT}% | ${timeLeft}min left`);
+        ? '█'.repeat(Math.min(Math.floor(roi/3),20)) + '░'.repeat(Math.max(20-Math.floor(roi/3),0))
+        : '▓'.repeat(Math.min(Math.floor(Math.abs(roi)/3),20));
+      console.log(`  🪞 [${pos.sym}] ${pctStr(roi)} [${bar}] | ${ageMin}min | SL:${CONFIG.SL_PCT}% TP:+${CONFIG.TP_PCT}% | ${timeLeft}min left`);
 
-      // Tiered take profits
-      let tierFired = false;
-      for(const tier of CONFIG.TP_TIERS) {
-        if(roi >= tier.roi && !pos.tiersFired.includes(tier.roi)) {
-          pos.tiersFired.push(tier.roi);
-          pos.anyTierFired = true;
-          pos.lastTierRoi  = roi;
-          const fraction   = tier.sellPct / 100;
-          const isLastTier = tier === CONFIG.TP_TIERS[CONFIG.TP_TIERS.length - 1];
-
-          log('EXIT', `🎯 TIER +${tier.roi}% on ${pos.sym} — selling ${tier.sellPct}%${isLastTier ? ' → MOONBAG' : ''}`);
-
-          if(isLastTier) {
-            pos.moonbagMode    = true;
-            pos.moonbagStartMs = Date.now();
-          }
-
-          execPartialSell(mint, fraction, `tier_${tier.roi}pct`)
-            .catch(e => {
-              pos.tiersFired.pop();
-              log('ERROR', `Tier sell failed: ${e.message}`);
-            });
-          tierFired = true;
-          break;
-        }
+      // Take profit at +25%
+      if(roi >= CONFIG.TP_PCT && !pos.tpFired) {
+        pos.tpFired   = true;
+        pos.isSelling = true;
+        log('EXIT', `🎯 TP ${pctStr(roi)} on ${pos.sym} — full exit`);
+        execSell(mint, `TP_${roi.toFixed(0)}pct`, false)
+          .catch(e => {
+            pos.tpFired   = false;
+            pos.isSelling = false;
+            log('ERROR', `TP sell failed, retrying: ${e.message}`);
+          });
+        continue;
       }
-      if(tierFired) continue;
 
-      // Stop loss — only before first tier fires
-      if(roi <= CONFIG.SL_PCT && !pos.anyTierFired) {
+      // Stop loss at -20%
+      if(roi <= CONFIG.SL_PCT) {
         pos.isSelling = true;
         log('EXIT', `🛑 STOP LOSS ${pos.sym} at ${pctStr(roi)}`);
-        await discord(`🛑  **STOP LOSS — ${pos.sym}**\n📉  **${pctStr(roi)}** after **${ageMin}min**`);
+        await discord(
+          `🛑  **STOP LOSS — ${pos.sym}**\n` +
+          `📉  **${pctStr(roi)}** (~-$${SOL_USD(Math.abs(pos.sol*roi/100))}) after **${ageMin}min**`
+        );
         execSell(mint, `SL_${roi.toFixed(0)}pct`, false)
           .catch(e => log('ERROR', `SL exit: ${e.message}`));
       }
@@ -638,30 +485,26 @@ async function exitManager() {
   }
 }
 
-
-// ── HELIUS WEBSOCKET ─────────────────────────────────────────
-// ── HELIUS WEBSOCKET — GRADUATION DETECTOR ────────────────────
-// Uses logsSubscribe to watch the Pump.fun migration account
-// Fires the instant a token completes its bonding curve
+// ── HELIUS WEBSOCKET — WATCH TARGET WALLET ────────────────────
+// Subscribes to all logs that mention the target wallet address
+// Fires every time target does anything on-chain
 
 function connectHelius() {
-  log('INFO', `🎓 Connecting to Helius WebSocket...`);
+  log('INFO', `🪞 Connecting to Helius — watching ${CONFIG.TARGET.slice(0,20)}...`);
 
   const ws = new WebSocket(CONFIG.HELIUS_WS);
   shared.ws = ws;
-  let subId = null;
 
   ws.on('open', () => {
-    log('INFO', `✅ Helius WS connected — subscribing to Pump.fun migration logs`);
+    log('INFO', `✅ Helius WS connected — subscribing to target wallet logs`);
     ws.send(JSON.stringify({
       jsonrpc: '2.0', id: 1,
       method: 'logsSubscribe',
       params: [
-        { mentions: [CONFIG.MIGRATION_ACCOUNT] },
+        { mentions: [CONFIG.TARGET] },
         { commitment: 'confirmed' },
       ],
     }));
-    log('INFO', `📡 Watching migration account: ${CONFIG.MIGRATION_ACCOUNT.slice(0,20)}...`);
   });
 
   ws.on('message', async (raw) => {
@@ -669,38 +512,35 @@ function connectHelius() {
     try {
       const msg = JSON.parse(raw.toString());
 
-      // Subscription confirmation
       if(msg.id === 1 && msg.result !== undefined) {
-        subId = msg.result;
-        log('INFO', `✅ logsSubscribe confirmed subId:${subId} — watching for graduations`);
+        log('INFO', `✅ logsSubscribe confirmed subId:${msg.result} — watching target`);
         return;
       }
 
       if(!msg.params?.result?.value) return;
-
       const value = msg.params.result.value;
-      const logs  = value.logs || [];
       const sig   = value.signature;
+      const logs  = value.logs || [];
 
-      // Filter for graduation/migration instructions
-      const isMigration = logs.some(l =>
-        l.includes('MigrateFunds') || l.includes('migrate') || l.includes('Migrate')
+      // Only process swap/trade transactions — skip transfers, fees, etc
+      const isSwap = logs.some(l =>
+        l.includes('Instruction: Buy') ||
+        l.includes('Instruction: Sell') ||
+        l.includes('swap') || l.includes('Swap') ||
+        l.includes('ray_log')
       );
-      if(!isMigration) return;
+      if(!isSwap) return;
 
-      log('GRAD', `🎓 GRADUATION TX — sig:${sig?.slice(0,20)}...`);
-      shared.graduations++;
+      // Fetch full transaction to determine buy/sell and mint
+      fetchTargetTrade(sig)
+        .catch(e => log('ERROR', `fetchTargetTrade: ${e.message}`));
 
-      fetchGraduationMint(sig)
-        .catch(e => log('ERROR', `fetchGraduationMint: ${e.message}`));
-
-    } catch(e) { log('ERROR', `WS msg error: ${e.message}`); }
+    } catch(e) { log('ERROR', `WS msg: ${e.message}`); }
   });
 
-  ws.on('error', (e) => log('ERROR', `Helius WS error: ${e.message}`));
-
-  ws.on('close', (code) => {
-    log('INFO', `Helius WS closed (${code}) — reconnecting in 3s...`);
+  ws.on('error', e => log('ERROR', `Helius WS: ${e.message}`));
+  ws.on('close', code => {
+    log('INFO', `Helius WS closed (${code}) — reconnecting in 3s`);
     shared.ws = null;
     if(shared.isRunning) setTimeout(connectHelius, 3000);
   });
@@ -711,325 +551,118 @@ function connectHelius() {
   }, 30000);
 }
 
-// ── FETCH MINT FROM GRADUATION TX ─────────────────────────────
+// ── PARSE TARGET TRADE ────────────────────────────────────────
 
-async function fetchGraduationMint(sig) {
+async function fetchTargetTrade(sig) {
   try {
-    const IGNORE_MINTS = new Set([
-      'So11111111111111111111111111111111111111112',
-      'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
-      'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
-      'SysvarRent111111111111111111111111111111111',
-      '11111111111111111111111111111111',
-      'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
-      'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
-    ]);
+    // Use Helius enhanced API to parse the transaction
+    const r = await safeFetch(CONFIG.HELIUS_TX, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ transactions: [sig] }),
+    }, 'target-trade');
+    if(!r.ok) throw new Error(`TX fetch ${r.status}`);
 
-    let mint = null;
+    const txs = await r.json();
+    const tx  = txs?.[0];
+    if(!tx || tx.transactionError) return;
 
-    // Method 1: Helius enhanced API (works for Raydium migrations)
-    try {
-      const r = await safeFetch(
-        `https://api-mainnet.helius-rpc.com/v0/transactions?api-key=${CONFIG.HELIUS_API_KEY}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ transactions: [sig] }),
-        }, 'graduation-tx'
-      );
-      if(r.ok) {
-        const txs = await r.json();
-        const tx  = txs?.[0];
-        if(tx) {
-          for(const t of (tx.tokenTransfers||[])) {
-            if(t.mint && !IGNORE_MINTS.has(t.mint)) { mint = t.mint; break; }
-          }
-          if(!mint) {
-            for(const a of (tx.accountData||[])) {
-              for(const c of (a.tokenBalanceChanges||[])) {
-                if(c.mint && !IGNORE_MINTS.has(c.mint)) { mint = c.mint; break; }
-              }
-              if(mint) break;
-            }
-          }
-        }
-      }
-    } catch(e) { log('ERROR', `Helius enhanced TX failed: ${e.message}`); }
+    const tfers  = tx.tokenTransfers  || [];
+    const native = tx.nativeTransfers || [];
 
-    // Method 2: Fallback — RPC getParsedTransaction (works for PumpSwap migrations)
-    if(!mint) {
-      try {
-        const tx = await shared.connection.getParsedTransaction(sig, {
-          maxSupportedTransactionVersion: 0,
-          commitment: 'confirmed',
-        });
-        if(tx) {
-          // Check token balance changes
-          const pre  = tx.meta?.preTokenBalances  || [];
-          const post = tx.meta?.postTokenBalances || [];
-          const allMints = [...pre, ...post].map(b => b.mint).filter(Boolean);
-          for(const m of allMints) {
-            if(!IGNORE_MINTS.has(m)) { mint = m; break; }
-          }
-          // Also check account keys for token mints (ends with "pump")
-          if(!mint) {
-            const keys = tx.transaction?.message?.accountKeys || [];
-            for(const k of keys) {
-              const addr = k.pubkey?.toString() || k.toString();
-              if(addr.endsWith('pump') && !IGNORE_MINTS.has(addr)) {
-                mint = addr; break;
-              }
-            }
-          }
-        }
-      } catch(e) { log('ERROR', `getParsedTransaction failed: ${e.message}`); }
+    // Calculate SOL in/out for target wallet
+    let solOut = 0, solIn = 0;
+    for(const t of native) {
+      if(t.fromUserAccount === CONFIG.TARGET) solOut += (t.amount||0) / 1e9;
+      if(t.toUserAccount   === CONFIG.TARGET) solIn  += (t.amount||0) / 1e9;
     }
 
-    if(!mint) {
-      log('INFO', `⚠️  No mint found in graduation tx ${sig.slice(0,20)}`);
-      return;
+    const buys = [], sells = [];
+    for(const t of tfers) {
+      if(IGNORE_MINTS.has(t.mint) || t.mint === CONFIG.SOL_MINT) continue;
+      if(t.toUserAccount   === CONFIG.TARGET && t.tokenAmount > 0) buys.push(t.mint);
+      if(t.fromUserAccount === CONFIG.TARGET && t.tokenAmount > 0) sells.push(t.mint);
     }
 
-    log('GRAD', `🎓 Mint: ${mint.slice(0,20)}...`);
-    await handleGraduation(mint, sig);
-  } catch(e) { log('ERROR', `fetchGraduationMint: ${e.message}`); }
-}
-
-// ── HANDLE GRADUATION ─────────────────────────────────────────
-
-// ── TOP HOLDER + HOLDER COUNT CHECK ──────────────────────────
-// Checks: 1) min unique holders  2) max top holder concentration
-
-async function checkTopHolders(mint) {
-  try {
-    const [largestAccts, supplyR] = await Promise.all([
-      shared.connection.getTokenLargestAccounts(new PublicKey(mint)),
-      shared.connection.getTokenSupply(new PublicKey(mint)),
-    ]);
-
-    if(!largestAccts?.value?.length) return { pass: true, reason: 'no data' };
-
-    const totalSupply = parseFloat(supplyR?.value?.uiAmount || 0);
-    if(totalSupply <= 0) return { pass: true, reason: 'no supply data' };
-
-    const KNOWN_PROGRAMS = new Set([
-      CONFIG.MIGRATION_ACCOUNT,
-      '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
-      'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
-      '39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg',
-      'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
-      'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
-    ]);
-
-    // Fetch all owner infos in parallel — much faster
-    const ownerInfos = await Promise.all(
-      largestAccts.value.slice(0, 10).map(acct =>
-        shared.connection.getParsedAccountInfo(acct.address)
-          .catch(() => null)
-      )
-    );
-
-    let topHolderPct  = 0;
-    let topHolderAddr = '';
-    let realHolders   = 0;
-
-    for(let i = 0; i < largestAccts.value.slice(0, 10).length; i++) {
-      const acct  = largestAccts.value[i];
-      const info  = ownerInfos[i];
-      const owner = info?.value?.data?.parsed?.info?.owner;
-      if(!owner || KNOWN_PROGRAMS.has(owner)) continue;
-
-      realHolders++;
-      const pct = (parseFloat(acct.uiAmount || 0) / totalSupply) * 100;
-      if(pct > topHolderPct) {
-        topHolderPct  = pct;
-        topHolderAddr = owner;
+    // Handle sells — queue emergency exit if we hold it
+    for(const mint of sells) {
+      if(wallet.positions.has(mint) && !wallet.positions.get(mint).isSelling) {
+        log('EMERGENCY', `🚨 TARGET SOLD ${mint.slice(0,12)}...`);
+        wallet.emergencyQueue.add(mint);
       }
     }
 
-    // Check minimum holders
-    if(realHolders < CONFIG.MIN_HOLDERS) {
-      return {
-        pass: false,
-        reason: 'too_few_holders',
-        holderCount: realHolders,
-        topHolderPct: topHolderPct.toFixed(1),
-      };
-    }
+    // Handle buys — copy if in signal range
+    for(const mint of buys) {
+      if(wallet.tradedMints.has(mint)) continue;
+      if(wallet.positions.has(mint)) continue;
+      if(IGNORE_MINTS.has(mint)) continue;
 
-    // Check top holder concentration
-    if(topHolderPct > CONFIG.MAX_TOP_HOLDER_PCT) {
-      return {
-        pass: false,
-        reason: 'whale_concentration',
-        holderCount: realHolders,
-        topHolderPct: topHolderPct.toFixed(1),
-        topHolderAddr,
-      };
-    }
+      const inRange = solOut >= CONFIG.MIN_BUY_SOL_SIGNAL && solOut <= CONFIG.MAX_BUY_SOL_SIGNAL;
+      if(!inRange) {
+        log('SKIP', `${mint.slice(0,10)} — ${solOut.toFixed(3)} SOL outside ${CONFIG.MIN_BUY_SOL_SIGNAL}–${CONFIG.MAX_BUY_SOL_SIGNAL} range`);
+        return;
+      }
 
-    return { pass: true, holderCount: realHolders, topHolderPct: topHolderPct.toFixed(1) };
-  } catch(e) {
-    log('ERROR', `checkTopHolders: ${e.message}`);
-    return { pass: true, reason: 'error — proceeding' };
-  }
+      // Max positions check
+      if(wallet.positions.size >= CONFIG.MAX_CONCURRENT_POSITIONS) {
+        wallet.stats.skipped++;
+        log('SKIP', `Max positions (${CONFIG.MAX_CONCURRENT_POSITIONS}) — skipping`);
+        await discord(`⏭  **MAX POSITIONS** — skipped copy of \`${mint.slice(0,16)}\``);
+        return;
+      }
+
+      // Balance check
+      const bal = await solBal();
+      if(bal < CONFIG.MIN_SOL_BALANCE) {
+        wallet.stats.skipped++;
+        log('SKIP', `Low balance ${bal.toFixed(4)} SOL`);
+        await discord(`⚠️  **LOW BALANCE** — ${bal.toFixed(4)} SOL | Need ${CONFIG.MIN_SOL_BALANCE} SOL`);
+        return;
+      }
+
+      shared.copiedBuys++;
+      wallet.tradedMints.add(mint);
+      log('COPY', `🪞 COPYING BUY — target:${solOut.toFixed(3)} SOL ours:${CONFIG.BUY_SOL} SOL | ${mint.slice(0,12)}...`);
+      execBuy(mint, solOut)
+        .catch(e => log('ERROR', `execBuy: ${e.message}`));
+    }
+  } catch(e) { log('ERROR', `fetchTargetTrade: ${e.message}`); }
 }
-
-// ── TOKEN AGE CHECK ───────────────────────────────────────────
-// Fetches the token's first transaction to determine how old it is
-// Returns age in ms, or null if can't determine
-
-async function getTokenAgeMs(mint) {
-  try {
-    // Get the earliest signature for this mint address
-    const sigs = await shared.connection.getSignaturesForAddress(
-      new PublicKey(mint),
-      { limit: 1, before: undefined },
-    );
-    // getSignaturesForAddress returns newest first by default
-    // We want the oldest — fetch with limit and check last
-    const allSigs = await shared.connection.getSignaturesForAddress(
-      new PublicKey(mint),
-      { limit: 1000 },
-    );
-    if(!allSigs || allSigs.length === 0) return null;
-    // Oldest is last in the array
-    const oldest = allSigs[allSigs.length - 1];
-    if(!oldest.blockTime) return null;
-    const ageMs = Date.now() - (oldest.blockTime * 1000);
-    return ageMs;
-  } catch(e) {
-    log('ERROR', `getTokenAgeMs: ${e.message}`);
-    return null; // fail open — don't skip on error
-  }
-}
-
-async function handleGraduation(mint, sig) {
-  const info = await tokenInfo(mint);
-  const sym  = info.sym;
-  const name = info.name;
-
-  if(wallet.snipedMints.has(mint)) { log('SKIP', `Already sniped ${sym}`); return; }
-
-  if(wallet.positions.size >= CONFIG.MAX_CONCURRENT_POSITIONS) {
-    wallet.stats.skipped++;
-    log('SKIP', `Max positions — skipping ${sym}`);
-    await discord(`⏭  **SKIPPED — max positions**
-🎓 **${sym}**
-\`${mint}\``);
-    return;
-  }
-
-  const bal = await solBal();
-  if(bal < CONFIG.MIN_SOL_BALANCE) {
-    wallet.stats.skipped++;
-    log('SKIP', `Low balance ${bal.toFixed(4)} SOL`);
-    await discord(`⚠️  **LOW BALANCE — SKIPPED**
-💰  ${bal.toFixed(4)} SOL | Need ${CONFIG.MIN_SOL_BALANCE} SOL`);
-    return;
-  }
-
-  wallet.stats.attempts++;
-  wallet.snipedMints.add(mint);
-
-  // ── All checks run in PARALLEL — saves 2-3 seconds ───────
-  log('INFO', `⚡ Running checks in parallel for ${sym}...`);
-  const [ageMs, holders, rug] = await Promise.all([
-    getTokenAgeMs(mint),
-    checkTopHolders(mint),
-    rugCheck(mint),
-  ]);
-
-  // Age check
-  if(ageMs !== null) {
-    const ageMin = (ageMs / 60000).toFixed(1);
-    if(ageMs > CONFIG.MAX_TOKEN_AGE_MS) {
-      wallet.stats.skipped++;
-      log('SKIP', `Too old: ${sym} — ${ageMin}min`);
-      await discord(`⏭  **SKIPPED — TOKEN TOO OLD**\n🎓 **${sym}**\n⏱  **${ageMin}min** old (max: ${CONFIG.MAX_TOKEN_AGE_MS/60000}min)\n\`${mint}\``);
-      return;
-    }
-    log('INFO', `✅ Age OK: ${ageMin}min`);
-  }
-
-  // Holder count + concentration check
-  if(!holders.pass) {
-    wallet.stats.skipped++;
-    if(holders.reason === 'too_few_holders') {
-      log('SKIP', `Too few holders: ${sym} — ${holders.holderCount} (min: ${CONFIG.MIN_HOLDERS})`);
-      await discord(`⏭  **SKIPPED — TOO FEW HOLDERS**\n🎓 **${sym}**\n👥  Only **${holders.holderCount} holders** (min: ${CONFIG.MIN_HOLDERS})\n\`${mint}\``);
-    } else {
-      log('SKIP', `Whale: ${sym} — ${holders.topHolderPct}% (max: ${CONFIG.MAX_TOP_HOLDER_PCT}%)`);
-      await discord(`⏭  **SKIPPED — WHALE CONCENTRATION**\n🎓 **${sym}**\n🐳  Top holder: **${holders.topHolderPct}%** (max: ${CONFIG.MAX_TOP_HOLDER_PCT}%)\n\`${mint}\``);
-    }
-    return;
-  }
-  log('INFO', `✅ Holders OK — ${holders.holderCount} holders, top: ${holders.topHolderPct}%`);
-
-  // Rug check
-  if(!rug.pass) {
-    wallet.stats.skipped++;
-    log('SKIP', `Rug FAILED ${sym} score:${rug.score}`);
-    await discord(`⏭  **SKIPPED — RUG CHECK**\n🎓 **${sym}**\n🚨 Score: **${rug.score}/1000**\n\`${mint}\``);
-    return;
-  }
-
-  log('INFO', `✅ All checks passed — age✅ holders:${holders.holderCount}✅ rug:${rug.score}✅ — BUYING`);
-  await discord(
-    `🎓  **GRADUATION — ${name} (${sym})**
-` +
-    `\`${mint}\`
-━━━━━━━━━━━━━━━━━━━━
-` +
-    `✅  Rug score: **${rug.score}/1000**
-` +
-    `🚀  Sniping **${CONFIG.BUY_SOL} SOL** (~$${SOL_USD(CONFIG.BUY_SOL)}) NOW
-` +
-    `🔗  https://solscan.io/tx/${sig}
-` +
-    `📊  https://dexscreener.com/solana/${mint}`
-  );
-
-  execBuy(mint, sym).catch(e => log('ERROR', `execBuy: ${e.message}`));
-}
-
 
 // ── HEALTH ────────────────────────────────────────────────────
 
 async function health() {
   while(shared.isRunning) {
     await sleep(CONFIG.HEALTH_MS);
-    const bal      = await solBal();
-    const pnl      = bal - wallet.stats.startBal;
-    const wr       = wallet.stats.sells > 0
-      ? ((wallet.stats.wins/wallet.stats.sells)*100).toFixed(0) : '0';
-    const wsStatus = shared.ws?.readyState === WebSocket.OPEN ? '🟢 LIVE' : '🔴 RECONNECTING';
-    const uptime   = ((Date.now() - wallet.stats.startTime) / 60000).toFixed(0);
+    const bal     = await solBal();
+    const pnl     = bal - wallet.stats.startBal;
+    const wr      = wallet.stats.sells > 0 ? ((wallet.stats.wins/wallet.stats.sells)*100).toFixed(0) : '0';
+    const uptime  = ((Date.now() - wallet.stats.startTime) / 60000).toFixed(0);
+    const wsState = shared.ws?.readyState === WebSocket.OPEN ? '🟢 LIVE' : '🔴 RECONNECTING';
 
     const lines = [
       '',
       '═'.repeat(62),
-      '  🎓 WINSTON v28.0 — Graduation Sniper',
+      '  🪞 WINSTON v29.0 — Wallet Copy Bot',
       '═'.repeat(62),
-      `  📡 PumpPortal: ${wsStatus} | WS events: ${shared.wsEvents} | Uptime: ${uptime}min`,
-      `  🎓 Graduations seen: ${shared.graduations} | Sniped: ${wallet.stats.buys} | Skipped: ${wallet.stats.skipped}`,
-      `  💸  Buy: ${CONFIG.BUY_SOL} SOL ($${SOL_USD(CONFIG.BUY_SOL)}) | TP: +${CONFIG.TP_TIERS.map(t=>t.roi).join("/+")}% | SL:${CONFIG.SL_PCT}% | Max:10min`,
+      `  📡 Helius WS: ${wsState} | Events: ${shared.wsEvents} | Uptime: ${uptime}min`,
+      `  🎯 Target: ${CONFIG.TARGET.slice(0,24)}...`,
+      `  💸  Buy: ${CONFIG.BUY_SOL} SOL ($${SOL_USD(CONFIG.BUY_SOL)}) | TP:+${CONFIG.TP_PCT}% | SL:${CONFIG.SL_PCT}% | Max:15min`,
+      `  🪞  Copied: ${shared.copiedBuys} | Skipped: ${wallet.stats.skipped}`,
       `  💰  ${bal.toFixed(4)} SOL ($${SOL_USD(bal)}) | PnL: ${pnl>=0?'+':''}${pnl.toFixed(4)} SOL`,
       `  📊  ${wallet.stats.wins}W/${wallet.stats.losses}L (${wr}% WR) | Fees: ${wallet.stats.feesTotal.toFixed(4)} SOL`,
     ];
 
     if(wallet.positions.size > 0) {
       for(const [m, p] of wallet.positions) {
-        const age      = ((Date.now()-p.time)/60000).toFixed(1);
-        const timeLeft = ((CONFIG.MAX_HOLD_MS-(Date.now()-p.time))/60000).toFixed(1);
-        lines.push(`  📦 ${p.sym} ${m.slice(0,8)}... | ${age}min | ${timeLeft}min left`);
+        const age  = ((Date.now()-p.time)/60000).toFixed(1);
+        const left = ((CONFIG.MAX_HOLD_MS-(Date.now()-p.time))/60000).toFixed(1);
+        lines.push(`  📦 ${p.sym} ${m.slice(0,8)}... | ${age}min | ${left}min left`);
       }
     } else {
-      lines.push('  📭 Watching for graduations...');
+      lines.push('  📭 No open positions — watching target');
     }
     lines.push('═'.repeat(62));
-
-    // Print all at once to avoid interleaving
     console.log(lines.join('\n'));
   }
 }
@@ -1038,9 +671,8 @@ async function health() {
 
 async function main() {
   console.log('\n╔════════════════════════════════════════════════════════════╗');
-  console.log('║  🎓 WINSTON v28.0 — Pump.fun Graduation Sniper             ║');
-  console.log('║  $5 buy · TP+35% · SL-30% · 10min max · rug check        ║');
-  console.log('║  Listens via Helius logsSubscribe — your own RPC          ║');
+  console.log('║  🪞 WINSTON v29.0 — Wallet Copy Bot                        ║');
+  console.log('║  $5 buy · TP+25% · SL-20% · 15min max · copy EqiFgy...   ║');
   console.log('╚════════════════════════════════════════════════════════════╝\n');
 
   if(!CONFIG.HELIUS_API_KEY) { log('ERROR', 'HELIUS_API_KEY missing'); process.exit(1); }
@@ -1049,39 +681,36 @@ async function main() {
   try {
     wallet.keypair = Keypair.fromSecretKey(bs58.decode(CONFIG.PRIVATE_KEY));
     log('INFO', `Wallet: ${wallet.keypair.publicKey.toString()}`);
-  } catch(e) { log('ERROR', `Bad private key: ${e.message}`); process.exit(1); }
+  } catch(e) { log('ERROR', `Bad key: ${e.message}`); process.exit(1); }
 
   shared.connection = new Connection(CONFIG.HELIUS_RPC, { commitment: 'confirmed' });
-
   wallet.stats.startBal = await solBal();
   log('INFO', `Balance: ${wallet.stats.startBal.toFixed(4)} SOL (~$${SOL_USD(wallet.stats.startBal)})`);
 
   if(wallet.stats.startBal < CONFIG.MIN_SOL_BALANCE) {
-    log('ERROR', `Balance too low — need at least ${CONFIG.MIN_SOL_BALANCE} SOL`);
+    log('ERROR', `Balance too low — need ${CONFIG.MIN_SOL_BALANCE} SOL`);
     process.exit(1);
   }
 
   shared.isRunning = true;
-
-  // Connect to PumpPortal WebSocket
   connectHelius();
 
   await discord(
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-    `🎓  **WINSTON v28.1 ONLINE**\n` +
-    `**Pump.fun Graduation Sniper**\n` +
+    `🪞  **WINSTON v29.0 ONLINE**\n` +
+    `**Wallet Copy Bot**\n` +
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-    `📡  Listening for Pump.fun graduations via Helius logsSubscribe\n` +
+    `🎯  Copying: \`${CONFIG.TARGET}\`\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
-    `💸  Buy: **${CONFIG.BUY_SOL} SOL (~$${SOL_USD(CONFIG.BUY_SOL)})** per graduation\n` +
-    `🏁  TP: **+${CONFIG.TP_ROI_PCT}%** → full exit\n` +
+    `💸  Buy: **${CONFIG.BUY_SOL} SOL (~$${SOL_USD(CONFIG.BUY_SOL)})** fixed\n` +
+    `📏  Signal: **${CONFIG.MIN_BUY_SOL_SIGNAL}–${CONFIG.MAX_BUY_SOL_SIGNAL} SOL** buys only\n` +
+    `🎯  TP: **+${CONFIG.TP_PCT}%** → full exit\n` +
     `🛑  SL: **${CONFIG.SL_PCT}%** → full exit\n` +
-    `⏱  Max hold: **10 minutes**\n` +
-    `🔍  Rug check: **enabled** (min score: ${CONFIG.MIN_RUGCHECK_SCORE})\n` +
-    `📦  Max concurrent: **${CONFIG.MAX_CONCURRENT_POSITIONS}** positions\n` +
+    `⏱  Max: **15 minutes**\n` +
+    `🚨  Target sells → we exit immediately\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `💰  Balance: **${wallet.stats.startBal.toFixed(4)} SOL** (~$${SOL_USD(wallet.stats.startBal)})\n` +
-    `🔄  Crash failsafe: **active**\n` +
+    `🔄  Crash failsafe: active\n` +
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬`
   );
 
@@ -1093,17 +722,15 @@ async function main() {
     if(shared.ws) shared.ws.close();
     const finalBal = await solBal();
     const pnl      = finalBal - wallet.stats.startBal;
-    const wr       = wallet.stats.sells > 0
-      ? ((wallet.stats.wins/wallet.stats.sells)*100).toFixed(0) : '0';
+    const wr       = wallet.stats.sells > 0 ? ((wallet.stats.wins/wallet.stats.sells)*100).toFixed(0) : '0';
     await discord(
       `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-      `🔴  **WINSTON v28.1 OFFLINE**\n` +
+      `🔴  **WINSTON v29.0 OFFLINE**\n` +
       `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
       `💰  Final: **${finalBal.toFixed(4)} SOL** (~$${SOL_USD(finalBal)})\n` +
       `📈  PnL: **${pnl>=0?'+':''}$${SOL_USD(Math.abs(pnl))}** (${pnl>=0?'+':''}${pnl.toFixed(4)} SOL)\n` +
-      `📊  **${wallet.stats.wins}W / ${wallet.stats.losses}L** (${wr}% WR)\n` +
-      `🎓  Graduations sniped: **${wallet.stats.buys}** | Skipped: **${wallet.stats.skipped}**\n` +
-      `💸  Total fees: **${wallet.stats.feesTotal.toFixed(4)} SOL**\n` +
+      `📊  **${wallet.stats.wins}W / ${wallet.stats.losses}L** (${wr}% WR) | ${wallet.stats.buys} buys\n` +
+      `💸  Fees: **${wallet.stats.feesTotal.toFixed(4)} SOL**\n` +
       `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬`
     );
     process.exit(0);
@@ -1129,11 +756,8 @@ async function runWithFailsafe() {
       try {
         if(CONFIG.DISCORD_WEBHOOK) {
           await fetch(CONFIG.DISCORD_WEBHOOK, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              content: `💥  **WINSTON v28 CRASHED — restarting (#${crashCount})**\n❌  ${e.message}\nBack in 5s...`
-            }),
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: `💥  **WINSTON v29 CRASHED #${crashCount}**\n❌  ${e.message}\nRestarting in 5s...` }),
           });
         }
       } catch(_) {}
@@ -1141,6 +765,7 @@ async function runWithFailsafe() {
       shared.isRunning = false;
       shared.ws        = null;
       wallet.positions.clear();
+      wallet.emergencyQueue.clear();
       await new Promise(r => setTimeout(r, 5000));
     }
   }
