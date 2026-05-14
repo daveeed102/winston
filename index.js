@@ -26,9 +26,9 @@ const WebSocket = require('ws');
 
 // ── MODES ─────────────────────────────────────────────────────
 const MODES = {
-  DEFAULT:    { tp: 12, sl: 7,  maxHold: 25 },
-  AGGRESSIVE: { tp: 15, sl: 8,  maxHold: 25 },
-  SAFER:      { tp: 9,  sl: 5,  maxHold: 20 },
+  DEFAULT:    { tp: 12, sl: 7,  maxHold: 45 },
+  AGGRESSIVE: { tp: 15, sl: 8,  maxHold: 45 },
+  SAFER:      { tp: 9,  sl: 5,  maxHold: 35 },
 };
 
 const MODE_KEY = (process.env.MODE || 'DEFAULT').toUpperCase();
@@ -55,7 +55,7 @@ const CONFIG = {
   // Exit (from mode, overridable via env)
   TAKE_PROFIT_PERCENT: parseFloat(process.env.TAKE_PROFIT_PERCENT) || MODE.tp,
   STOP_LOSS_PERCENT:   parseFloat(process.env.STOP_LOSS_PERCENT)   || MODE.sl,
-  MAX_HOLD_SECONDS:    parseInt(process.env.MAX_HOLD_SECONDS)      || MODE.maxHold,
+  MAX_HOLD_SECONDS:    parseInt(process.env.MAX_HOLD_SECONDS)      || 45,
 
   // Speed
   SLIPPAGE_BPS:                 Math.round((parseFloat(process.env.SLIPPAGE_PERCENT)||15)*100),
