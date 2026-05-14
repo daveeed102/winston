@@ -44,7 +44,13 @@ const CONFIG = {
   JUPITER_QUOTE: 'https://lite-api.jup.ag/swap/v1/quote',
   JUPITER_SWAP:  'https://lite-api.jup.ag/swap/v1/swap',
 
-  // ── Creator wallet to watch ───────────────────────────────
+  // ── Creator wallets to watch (any of these creates → we buy) ─
+  CREATORS: new Set([
+    'BiCQ7k6afuhQ9qjta32pxwaEWTTKYnF7unBVL3wg8aB8',
+    'EP4eybwbNifUHFxgTGPHVqLxupSfgWncmiiSCrEWMNE3',
+    '7CYT7Beui1y8Ky26H8CeDSiyyHmrhXzhFFM4CKZCoLS1',
+  ]),
+  // Keep CREATOR for backward compat in skip addresses
   CREATOR: 'BiCQ7k6afuhQ9qjta32pxwaEWTTKYnF7unBVL3wg8aB8',
 
   // ── Pump.fun program ID ───────────────────────────────────
@@ -560,14 +566,19 @@ function connectHelius() {
 
   ws.on('open', () => {
     log('INFO', `✅ Helius WS connected — subscribing to creator wallet logs`);
-    ws.send(JSON.stringify({
-      jsonrpc: '2.0', id: 1,
-      method: 'logsSubscribe',
-      params: [
-        { mentions: [CONFIG.CREATOR] },
-        { commitment: 'confirmed' },
-      ],
-    }));
+    // Subscribe to each creator wallet separately
+    // Helius logsSubscribe only supports one address per subscription
+    let subId = 1;
+    for(const creator of CONFIG.CREATORS) {
+      ws.send(JSON.stringify({
+        jsonrpc: '2.0', id: subId++,
+        method: 'logsSubscribe',
+        params: [
+          { mentions: [creator] },
+          { commitment: 'confirmed' },
+        ],
+      }));
+    }
   });
 
   ws.on('message', async (raw) => {
@@ -576,7 +587,7 @@ function connectHelius() {
       const msg = JSON.parse(raw.toString());
 
       if(msg.id === 1 && msg.result !== undefined) {
-        log('INFO', `✅ logsSubscribe confirmed subId:${msg.result} — watching for new token creates`);
+        log('INFO', `✅ logsSubscribe confirmed subId:${msg.result}`);
         return;
       }
 
@@ -596,7 +607,7 @@ function connectHelius() {
 
       // Don't process if we already have an open position
       if(wallet.position) {
-        log('INFO', `⏭ Already in position (${wallet.position.sym}) — skipping new create`);
+        log('INFO', `⏭ Already in position (${wallet.position.sym}) — skipping`);
         await discord(`⏭  **New token created but already in position** (${wallet.position.sym})\nWill catch next one after 20min exit`);
         return;
       }
@@ -681,7 +692,7 @@ async function extractMintFromCreate(sig) {
         });
         if(tx) {
           const SKIP = new Set([
-            CONFIG.CREATOR,
+            ...CONFIG.CREATORS,
             CONFIG.PUMPFUN_PROGRAM,
             '11111111111111111111111111111111',
             'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
@@ -753,7 +764,7 @@ async function health() {
       '  🆕 WINSTON v30.0 — Pump.fun Creator Sniper',
       '═'.repeat(64),
       `  📡 Helius: ${wsState} | Events: ${shared.wsEvents} | Uptime: ${uptime}min`,
-      `  👤 Creator: ${CONFIG.CREATOR.slice(0,24)}...`,
+      `  👤 Watching: ${[...CONFIG.CREATORS].map(c=>c.slice(0,8)).join(' | ')}`,
       `  💸  Buy: ${CONFIG.BUY_SOL} SOL ($${SOL_USD(CONFIG.BUY_SOL)}) | 2x→sell 75% | 20min hard exit`,
       `  💰  ${bal.toFixed(4)} SOL ($${SOL_USD(bal)}) | PnL: ${pnl>=0?'+':''}${pnl.toFixed(4)} SOL`,
       `  📊  Buys:${wallet.stats.buys} 2x-hits:${wallet.stats.tpHits} ${wallet.stats.wins}W/${wallet.stats.losses}L (${wr}% WR)`,
@@ -806,7 +817,8 @@ async function main() {
     `🆕  **WINSTON v30.0 ONLINE**\n` +
     `**Pump.fun Creator Sniper**\n` +
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
-    `👤  Watching: \`${CONFIG.CREATOR}\`\n` +
+    `👤  Watching **${CONFIG.CREATORS.size} wallets**:\n` +
+    `${[...CONFIG.CREATORS].map(c=>`\`${c.slice(0,20)}...\``).join('\n')}\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `💸  Buy: **${CONFIG.BUY_SOL} SOL (~$${SOL_USD(CONFIG.BUY_SOL)})** on each new token\n` +
     `🎯  At **2x**: sell **75%**, keep **25%** moonbag\n` +
