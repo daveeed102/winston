@@ -337,11 +337,20 @@ async function closePosition(reason, label) {
   }
   state.position = null;
 
+  // ── Remove mint from tradedMints so we can buy it again ──────
+  // He keeps buying the same token multiple times — we want to
+  // re-enter after each profitable exit, not skip forever
+  if(pos.mint) {
+    state.tradedMints.delete(pos.mint);
+    log('INFO', `♻️  ${pos.sym} removed from traded set — ready to buy again`);
+  }
+
   // ── BUY BACK IN immediately after any profitable exit ────────
-  // We sold for a profit — stay in the game, keep cycling
   if(reason === 'take_profit') {
-    log('INFO', '🔄 Sold for profit — ready for next signal immediately');
-    await discord('🔄  **Back in watching mode** — ready for next buy signal');
+    log('INFO', '🔄 Sold for profit — back in watching mode, will buy next signal');
+    await discord('🔄  **Profit taken! Watching for next buy signal...**');
+  } else if(reason === 'max_hold' || reason === 'rug_detected') {
+    log('INFO', `🔄 Position closed (${reason}) — watching for next signal`);
   }
 }
 
