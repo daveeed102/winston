@@ -47,26 +47,26 @@ const CONFIG = {
   JUPITER_SWAP:  'https://lite-api.jup.ag/swap/v1/swap',
 
   // ── Buy size — randomized each trade ─────────────────────
-  MIN_BUY_SOL: parseFloat(process.env.MIN_BUY_SOL) || 0.055, // ~$5
-  MAX_BUY_SOL: parseFloat(process.env.MAX_BUY_SOL) || 0.088, // ~$8
+  MIN_BUY_SOL: parseFloat(process.env.MIN_BUY_SOL) || 0.033, // ~$3
+  MAX_BUY_SOL: parseFloat(process.env.MAX_BUY_SOL) || 0.055, // ~$5
 
   // ── Signal filter ─────────────────────────────────────────
   MAX_SIGNAL_AGE_SECONDS: parseInt(process.env.MAX_SIGNAL_AGE_SECONDS) || 8,
 
   // ── Exit rules ────────────────────────────────────────────
   TAKE_PROFIT_PERCENT: parseFloat(process.env.TAKE_PROFIT_PERCENT) || 12,
-  STOP_LOSS_PERCENT:   parseFloat(process.env.STOP_LOSS_PERCENT)   || 8,
-  MAX_HOLD_SECONDS:    parseInt(process.env.MAX_HOLD_SECONDS)      || 180, // 3 min
+  STOP_LOSS_PERCENT:   0, // NO stop loss — wait for profit
+  MAX_HOLD_SECONDS:    parseInt(process.env.MAX_HOLD_SECONDS)      || 300, // 5 min — wait it out
 
   // ── Fees — minimized ──────────────────────────────────────
   // Reduced from 500k to 200k — saves ~$0.03 per trade
   // Still fast enough for this wallet's pace (he's not sub-second)
-  SLIPPAGE_BPS:                parseInt(process.env.SLIPPAGE_BPS) || Math.round((parseFloat(process.env.SLIPPAGE_PERCENT)||10)*100),
+  SLIPPAGE_BPS:                1500, // 15% — hardcoded, ignores env var
   PRIORITY_FEE_MICRO_LAMPORTS: parseInt(process.env.PRIORITY_FEE_MICRO_LAMPORTS) || 200000,
 
   // ── Mode ──────────────────────────────────────────────────
 
-  get MIN_SOL_BALANCE(){ return this.MAX_BUY_SOL + 0.005; },
+  get MIN_SOL_BALANCE(){ return this.MAX_BUY_SOL + 0.01; },
   EXIT_CHECK_MS: 500,
   HEALTH_MS:     30000,
   SELL_MAX_RETRIES: 4,
@@ -336,6 +336,13 @@ async function closePosition(reason, label) {
     await discord(`🆘  **SELL FAILED — ${pos.sym}**\nhttps://jup.ag/swap/${pos.mint}-SOL`);
   }
   state.position = null;
+
+  // ── BUY BACK IN immediately after any profitable exit ────────
+  // We sold for a profit — stay in the game, keep cycling
+  if(reason === 'take_profit') {
+    log('INFO', '🔄 Sold for profit — ready for next signal immediately');
+    await discord('🔄  **Back in watching mode** — ready for next buy signal');
+  }
 }
 
 // ── BUY ───────────────────────────────────────────────────────
@@ -415,7 +422,7 @@ async function execBuy(mint, signalAgeMs, targetSolSpent=0) {
       `🎯  Target spent: **${targetSolSpent.toFixed(3)} SOL** | Confidence: **${confidence}**\n` +
       `💸  Bought: **${sol} SOL** (~$${SOL_USD(sol)}) | Fee: ~$${SOL_USD(feeSol)}\n` +
       `━━━━━━━━━━━━━━━━━━━━\n` +
-      `🏁  TP: **+${CONFIG.TAKE_PROFIT_PERCENT}%** | SL: **-${CONFIG.STOP_LOSS_PERCENT}%** | Max: **${CONFIG.MAX_HOLD_SECONDS}s**\n` +
+      `🏁  TP: **+${CONFIG.TAKE_PROFIT_PERCENT}%** | **No SL** — wait for profit | Max: **${CONFIG.MAX_HOLD_SECONDS}s**\n` +
       `💰  Remaining balance: **${bal.toFixed(4)} SOL** (~$${SOL_USD(bal)})\n` +
       `📊  https://dexscreener.com/solana/${mint}`
     );
@@ -430,7 +437,7 @@ async function execBuy(mint, signalAgeMs, targetSolSpent=0) {
 // ── EXIT MANAGER ──────────────────────────────────────────────
 
 async function exitManager() {
-  log('INFO',`🏁 Exit | TP:+${CONFIG.TAKE_PROFIT_PERCENT}% SL:-${CONFIG.STOP_LOSS_PERCENT}% Max:${CONFIG.MAX_HOLD_SECONDS}s | 500ms checks`);
+  log('INFO',`🏁 Exit | TP:+${CONFIG.TAKE_PROFIT_PERCENT}% | NO SL — wait for profit | Max:${CONFIG.MAX_HOLD_SECONDS}s`);
 
   while(state.isRunning) {
     await sleep(CONFIG.EXIT_CHECK_MS);
@@ -461,13 +468,18 @@ async function exitManager() {
       `peak:${pctStr(pos.peakRoi)} | in:$${SOL_USD(pos.sol)}`
     );
 
+    if(roi <= -90) {
+      log('EXIT', `🚨 RUG DETECTED ${pos.sym} at ${pctStr(roi)} — emergency exit`);
+      await closePosition('rug_detected', `🚨 RUG ${pctStr(roi)}`);
+      continue;
+    }
+
     if(roi >= CONFIG.TAKE_PROFIT_PERCENT) {
       await closePosition('take_profit', `🏁 TP ${pctStr(roi)}`);
       continue;
     }
-    if(roi <= -CONFIG.STOP_LOSS_PERCENT) {
-      await closePosition('stop_loss', `🛑 SL ${pctStr(roi)}`);
-    }
+    // No stop loss — we wait for profit or time exit
+    // if(roi <= -CONFIG.STOP_LOSS_PERCENT) { ... }
   }
 }
 
@@ -507,23 +519,44 @@ async function parseBuyFromSig(sig) {
       if(t.fromUserAccount===CONFIG.TARGET_WALLET) solOut += (t.amount||0)/1e9;
     }
 
-    // Find mints received by target
+    // Find mints received by target wallet
+    // Method 1: direct token transfers to target
     const mintsBought = [];
     for(const t of tfers){
       if(IGNORE_MINTS.has(t.mint)||t.mint===CONFIG.SOL_MINT) continue;
-      if(t.toUserAccount===CONFIG.TARGET_WALLET&&t.tokenAmount>0) mintsBought.push(t.mint);
+      if(t.toUserAccount===CONFIG.TARGET_WALLET&&parseFloat(t.tokenAmount||0)>0){
+        mintsBought.push(t.mint);
+      }
     }
+
+    // Method 2: token balance changes (catches token→token swaps)
     if(!mintsBought.length){
-      // Fallback: token balance changes
       for(const a of (tx.accountData||[])){
         for(const c of (a.tokenBalanceChanges||[])){
           if(c.userAccount===CONFIG.TARGET_WALLET&&
              !IGNORE_MINTS.has(c.mint)&&
-             parseFloat(c.rawTokenAmount?.tokenAmount||0)>0) mintsBought.push(c.mint);
+             c.mint!==CONFIG.SOL_MINT&&
+             parseFloat(c.rawTokenAmount?.tokenAmount||0)>0){
+            mintsBought.push(c.mint);
+          }
         }
       }
     }
-    if(!mintsBought.length) return;
+
+    // Method 3: any token arriving when SOL was sent (broad fallback)
+    if(!mintsBought.length&&solOut>0.001&&tfers.length>0){
+      for(const t of tfers){
+        if(!IGNORE_MINTS.has(t.mint)&&t.mint!==CONFIG.SOL_MINT&&parseFloat(t.tokenAmount||0)>0){
+          mintsBought.push(t.mint);
+          break;
+        }
+      }
+    }
+
+    if(!mintsBought.length){
+      log('SKIP',`No buy — type:${txType} solOut:${solOut.toFixed(3)} tfers:${tfers.length}`);
+      return;
+    }
 
     const mint = mintsBought[0];
 
@@ -653,7 +686,7 @@ async function health() {
       `  📡 WS: ${wsOk?'🟢 LIVE':'🔴 RECONN'} | Events:${state.wsEvents} | Uptime:${uptime}min`,
       `  🎯 ${CONFIG.TARGET_WALLET.slice(0,28)}...`,
       `  💸  Buy: $${SOL_USD(CONFIG.MIN_BUY_SOL)}-$${SOL_USD(CONFIG.MAX_BUY_SOL)} (${CONFIG.MIN_BUY_SOL}-${CONFIG.MAX_BUY_SOL} SOL, random)`,
-      `  🏁  TP:+${CONFIG.TAKE_PROFIT_PERCENT}% | SL:-${CONFIG.STOP_LOSS_PERCENT}% | Max:${CONFIG.MAX_HOLD_SECONDS}s`,
+      `  🏁  TP:+${CONFIG.TAKE_PROFIT_PERCENT}% | No SL — wait for profit | Max:${CONFIG.MAX_HOLD_SECONDS}s`,
       `  💰  ${bal.toFixed(4)} SOL ($${SOL_USD(bal)}) | PnL:${pnl>=0?'+':''}$${SOL_USD(Math.abs(pnl))} (${pnl>=0?'+':''}${pnl.toFixed(4)} SOL)`,
       `  📊  ${state.stats.wins}W/${state.stats.losses}L (${wr}%WR) | Sigs:${state.stats.signalsDetected} | Fees/trade:~$${SOL_USD(feeEst)}`,
     ];
@@ -676,7 +709,7 @@ async function health() {
 async function main() {
   console.log('\n╔══════════════════════════════════════════════════════════════╗');
   console.log(`║  ⚡ WINSTON v33.0 — Momentum Copy Scalper                     ║`);
-  console.log(`║  Buy: $${SOL_USD(CONFIG.MIN_BUY_SOL)}-$${SOL_USD(CONFIG.MAX_BUY_SOL)} random | TP:+${CONFIG.TAKE_PROFIT_PERCENT}% | SL:-${CONFIG.STOP_LOSS_PERCENT}% | Max:${CONFIG.MAX_HOLD_SECONDS}s      ║`);
+  console.log(`║  Buy: random $3-$5 | TP:+12% | No SL | Max:5min — wait for profit  ║`);
   console.log('╚══════════════════════════════════════════════════════════════╝\n');
 
   if(!CONFIG.HELIUS_API_KEY){ log('ERROR','HELIUS_API_KEY missing'); process.exit(1); }
@@ -712,7 +745,7 @@ async function main() {
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `💸  Buy: **$${SOL_USD(CONFIG.MIN_BUY_SOL)}-$${SOL_USD(CONFIG.MAX_BUY_SOL)}** (random each trade)\n` +
     `⚡  Max signal age: **${CONFIG.MAX_SIGNAL_AGE_SECONDS}s**\n` +
-    `🏁  TP: **+${CONFIG.TAKE_PROFIT_PERCENT}%** | SL: **-${CONFIG.STOP_LOSS_PERCENT}%** | Max: **${CONFIG.MAX_HOLD_SECONDS}s**\n` +
+    `🏁  TP: **+${CONFIG.TAKE_PROFIT_PERCENT}%** | **No SL** — wait for profit | Max: **${CONFIG.MAX_HOLD_SECONDS}s**\n` +
     `💸  Fee per trade: ~**$${feeEst}** (${CONFIG.PRIORITY_FEE_MICRO_LAMPORTS}μL priority)\n` +
     `📋  First buy only — skips repeat buys on same token\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
