@@ -36,7 +36,7 @@ const MODE     = MODES[MODE_KEY] || MODES.DEFAULT;
 
 // ── CONFIG ────────────────────────────────────────────────────
 const CONFIG = {
-  TARGET_WALLET:  process.env.TARGET_WALLET  || '93kgxYKex5wPyEkjH9P4KspLFAi3fdWBkw8vZce51pbp',
+  TARGET_WALLET:  process.env.TARGET_WALLET  || 'Ev7kp4NfhVjvUqKMwhKCcvXRb2t828gDaSqWsD2gtPzT',
   PRIVATE_KEY:    process.env.WALLET_PRIVATE_KEY || process.env.PRIVATE_KEY || '',
   HELIUS_API_KEY: process.env.HELIUS_API_KEY || '',
   DISCORD_WEBHOOK:process.env.DISCORD_WEBHOOK_URL || process.env.DISCORD_WEBHOOK || '',
