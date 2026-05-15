@@ -607,18 +607,16 @@ function connectHelius() {
       }
 
       const logStr = logs.join(' ');
-      if(logStr.includes('CloseAccount')||logStr.includes('claim_cashback')) return;
 
-      const isSwap =
-        logStr.includes('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P')||
-        logStr.includes('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA')||
-        logStr.includes('675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8')||
-        logStr.includes('JUP')||
-        logStr.includes('Instruction: Buy')||
-        logStr.includes('ray_log');
+      // Skip obvious non-trades immediately
+      if(logStr.includes('CloseAccount')) return;
+      if(logStr.includes('claim_cashback')) return;
 
-      if(!isSwap) return;
-
+      // Parse every other transaction — let Helius enhanced API
+      // determine if it's a buy. Don't pre-filter by program ID
+      // because the target wallet may route through aggregators
+      // that don't show standard program IDs in logs.
+      log('INFO', `📨 TX detected — ${sig.slice(0,20)}...`);
       parseBuyFromSig(sig).catch(e=>log('ERROR',`parse: ${e.message}`));
     } catch(e){ log('ERROR',`WS: ${e.message}`); }
   });
