@@ -61,7 +61,7 @@ const CONFIG = {
   // ── Fees — minimized ──────────────────────────────────────
   // Reduced from 500k to 200k — saves ~$0.03 per trade
   // Still fast enough for this wallet's pace (he's not sub-second)
-  SLIPPAGE_BPS:                Math.round((parseFloat(process.env.SLIPPAGE_PERCENT)||10)*100),
+  SLIPPAGE_BPS:                parseInt(process.env.SLIPPAGE_BPS) || Math.round((parseFloat(process.env.SLIPPAGE_PERCENT)||10)*100),
   PRIORITY_FEE_MICRO_LAMPORTS: parseInt(process.env.PRIORITY_FEE_MICRO_LAMPORTS) || 200000,
 
   // ── Mode ──────────────────────────────────────────────────
