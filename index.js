@@ -51,7 +51,8 @@ const CONFIG = {
   MAX_BUY_SOL: parseFloat(process.env.MAX_BUY_SOL) || 0.033, // $3 fixed — same as min
 
   // ── Signal filter ─────────────────────────────────────────
-  MAX_SIGNAL_AGE_SECONDS: parseInt(process.env.MAX_SIGNAL_AGE_SECONDS) || 8,
+  MAX_SIGNAL_AGE_SECONDS:    parseInt(process.env.MAX_SIGNAL_AGE_SECONDS) || 8,
+  MIN_BUYS_BEFORE_ENTRY:     parseInt(process.env.MIN_BUYS_BEFORE_ENTRY) || 8, // wait for 8 buys
 
   // ── Exit rules ────────────────────────────────────────────
   TAKE_PROFIT_PERCENT: parseFloat(process.env.TAKE_PROFIT_PERCENT) || 12,
@@ -62,7 +63,7 @@ const CONFIG = {
   // Reduced from 500k to 200k — saves ~$0.03 per trade
   // Still fast enough for this wallet's pace (he's not sub-second)
   SLIPPAGE_BPS:                1500, // 15% — hardcoded, ignores env var
-  PRIORITY_FEE_MICRO_LAMPORTS: parseInt(process.env.PRIORITY_FEE_MICRO_LAMPORTS) || 200000,
+  PRIORITY_FEE_MICRO_LAMPORTS: parseInt(process.env.PRIORITY_FEE_MICRO_LAMPORTS) || 1000000, // 1M — competitive
 
   // ── Mode ──────────────────────────────────────────────────
 
@@ -91,7 +92,8 @@ const state = {
   ws:            null,
   isRunning:     false,
   position:      null,
-  tradedMints:   new Set(), // first-buy dedup: never buy same mint twice
+  mintBuyCounts: new Map(), // mint → how many times target bought it
+  tradedMints:   new Set(), // mints we've entered (cleared after sell)
   processedSigs: new Set(),
   buyInProgress: false,
   wsEvents:      0,
@@ -271,7 +273,131 @@ async function execSell(mint, reason, attempt=1) {
       await sleep(300*attempt);
       return execSell(mint, reason, attempt+1);
     }
+    // ── FALLBACK: try with emergency slippage ────────────────
+    // If all retries failed, one last attempt with max slippage
+    log('ERROR', `All retries failed — trying emergency sell with 50% slippage`);
+    try {
+      const accts2 = await state.connection.getParsedTokenAccountsByOwner(
+        state.keypair.publicKey, { mint: new PublicKey(mint) }
+      );
+      const acct2 = accts2?.value?.[0];
+      if(acct2) {
+        const bal2 = parseFloat(acct2.account.data.parsed.info.tokenAmount.uiAmount||0);
+        const dec2 = acct2.account.data.parsed.info.tokenAmount.decimals;
+        const raw2 = BigInt(Math.floor(bal2 * Math.pow(10,dec2)));
+        if(raw2 > 0n) {
+          const qr2 = await fetch(
+            `${CONFIG.JUPITER_QUOTE}?inputMint=${mint}&outputMint=${CONFIG.SOL_MINT}&amount=${raw2.toString()}&slippageBps=5000`
+          );
+          if(qr2.ok) {
+            const q2 = await qr2.json();
+            if(q2.outAmount) {
+              const sr2 = await fetch(CONFIG.JUPITER_SWAP, {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({
+                  quoteResponse: q2,
+                  userPublicKey: state.keypair.publicKey.toString(),
+                  wrapAndUnwrapSol: true,
+                  dynamicSlippage: { minBps:50, maxBps:5000 },
+                  prioritizationFeeLamports: 1000000, // 0.001 SOL — max priority
+                }),
+              });
+              if(sr2.ok) {
+                const sd2 = await sr2.json();
+                if(sd2.swapTransaction) {
+                  const buf2 = Buffer.from(sd2.swapTransaction,'base64');
+                  const tx2  = VersionedTransaction.deserialize(buf2);
+                  tx2.sign([state.keypair]);
+                  const sig2 = await state.connection.sendRawTransaction(tx2.serialize(),{skipPreflight:true,maxRetries:5});
+                  if(await confirm(sig2, 20000)){
+                    const solBack2 = parseFloat(q2.outAmount)/1e9;
+                    log('SELL', `✅ EMERGENCY SELL succeeded → ${solBack2.toFixed(4)} SOL`);
+                    return { success:true, solBack:solBack2, sig:sig2 };
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch(e2) { log('ERROR', `Emergency sell also failed: ${e2.message}`); }
+
+    // ── LAST RESORT: Pump.fun direct sell ────────────────────
+    // When Jupiter has no route (bonding curve drained), try
+    // selling directly through Pump.fun's own sell instruction
+    log('ERROR', `Jupiter exhausted — trying Pump.fun direct sell`);
+    try {
+      const pumpResult = await pumpFunDirectSell(mint);
+      if(pumpResult) {
+        log('SELL', `✅ Pump.fun direct sell succeeded`);
+        return { success:true, solBack: pumpResult, sig:'pump_direct' };
+      }
+    } catch(e3) { log('ERROR', `Pump.fun direct sell failed: ${e3.message}`); }
+
+    await discord(
+      `🆘  **COMPLETELY STUCK — ${mint.slice(0,16)}**\n` +
+      `All sell methods failed. Check wallet manually:\n` +
+      `https://jup.ag/swap/${mint}-SOL\n` +
+      `https://pump.fun/${mint}`
+    );
     return { success:false, error:e.message };
+  }
+}
+
+// ── PUMP.FUN DIRECT SELL ──────────────────────────────────────
+// Last resort when Jupiter has no route
+// Sells directly through Pump.fun bonding curve program
+// Works even when liquidity is very thin
+
+async function pumpFunDirectSell(mint) {
+  try {
+    // Get our token balance
+    const accts = await state.connection.getParsedTokenAccountsByOwner(
+      state.keypair.publicKey, { mint: new PublicKey(mint) }
+    );
+    const acct = accts?.value?.[0];
+    if(!acct) return null;
+    const bal = parseFloat(acct.account.data.parsed.info.tokenAmount.uiAmount||0);
+    if(bal <= 0) return null;
+
+    // Use Pump.fun API to get sell transaction
+    const dec = acct.account.data.parsed.info.tokenAmount.decimals;
+    const raw = Math.floor(bal * Math.pow(10, dec));
+
+    // Pump.fun trade API — works for bonding curve tokens
+    const r = await fetch('https://pumpportal.fun/api/trade-local', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        publicKey:        state.keypair.publicKey.toString(),
+        action:           'sell',
+        mint:             mint,
+        amount:           raw,
+        denominatedInSol: 'false', // amount is in tokens not SOL
+        slippage:         50,      // 50% slippage — get out at any cost
+        priorityFee:      0.001,   // 0.001 SOL priority
+        pool:             'pump',
+      }),
+    });
+
+    if(!r.ok) throw new Error(`Pump API ${r.status}`);
+    const data = await r.arrayBuffer();
+    const tx   = VersionedTransaction.deserialize(new Uint8Array(data));
+    tx.sign([state.keypair]);
+
+    const sig = await state.connection.sendRawTransaction(tx.serialize(), {
+      skipPreflight: true, maxRetries: 5,
+    });
+
+    if(await confirm(sig, 20000)) {
+      log('SELL', `✅ Pump.fun direct sell confirmed: ${sig.slice(0,20)}`);
+      // Return estimate — actual amount unknown without parsing
+      return 0.001; // minimal SOL, but at least we're out
+    }
+    return null;
+  } catch(e) {
+    log('ERROR', `pumpFunDirectSell: ${e.message}`);
+    return null;
   }
 }
 
@@ -337,12 +463,13 @@ async function closePosition(reason, label) {
   }
   state.position = null;
 
-  // ── Remove mint from tradedMints so we can buy it again ──────
-  // He keeps buying the same token multiple times — we want to
-  // re-enter after each profitable exit, not skip forever
+  // ── Reset tracking so we can re-enter on next conviction ───────
+  // After sell: clear tradedMints entry + reset buy count to 0
+  // So next time he hits 8 buys again on this token, we jump back in
   if(pos.mint) {
     state.tradedMints.delete(pos.mint);
-    log('INFO', `♻️  ${pos.sym} removed from traded set — ready to buy again`);
+    state.mintBuyCounts.delete(pos.mint); // reset count — need fresh 8 buys to re-enter
+    log('INFO', `♻️  ${pos.sym} — tracking reset, need ${CONFIG.MIN_BUYS_BEFORE_ENTRY} new buys to re-enter`);
   }
 
   // ── BUY BACK IN immediately after any profitable exit ────────
@@ -402,10 +529,10 @@ async function execBuy(mint, signalAgeMs, targetSolSpent=0) {
     const tx  = VersionedTransaction.deserialize(buf);
     tx.sign([state.keypair]);
     const sig = await state.connection.sendRawTransaction(tx.serialize(),{
-      skipPreflight:true, maxRetries:2,
+      skipPreflight:true, maxRetries:5,
     });
 
-    if(!await confirm(sig, 20000)) throw new Error('Confirm timeout');
+    if(!await confirm(sig, 30000)) throw new Error('Confirm timeout');
 
     const latency = nowMs()-t0;
     state.stats.buys++;
@@ -569,17 +696,37 @@ async function parseBuyFromSig(sig) {
 
     const mint = mintsBought[0];
 
-    // ── KEY RULE: first buy only per token ────────────────
-    // His repeated buys on same token = adding to position
-    // We only want the FIRST — his subsequent buys pump it for us
+    // ── CONVICTION COUNTER ────────────────────────────────
+    // Track how many times target has bought this mint
+    // Only enter after MIN_BUYS_BEFORE_ENTRY consecutive buys
+    // This confirms real momentum, not a test/feeler buy
+    const prevCount = state.mintBuyCounts.get(mint) || 0;
+    const newCount  = prevCount + 1;
+    state.mintBuyCounts.set(mint, newCount);
+
+    const sym = await tokenSymbol(mint);
+
+    // Clean up old mint counts to save memory (keep last 50)
+    if(state.mintBuyCounts.size > 50){
+      const firstKey = state.mintBuyCounts.keys().next().value;
+      state.mintBuyCounts.delete(firstKey);
+    }
+
+    // Not enough buys yet — log progress and wait
+    if(newCount < CONFIG.MIN_BUYS_BEFORE_ENTRY){
+      log('INFO',`📊 ${sym} buy #${newCount}/${CONFIG.MIN_BUYS_BEFORE_ENTRY} — waiting for conviction`);
+      return;
+    }
+
+    // Already in this position (we entered on buy #8, now he's on buy #12)
+    // Re-enter after we sell — tradedMints cleared on sell
     if(state.tradedMints.has(mint)){
-      log('SKIP',`Already traded ${mint.slice(0,16)}... — skipping repeat buy`);
-      state.stats.signalsSkipped++;
+      log('SKIP',`Already in/traded ${sym} — buy #${newCount}, waiting for next entry`);
       return;
     }
 
     if(state.position){
-      log('SKIP',`In position (${state.position.sym}) — skipping`);
+      log('SKIP',`In position (${state.position.sym}) — skipping ${sym} buy #${newCount}`);
       state.stats.signalsSkipped++;
       return;
     }
@@ -596,6 +743,14 @@ async function parseBuyFromSig(sig) {
       );
       return;
     }
+
+    // ── ENTRY CONFIRMED — buy #${newCount} hit the threshold ──
+    log('INFO', `🎯 CONVICTION CONFIRMED — ${sym} buy #${newCount}/${CONFIG.MIN_BUYS_BEFORE_ENTRY} — ENTERING`);
+    await discord(
+      `🎯 **CONVICTION CONFIRMED — ${sym}**\n` +
+      `📊 Target bought **${newCount}x** in a row — entering now\n` +
+      `\`${mint}\``
+    );
 
     state.stats.signalsDetected++;
     state.tradedMints.add(mint);
