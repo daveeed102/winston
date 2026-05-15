@@ -120,12 +120,29 @@ const SOL_USD = sol => (sol * 96).toFixed(2);
 const pctStr  = n   => `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
 const nowMs   = ()  => Date.now();
 
-// Random buy size between MIN and MAX — different every trade
-function randomBuySol() {
-  const min  = CONFIG.MIN_BUY_SOL;
-  const max  = CONFIG.MAX_BUY_SOL;
-  const raw  = min + Math.random() * (max - min);
-  // Round to 3 decimal places to look natural
+// Smart buy sizing based on signal quality
+// signalAgeMs: how old the signal is when we act
+// targetSolSpent: how much SOL the target wallet put in
+//
+// HIGH (0.088 SOL): age < 3s AND target spent >= 1.0 SOL
+// LOW  (0.055 SOL): age > 5s OR target spent < 0.3 SOL
+// MID  (interpolated): everything in between
+function smartBuySol(signalAgeMs, targetSolSpent) {
+  const min    = CONFIG.MIN_BUY_SOL;
+  const max    = CONFIG.MAX_BUY_SOL;
+  const ageSec = signalAgeMs / 1000;
+
+  // Low confidence → minimum
+  if(ageSec > 5 || targetSolSpent < 0.3) return min;
+
+  // High confidence → maximum
+  if(ageSec < 3 && targetSolSpent >= 1.0) return max;
+
+  // Medium — blend age + size into a confidence score
+  const ageScore  = Math.min(Math.max((ageSec - 1) / 4, 0), 1); // 0=fresh, 1=old
+  const sizeScore = Math.min(Math.max((targetSolSpent - 0.3) / 1.2, 0), 1); // 0=small, 1=big
+  const confidence = (1 - ageScore) * 0.6 + sizeScore * 0.4;
+  const raw = min + confidence * (max - min);
   return Math.round(raw * 1000) / 1000;
 }
 
@@ -323,16 +340,22 @@ async function closePosition(reason, label) {
 
 // ── BUY ───────────────────────────────────────────────────────
 
-async function execBuy(mint, signalAgeMs) {
-  // Random buy size every trade
-  const sol      = randomBuySol();
+async function execBuy(mint, signalAgeMs, targetSolSpent=0) {
+  // Smart sizing: bigger buy when signal is fresh + target spent more
+  const sol      = smartBuySol(signalAgeMs, targetSolSpent);
   const lamports = Math.floor(sol*1e9);
   const sym      = await tokenSymbol(mint);
   const feeSol   = CONFIG.PRIORITY_FEE_MICRO_LAMPORTS/1e9;
 
+  // Confidence label for logging
+  const confidence =
+    sol >= CONFIG.MAX_BUY_SOL              ? '🔥 HIGH'  :
+    sol <= CONFIG.MIN_BUY_SOL              ? '🧊 LOW'   : '⚡ MED';
+
   log('SIGNAL',
-    `TARGET FIRST BUY: ${sym} | age:${(signalAgeMs/1000).toFixed(2)}s | ` +
-    `buying ${sol} SOL (~$${SOL_USD(sol)}) | ${mint.slice(0,16)}...`
+    `TARGET BUY: ${sym} | age:${(signalAgeMs/1000).toFixed(2)}s | ` +
+    `target spent:${targetSolSpent.toFixed(3)} SOL | ` +
+    `confidence:${confidence} → buying ${sol} SOL (~$${SOL_USD(sol)}) | ${mint.slice(0,16)}...`
   );
 
   try {
@@ -389,6 +412,7 @@ async function execBuy(mint, signalAgeMs) {
       `\`${mint}\`\n` +
       `━━━━━━━━━━━━━━━━━━━━\n` +
       `⚡  Signal age: **${(signalAgeMs/1000).toFixed(2)}s** | Latency: **${latency}ms**\n` +
+      `🎯  Target spent: **${targetSolSpent.toFixed(3)} SOL** | Confidence: **${confidence}**\n` +
       `💸  Bought: **${sol} SOL** (~$${SOL_USD(sol)}) | Fee: ~$${SOL_USD(feeSol)}\n` +
       `━━━━━━━━━━━━━━━━━━━━\n` +
       `🏁  TP: **+${CONFIG.TAKE_PROFIT_PERCENT}%** | SL: **-${CONFIG.STOP_LOSS_PERCENT}%** | Max: **${CONFIG.MAX_HOLD_SECONDS}s**\n` +
@@ -469,12 +493,19 @@ async function parseBuyFromSig(sig) {
       return;
     }
 
-    const tfers  = tx.tokenTransfers||[];
-    const txType = tx.type||'';
-    const desc   = (tx.description||'').toLowerCase();
+    const tfers   = tx.tokenTransfers||[];
+    const native  = tx.nativeTransfers||[];
+    const txType  = tx.type||'';
+    const desc    = (tx.description||'').toLowerCase();
 
     if(txType==='TRANSFER') return;
     if(desc.includes('claim')||desc.includes('close')) return;
+
+    // How much SOL did target spend on this buy?
+    let solOut = 0;
+    for(const t of native){
+      if(t.fromUserAccount===CONFIG.TARGET_WALLET) solOut += (t.amount||0)/1e9;
+    }
 
     // Find mints received by target
     const mintsBought = [];
@@ -528,7 +559,7 @@ async function parseBuyFromSig(sig) {
     state.tradedMints.add(mint);
     state.buyInProgress = true;
 
-    const success = await execBuy(mint, signalAgeMs);
+    const success = await execBuy(mint, signalAgeMs, solOut);
     state.buyInProgress = false;
     if(!success) state.tradedMints.delete(mint); // allow retry if buy failed
 
