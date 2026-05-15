@@ -2,7 +2,7 @@
 // WINSTON v32.0 — Ultra-Fast Copy Scalp Bot
 // ⚠️  HIGH RISK — for educational/personal use only
 // ============================================================
-// Target: 93kgxYKex5wPyEkjH9P4KspLFAi3fdWBkw8vZce51pbp
+// Target: CFPhuaGoS1R8EKQdVjqqoB2T4VkzCsGfGBqdG1fLg5a5
 // Strategy: copy ENTRY only, own fast scalp exit
 //
 // Exit modes (set MODE in .env):
