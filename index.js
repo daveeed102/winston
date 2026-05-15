@@ -47,8 +47,8 @@ const CONFIG = {
   JUPITER_SWAP:  'https://lite-api.jup.ag/swap/v1/swap',
 
   // ── Buy size — randomized each trade ─────────────────────
-  MIN_BUY_SOL: parseFloat(process.env.MIN_BUY_SOL) || 0.033, // ~$3
-  MAX_BUY_SOL: parseFloat(process.env.MAX_BUY_SOL) || 0.055, // ~$5
+  MIN_BUY_SOL: parseFloat(process.env.MIN_BUY_SOL) || 0.033, // $3 fixed
+  MAX_BUY_SOL: parseFloat(process.env.MAX_BUY_SOL) || 0.033, // $3 fixed — same as min
 
   // ── Signal filter ─────────────────────────────────────────
   MAX_SIGNAL_AGE_SECONDS: parseInt(process.env.MAX_SIGNAL_AGE_SECONDS) || 8,
@@ -66,7 +66,7 @@ const CONFIG = {
 
   // ── Mode ──────────────────────────────────────────────────
 
-  get MIN_SOL_BALANCE(){ return this.MAX_BUY_SOL + 0.01; },
+  get MIN_SOL_BALANCE(){ return 0.043; }, // 0.033 buy + 0.01 fees
   EXIT_CHECK_MS: 500,
   HEALTH_MS:     30000,
   SELL_MAX_RETRIES: 4,
@@ -718,7 +718,7 @@ async function health() {
 async function main() {
   console.log('\n╔══════════════════════════════════════════════════════════════╗');
   console.log(`║  ⚡ WINSTON v33.0 — Momentum Copy Scalper                     ║`);
-  console.log(`║  Buy: random $3-$5 | TP:+12% | No SL | Max:5min — wait for profit  ║`);
+  console.log(`║  Buy: $3 fixed (0.033 SOL) | TP:+12% | No SL | Max:5min           ║`);
   console.log('╚══════════════════════════════════════════════════════════════╝\n');
 
   if(!CONFIG.HELIUS_API_KEY){ log('ERROR','HELIUS_API_KEY missing'); process.exit(1); }
