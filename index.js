@@ -756,9 +756,24 @@ async function parseBuyFromSig(sig) {
     state.tradedMints.add(mint);
     state.buyInProgress = true;
 
-    const success = await execBuy(mint, signalAgeMs, solOut);
+    // ── KEEP RETRYING until buy succeeds ─────────────────
+    // He's still buying — we need to get in. Don't give up.
+    let bought = false;
+    let attempt = 0;
+    while(!bought && attempt < 10) {
+      attempt++;
+      if(attempt > 1) {
+        log('INFO', `🔄 Buy retry #${attempt} for ${sym} — not giving up`);
+        await sleep(500); // brief pause between retries
+      }
+      bought = await execBuy(mint, signalAgeMs, solOut);
+    }
+
+    if(!bought) {
+      log('ERROR', `❌ Gave up on ${sym} after ${attempt} attempts`);
+      state.tradedMints.delete(mint); // reset so next signal can try
+    }
     state.buyInProgress = false;
-    if(!success) state.tradedMints.delete(mint); // allow retry if buy failed
 
   } catch(e){
     log('ERROR',`parseBuyFromSig: ${e.message}`);
