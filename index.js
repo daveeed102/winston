@@ -51,7 +51,7 @@ const CONFIG = {
   TP1_SELL_PCT:    parseFloat(process.env.TP1_SELL)   || 50,
   TP2_PCT:         parseFloat(process.env.TP2_PCT)    || 60,   // +60% → sell 50% of remainder
   TP2_SELL_PCT:    parseFloat(process.env.TP2_SELL)   || 50,
-  SL_PCT:          parseFloat(process.env.SL_PCT)     || -25,  // -25% → full exit
+  SL_PCT:          parseFloat(process.env.SL_PCT)     || -65,  // -65% → full exit
   MOONBAG_MAX_MS:  (parseInt(process.env.MOONBAG_MINS)||10) * 60000, // 10 min moonbag
 
   // ── Speed ─────────────────────────────────────────────────
