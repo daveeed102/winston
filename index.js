@@ -43,7 +43,8 @@ const CONFIG = {
 
   // ── Buy config ────────────────────────────────────────────
   BUY_SOL:         parseFloat(process.env.BUY_SOL)    || 0.061, // ~$5
-  MAX_MC_USD:      parseFloat(process.env.MAX_MC_USD) || 20000, // skip if MC > $20K
+  MAX_MC_USD:      parseFloat(process.env.MAX_MC_USD) || 150000, // skip if MC > $150K
+  MIN_MC_USD:      parseFloat(process.env.MIN_MC_USD) || 4000,   // skip if MC < $4K
   MAX_POSITIONS:   parseInt(process.env.MAX_POSITIONS) || 5,
 
   // ── Exit tiers ────────────────────────────────────────────
@@ -621,6 +622,13 @@ async function parseTx(sig) {
         log('SKIP',`MC too high: $${mc.toFixed(0)} > $${CONFIG.MAX_MC_USD}`);
         state.stats.skippedMC++;
         await discord(`⏭ **SKIPPED — MC $${mc.toFixed(0)}** > $${CONFIG.MAX_MC_USD}\n\`${mint.slice(0,20)}...\``);
+        continue;
+      }
+
+      if(mc !== null && mc < CONFIG.MIN_MC_USD){
+        log('SKIP',`MC too low: $${mc.toFixed(0)} < $${CONFIG.MIN_MC_USD}`);
+        state.stats.skippedMC++;
+        await discord(`⏭ **SKIPPED — MC $${mc.toFixed(0)}** < $${CONFIG.MIN_MC_USD} (too new/risky)\n\`${mint.slice(0,20)}...\``);
         continue;
       }
 
