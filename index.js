@@ -23,8 +23,8 @@ const C = {
   HELIUS_API_KEY:         process.env.HELIUS_API_KEY || '',
   DISCORD_WEBHOOK:        process.env.DISCORD_WEBHOOK_URL || '',
 
-  TRADE_SIZE_USD:         parseFloat(process.env.TRADE_SIZE_USD)          || 3,
-  MAX_TRADE_SIZE_USD:     parseFloat(process.env.MAX_TRADE_SIZE_USD)       || 5,
+  TRADE_SIZE_USD:         parseFloat(process.env.TRADE_SIZE_USD)          || 5,
+  MAX_TRADE_SIZE_USD:     parseFloat(process.env.MAX_TRADE_SIZE_USD)       || 5, // same as trade size
   MAX_OPEN_TRADES:        parseInt(process.env.MAX_OPEN_TRADES)            || 1,
   TAKE_PROFIT_PCT:        parseFloat(process.env.TAKE_PROFIT_PERCENT)      || 12,
   STOP_LOSS_PCT:          parseFloat(process.env.STOP_LOSS_PERCENT)        || 7,
@@ -109,10 +109,7 @@ const session = {
 
 function checkKillSwitch(reason) {
   if(session.killed) return true;
-  if(session.dailyLossUsd >= C.MAX_DAILY_LOSS_USD) {
-    session.killed = true;
-    session.killReason = `Daily loss limit $${C.MAX_DAILY_LOSS_USD} reached`;
-  }
+  // Daily loss limit removed — trade freely
   if(session.consecLosses >= C.MAX_CONSEC_LOSSES) {
     session.killed = true;
     session.killReason = `${C.MAX_CONSEC_LOSSES} consecutive losses`;
@@ -455,19 +452,33 @@ async function monitorPosition(mint) {
     const holdSecs = holdMs / 1000;
 
     // Get current price via Jupiter quote
-    const lamportsOut = Math.floor(p.tradeSizeSol * LAMPORTS_PER_SOL);
-    const currentQuote = await jupiterQuote(C.SOL_MINT, mint, lamportsOut, C.SLIPPAGE_BPS);
-
-    let currentPrice = p.entryPrice;
     let exitReason   = null;
-    let canGetQuote  = !!currentQuote;
+    let canGetQuote  = false;
+    let roi          = 0;
 
-    if(currentQuote) {
-      // Estimate price from quote
-      currentPrice = p.entryPrice * (parseFloat(currentQuote.outAmount) / lamportsOut);
-    }
-
-    const roi = ((currentPrice - p.entryPrice) / p.entryPrice) * 100;
+    // Get current value by quoting a sell of our token balance back to SOL
+    try {
+      if(p.tokenAmountRaw && p.tokenAmountRaw > 0n) {
+        const sellQuote = await jupiterQuote(mint, C.SOL_MINT, p.tokenAmountRaw.toString(), C.SLIPPAGE_BPS);
+        if(sellQuote && sellQuote.outAmount) {
+          canGetQuote = true;
+          const currentValueSol = parseFloat(sellQuote.outAmount) / LAMPORTS_PER_SOL;
+          // ROI based on what we'd actually get back vs what we spent
+          roi = ((currentValueSol - p.tradeSizeSol) / p.tradeSizeSol) * 100;
+        }
+      } else if(!C.DRY_RUN) {
+        // Try to get token balance if we don't have it
+        const bal = await getTokenBalance(mint);
+        if(bal.raw > 0n) {
+          const sellQuote = await jupiterQuote(mint, C.SOL_MINT, bal.raw.toString(), C.SLIPPAGE_BPS);
+          if(sellQuote?.outAmount) {
+            canGetQuote = true;
+            const currentValueSol = parseFloat(sellQuote.outAmount) / LAMPORTS_PER_SOL;
+            roi = ((currentValueSol - p.tradeSizeSol) / p.tradeSizeSol) * 100;
+          }
+        }
+      }
+    } catch(e) {}
 
     // Check exit conditions
     if(holdSecs >= C.MAX_HOLD_SECS)      exitReason = 'timeout';
@@ -481,7 +492,7 @@ async function monitorPosition(mint) {
 
     if(exitReason) {
       clearInterval(monitor);
-      await exitPosition(mint, exitReason, currentPrice, roi);
+      await exitPosition(mint, exitReason, p.entryPrice * (1 + roi/100), roi);
     }
   }, CHECK_INTERVAL);
 }
@@ -787,7 +798,7 @@ async function main() {
   log('BOOT', `Balance: ${session.startBal.toFixed(4)} SOL ($${(session.startBal*C.SOL_PRICE_USD).toFixed(2)})`);
   log('BOOT', `Mode: ${C.DRY_RUN ? 'DRY RUN' : 'LIVE TRADING'}`);
   log('BOOT', `TP:+${C.TAKE_PROFIT_PCT}% SL:-${C.STOP_LOSS_PCT}% Hold:${C.MAX_HOLD_SECS}s Score:${C.MIN_ABSORPTION_SCORE}`);
-  log('BOOT', `Max loss/day:$${C.MAX_DAILY_LOSS_USD} Max consec losses:${C.MAX_CONSEC_LOSSES}`);
+  log('BOOT', `Max consec losses: ${C.MAX_CONSEC_LOSSES}`);
 
   if(C.DRY_RUN) {
     log('BOOT', '🟡 DRY RUN — set DRY_RUN=false to enable live trading');
