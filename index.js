@@ -581,9 +581,11 @@ function watchNewTokens() {
       const { logs, signature } = msg.params.result.value;
       const logStr = (logs||[]).join(' ');
 
-      // New token create
-      if(logStr.includes('InitializeMint') || logStr.includes('Create')) {
-        await processNewTokenSig(signature);
+      // Only process creates, and only if we have room for more tokens
+      if(session.watchedTokens.size < 15 &&
+         (logStr.includes('InitializeMint') || logStr.includes('MintTo')) &&
+         sigQueue.length < 5) {
+        processNewTokenSig(signature);
       }
     } catch(e){}
   });
@@ -597,33 +599,58 @@ function watchNewTokens() {
   setInterval(() => { if(ws?.readyState===WebSocket.OPEN) ws.ping(); }, 20000);
 }
 
+// Queue of sigs to process — batch them to avoid RPC spam
+const sigQueue = [];
+let sigQueueRunning = false;
+
 async function processNewTokenSig(sig) {
   if(!sig) return;
-  try {
-    // Get transaction to extract mint address
-    const tx = await session.connection.getParsedTransaction(sig, {
-      maxSupportedTransactionVersion:0, commitment:'confirmed'
-    });
-    if(!tx) return;
+  sigQueue.push(sig);
+  if(!sigQueueRunning) drainSigQueue();
+}
 
-    // Find new token mint from token balances
-    for(const b of (tx.meta?.postTokenBalances||[])) {
-      const mint = b.mint;
-      if(!mint || session.watchedTokens.has(mint) || session.blacklist.has(mint)) continue;
+async function drainSigQueue() {
+  sigQueueRunning = true;
+  while(sigQueue.length > 0) {
+    // Cap watched tokens
+    if(session.watchedTokens.size >= 15) { sigQueue.length = 0; break; }
 
-      // Get initial price from DexScreener
-      const price = await getTokenPrice(mint);
-      if(!price) continue;
+    const sig = sigQueue.shift();
+    try {
+      const tx = await session.connection.getParsedTransaction(sig, {
+        maxSupportedTransactionVersion:0, commitment:'confirmed'
+      });
+      if(!tx) { await new Promise(r=>setTimeout(r,500)); continue; }
 
-      const state = initTokenState(mint, price);
-      session.watchedTokens.set(mint, state);
-      log('WATCHING', `New token: ${mint.slice(0,12)}... @ $${price.toFixed(8)}`);
+      for(const b of (tx.meta?.postTokenBalances||[])) {
+        const mint = b.mint;
+        if(!mint) continue;
 
-      // Start price polling for this token
-      startTokenMonitor(mint);
-      break;
-    }
-  } catch(e){}
+        // Skip known tokens and stables
+        const IGNORE = new Set([
+          'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+          'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+          C.SOL_MINT,
+        ]);
+        if(IGNORE.has(mint)) continue;
+        if(session.watchedTokens.has(mint) || session.blacklist.has(mint)) continue;
+
+        const price = await getTokenPrice(mint);
+        // Only watch cheap meme coins, skip stables/established tokens
+        if(!price || price > 0.05) continue;
+
+        const state = initTokenState(mint, price);
+        session.watchedTokens.set(mint, state);
+        log('WATCHING', `New token: ${mint.slice(0,12)}... @ $${price.toFixed(8)}`);
+        startTokenMonitor(mint);
+        break;
+      }
+    } catch(e){}
+
+    // Rate limit: 1 RPC call per 2 seconds max
+    await new Promise(r=>setTimeout(r,2000));
+  }
+  sigQueueRunning = false;
 }
 
 async function getTokenPrice(mint) {
