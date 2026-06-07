@@ -182,22 +182,51 @@ async function jupSwap(quote, attempt=1) {
 const priceCache = new Map(); // mint → { price, liq, ts }
 
 async function getPrice(mint) {
+  // Try DexScreener first
   try {
-    const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
-    if(!r.ok) return null;
-    const d = await r.json();
-    // Only care about Raydium pairs (graduated coins)
-    const pairs = (d.pairs||[]).filter(p => p.dexId === 'raydium' && parseFloat(p.liquidity?.usd||0) > 0);
-    if(!pairs.length) return null;
-    // Pick highest liquidity pair
-    pairs.sort((a,b) => parseFloat(b.liquidity?.usd||0) - parseFloat(a.liquidity?.usd||0));
-    const p = pairs[0];
-    const price = parseFloat(p.priceUsd||0);
-    const liq   = parseFloat(p.liquidity?.usd||0);
-    if(!price) return null;
-    priceCache.set(mint, { price, liq, ts: Date.now() });
-    return { price, liq };
-  } catch(e) { return null; }
+    const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, {
+      headers: { 'Accept': 'application/json' }
+    });
+    if(r.ok) {
+      const d = await r.json();
+      // Accept any pair — raydium, orca, meteora, etc
+      const pairs = (d.pairs||[]).filter(p => parseFloat(p.priceUsd||0) > 0);
+      if(pairs.length) {
+        // Prefer raydium, else take highest liquidity
+        const raydium = pairs.filter(p => p.dexId === 'raydium');
+        const best    = raydium.length ? raydium[0] : pairs.sort((a,b) => parseFloat(b.liquidity?.usd||0) - parseFloat(a.liquidity?.usd||0))[0];
+        const price   = parseFloat(best.priceUsd||0);
+        const liq     = parseFloat(best.liquidity?.usd||0);
+        if(price > 0) {
+          priceCache.set(mint, { price, liq, ts: Date.now() });
+          return { price, liq };
+        }
+      }
+    }
+  } catch(e) {}
+
+  // Fallback: Jupiter quote — works immediately after graduation even before DexScreener indexes
+  try {
+    const lamports = 10000000; // 0.01 SOL
+    const r = await fetch(
+      `${C.JUPITER_API}/quote?inputMint=${C.SOL_MINT}&outputMint=${mint}&amount=${lamports}&slippageBps=5000`
+    );
+    if(r.ok) {
+      const q = await r.json();
+      if(q.outAmount && parseFloat(q.outAmount) > 0) {
+        // price = 0.01 SOL worth of USD / tokens received
+        const tokensOut = parseFloat(q.outAmount) / 1e6; // assume 6 decimals
+        const price     = (lamports / LAMPORTS_PER_SOL * C.SOL_PRICE_USD) / tokensOut;
+        // No liquidity data from Jupiter, estimate from price impact
+        const impact  = parseFloat(q.priceImpactPct||0) * 100;
+        const liqEst  = impact > 0 ? (C.TRADE_SIZE_USD / (impact / 100)) : 5000;
+        priceCache.set(mint, { price, liq: liqEst, ts: Date.now() });
+        return { price, liq: liqEst };
+      }
+    }
+  } catch(e) {}
+
+  return null;
 }
 
 // ── COIN STATE ────────────────────────────────────────────────
