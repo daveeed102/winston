@@ -31,7 +31,7 @@ const C = {
   MIN_PRICE_TICKS_UP:   parseInt(process.env.MIN_TICKS_UP)       || 3,    // 3 consecutive up ticks
   MIN_MOMENTUM_PCT:     parseFloat(process.env.MIN_MOMENTUM_PCT) || 8,    // +8% in last 10s
   MAX_PRICE_IMPACT_PCT: parseFloat(process.env.MAX_IMPACT)       || 4,
-  MIN_LIQUIDITY_USD:    parseFloat(process.env.MIN_LIQUIDITY)     || 5000, // $5K min liquidity
+  MIN_LIQUIDITY_USD:    parseFloat(process.env.MIN_LIQUIDITY)     || 1000, // $1K min — fresh grads start low
   SLIPPAGE_BPS:         parseInt(process.env.SLIPPAGE_BPS)        || 2500,
 
   // Only watch coins that graduated (migrated to Raydium)
@@ -510,6 +510,8 @@ function connectWS() {
   setInterval(() => { if(ws?.readyState===WebSocket.OPEN) ws.ping(); }, 20000);
 }
 
+const pendingMints = new Set(); // prevent parallel retries on same mint
+
 async function fetchGradMint(sig) {
   try {
     const tx = await session.connection.getParsedTransaction(sig, {
@@ -517,22 +519,22 @@ async function fetchGradMint(sig) {
     });
     if(!tx) return;
 
-    // Extract mint from token balances
+    const SKIP = new Set([
+      'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+      'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+      C.SOL_MINT,
+    ]);
+
     for(const b of (tx.meta?.postTokenBalances||[])) {
       const mint = b.mint;
       if(!mint) continue;
-
-      // Skip known tokens
-      const SKIP = new Set([
-        'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
-        'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
-        C.SOL_MINT,
-      ]);
       if(SKIP.has(mint)) continue;
       if(session.watchedCoins.has(mint) || session.blacklist.has(mint)) continue;
+      if(pendingMints.has(mint)) continue; // already being retried
 
+      pendingMints.add(mint);
       log('TICK', `Graduated coin: ${mint.slice(0,12)}... — checking price`);
-      await watchCoin(mint);
+      watchCoin(mint).finally(() => pendingMints.delete(mint));
       break;
     }
   } catch(e){}
@@ -572,19 +574,26 @@ async function startDexScreenerPoll() {
 async function watchCoin(mint) {
   if(session.watchedCoins.size >= 20) return;
   if(session.watchedCoins.has(mint)) return;
+  if(session.blacklist.has(mint)) return;
 
-  const data = await getPrice(mint);
-  if(!data) return;
-  if(data.liq < C.MIN_LIQUIDITY_USD) {
-    log('SKIP', `${mint.slice(0,10)} liq too low: $${data.liq.toFixed(0)}`);
-    return;
+  // Retry up to 5 times with increasing delay — DexScreener lags after graduation
+  for(let attempt = 0; attempt < 5; attempt++) {
+    if(session.watchedCoins.has(mint)) return; // already added by another event
+    const data = await getPrice(mint);
+    if(data && data.price > 0) {
+      // Accept any liquidity — fresh graduates start low
+      const state = makeCoinState(mint, data.price, data.liq);
+      session.watchedCoins.set(mint, state);
+      log('TICK', `✅ Watching: ${mint.slice(0,10)} @ $${data.price.toFixed(8)} liq:$${(data.liq/1000).toFixed(1)}K`);
+      startCoinTicker(mint);
+      return;
+    }
+    // DexScreener not indexed yet — wait and retry
+    const delay = [2000, 4000, 6000, 10000, 15000][attempt];
+    log('TICK', `${mint.slice(0,10)} not on DexScreener yet (attempt ${attempt+1}) — retry in ${delay/1000}s`);
+    await new Promise(r => setTimeout(r, delay));
   }
-
-  const state = makeCoinState(mint, data.price, data.liq);
-  session.watchedCoins.set(mint, state);
-  log('TICK', `Watching: ${mint.slice(0,10)} @ $${data.price.toFixed(8)} liq:$${(data.liq/1000).toFixed(1)}K`);
-
-  startCoinTicker(mint);
+  log('SKIP', `${mint.slice(0,10)} never appeared on DexScreener — skip`);
 }
 
 // ── FAST PRICE TICKER ─────────────────────────────────────────
