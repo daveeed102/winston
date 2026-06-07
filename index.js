@@ -1,170 +1,141 @@
 // ============================================================
-// SNIPER EXIT ABSORPTION BOT v1.0
-// Solana meme coin micro-scalper — burner wallet only
-// Strategy: wait for first sniper dump → buy the bounce
-// Default: DRY_RUN=true (paper trading)
+// MOMENTUM RIDER v1.0 — Pump.fun Graduated Coin Scalper
+// Strategy: watch graduated coins on Raydium
+// Enter on confirmed upward momentum
+// Ride for 20 seconds, exit fast
 // ============================================================
 require('dotenv').config();
-const {
-  Connection, Keypair, VersionedTransaction,
-  PublicKey, LAMPORTS_PER_SOL
-} = require('@solana/web3.js');
-const bs58  = require('bs58');
-const fetch = require('node-fetch');
-const fs    = require('fs');
-const path  = require('path');
+const { Connection, Keypair, VersionedTransaction, PublicKey, LAMPORTS_PER_SOL } = require('@solana/web3.js');
+const bs58   = require('bs58');
+const fetch  = require('node-fetch');
+const fs     = require('fs');
+const path   = require('path');
 const WebSocket = require('ws');
 
 // ── CONFIG ────────────────────────────────────────────────────
 const C = {
-  DRY_RUN:                process.env.DRY_RUN !== 'false',   // MUST explicitly set false for live
-  PRIVATE_KEY:            process.env.PRIVATE_KEY || process.env.WALLET_SECRET_KEY || '',
-  RPC_URL:                process.env.RPC_URL || 'https://api.mainnet-beta.solana.com',
-  HELIUS_API_KEY:         process.env.HELIUS_API_KEY || '',
-  DISCORD_WEBHOOK:        process.env.DISCORD_WEBHOOK_URL || '',
+  DRY_RUN:        process.env.DRY_RUN !== 'false',
+  PRIVATE_KEY:    process.env.PRIVATE_KEY || process.env.WALLET_SECRET_KEY || '',
+  HELIUS_API_KEY: process.env.HELIUS_API_KEY || '',
+  DISCORD:        process.env.DISCORD_WEBHOOK_URL || '',
 
-  TRADE_SIZE_USD:         parseFloat(process.env.TRADE_SIZE_USD)          || 5,
-  MAX_TRADE_SIZE_USD:     parseFloat(process.env.MAX_TRADE_SIZE_USD)       || 5, // same as trade size
-  MAX_OPEN_TRADES:        parseInt(process.env.MAX_OPEN_TRADES)            || 1,
-  TAKE_PROFIT_PCT:        parseFloat(process.env.TAKE_PROFIT_PERCENT)      || 12,
-  STOP_LOSS_PCT:          parseFloat(process.env.STOP_LOSS_PERCENT)        || 7,
-  MAX_HOLD_SECS:          parseInt(process.env.MAX_HOLD_SECONDS)           || 90,
-  MAX_TRADES_PER_HOUR:    parseInt(process.env.MAX_TRADES_PER_HOUR)        || 20,
-  MAX_DAILY_LOSS_USD:     parseFloat(process.env.MAX_DAILY_LOSS_USD)       || 5,
-  MAX_CONSEC_LOSSES:      parseInt(process.env.MAX_CONSECUTIVE_LOSSES)     || 3,
+  // Trade
+  TRADE_SIZE_USD:   parseFloat(process.env.TRADE_SIZE_USD)  || 5,
+  TAKE_PROFIT_PCT:  parseFloat(process.env.TAKE_PROFIT_PCT) || 15,   // +15% = exit
+  STOP_LOSS_PCT:    parseFloat(process.env.STOP_LOSS_PCT)   || 12,   // -12% = exit
+  HOLD_SECS:        parseInt(process.env.HOLD_SECS)         || 20,   // 20s max hold
+  MAX_OPEN:         parseInt(process.env.MAX_OPEN)          || 1,
+  MAX_PER_HOUR:     parseInt(process.env.MAX_PER_HOUR)      || 30,
 
-  MIN_ABSORPTION_SCORE:   parseInt(process.env.MIN_ABSORPTION_SCORE)       || 75,
-  MIN_TOKEN_AGE_SECS:     parseInt(process.env.MIN_TOKEN_AGE_SECONDS)      || 30,
-  MAX_TOKEN_AGE_SECS:     parseInt(process.env.MAX_TOKEN_AGE_SECONDS)      || 600,
-  MIN_PUMP_PCT:           parseFloat(process.env.MIN_FIRST_PUMP_PERCENT)   || 40,
-  MAX_PUMP_PCT:           parseFloat(process.env.MAX_FIRST_PUMP_PERCENT)   || 150,
-  MIN_DUMP_PCT:           parseFloat(process.env.MIN_FIRST_DUMP_PERCENT)   || 15,
-  MAX_DUMP_PCT:           parseFloat(process.env.MAX_FIRST_DUMP_PERCENT)   || 35,
-  MIN_NEW_BUYERS:         parseInt(process.env.MIN_NEW_BUYERS_AFTER_DUMP)  || 3,
-  PRICE_HOLD_SECS:        parseInt(process.env.PRICE_HOLD_SECONDS)         || 15,
-  MAX_PRICE_IMPACT_PCT:   parseFloat(process.env.MAX_PRICE_IMPACT_PERCENT) || 5,
-  MIN_HOLDERS:            parseInt(process.env.MIN_HOLDERS)               || 15,
-  SLIPPAGE_BPS:           parseInt(process.env.SLIPPAGE_BPS)               || 2000,
+  // Momentum filter — must pass ALL of these to enter
+  MIN_PRICE_TICKS_UP:   parseInt(process.env.MIN_TICKS_UP)       || 3,    // 3 consecutive up ticks
+  MIN_MOMENTUM_PCT:     parseFloat(process.env.MIN_MOMENTUM_PCT) || 8,    // +8% in last 10s
+  MAX_PRICE_IMPACT_PCT: parseFloat(process.env.MAX_IMPACT)       || 4,
+  MIN_LIQUIDITY_USD:    parseFloat(process.env.MIN_LIQUIDITY)     || 5000, // $5K min liquidity
+  SLIPPAGE_BPS:         parseInt(process.env.SLIPPAGE_BPS)        || 2500,
 
-  SOL_PRICE_USD:          parseFloat(process.env.SOL_PRICE_USD)            || 96,
-  SOL_MINT:               'So11111111111111111111111111111111111111112',
-  JUPITER_API:            process.env.JUPITER_API_URL || 'https://lite-api.jup.ag/swap/v1',
-  PUMPFUN_PROGRAM:        '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+  // Only watch coins that graduated (migrated to Raydium)
+  // These come through the pump.fun migration program
+  PUMPFUN_MIGRATION: 'FRSMJmtB3HHJWKyAWWHhNjwJQp7JDdBqgHMCCcbJjvkN',
+  PUMPFUN_PROGRAM:   '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
 
-  get HELIUS_RPC(){ return this.HELIUS_API_KEY ? `https://mainnet.helius-rpc.com/?api-key=${this.HELIUS_API_KEY}` : this.RPC_URL; },
+  SOL_PRICE_USD: parseFloat(process.env.SOL_PRICE_USD) || 96,
+  SOL_MINT:      'So11111111111111111111111111111111111111112',
+  JUPITER_API:   'https://lite-api.jup.ag/swap/v1',
+
+  get HELIUS_RPC(){ return this.HELIUS_API_KEY ? `https://mainnet.helius-rpc.com/?api-key=${this.HELIUS_API_KEY}` : 'https://api.mainnet-beta.solana.com'; },
   get HELIUS_WS() { return this.HELIUS_API_KEY ? `wss://mainnet.helius-rpc.com/?api-key=${this.HELIUS_API_KEY}` : null; },
 };
 
 // ── LOGGER ────────────────────────────────────────────────────
-const TRADE_LOG_FILE = path.join(__dirname, 'trades.json');
-const LOG_FILE       = path.join(__dirname, 'bot.log');
-if(!fs.existsSync(TRADE_LOG_FILE)) fs.writeFileSync(TRADE_LOG_FILE, '[]');
+const TRADE_FILE = path.join(__dirname, 'trades.json');
+if(!fs.existsSync(TRADE_FILE)) fs.writeFileSync(TRADE_FILE, '[]');
+const LOG_FILE = path.join(__dirname, 'bot.log');
 
-function log(tag, msg, extra='') {
+const COLORS = {
+  BOOT:'\x1b[37m', TICK:'\x1b[36m', MOMENTUM:'\x1b[35m',
+  BUY:'\x1b[92m', SELL:'\x1b[91m', EXIT:'\x1b[93m',
+  SKIP:'\x1b[90m', ERROR:'\x1b[31m', INFO:'\x1b[37m', WARN:'\x1b[33m',
+};
+
+function log(tag, msg) {
   const ts   = new Date().toISOString();
-  const line = `[${ts}] [${tag}] ${msg}${extra ? ' '+extra : ''}`;
-  const COLOR = {
-    BOOT:'', WATCHING:'\x1b[36m', 'DUMP DETECTED':'\x1b[33m',
-    'ABSORPTION SCORE':'\x1b[35m', 'BUY SIGNAL':'\x1b[32m',
-    'DRY RUN BUY':'\x1b[32m', 'LIVE BUY':'\x1b[92m',
-    EXIT:'\x1b[31m', 'KILL SWITCH':'\x1b[91m', ERROR:'\x1b[31m',
-    INFO:'\x1b[37m', WARN:'\x1b[33m',
-  };
-  console.log((COLOR[tag]||'\x1b[37m') + line + '\x1b[0m');
+  const line = `[${ts}] [${tag}] ${msg}`;
+  console.log((COLORS[tag]||'\x1b[37m') + line + '\x1b[0m');
   try { fs.appendFileSync(LOG_FILE, line+'\n'); } catch(e){}
 }
 
-function saveTrade(trade) {
+function saveTrade(t) {
   try {
-    const trades = JSON.parse(fs.readFileSync(TRADE_LOG_FILE,'utf8'));
-    trades.push(trade);
-    fs.writeFileSync(TRADE_LOG_FILE, JSON.stringify(trades, null, 2));
-  } catch(e) { log('ERROR', 'Failed to save trade: '+e.message); }
+    const arr = JSON.parse(fs.readFileSync(TRADE_FILE,'utf8'));
+    arr.push(t);
+    fs.writeFileSync(TRADE_FILE, JSON.stringify(arr,null,2));
+  } catch(e){}
 }
 
 async function discord(msg) {
-  if(!C.DISCORD_WEBHOOK) return;
+  if(!C.DISCORD) return;
   try {
-    await fetch(C.DISCORD_WEBHOOK, {
+    await fetch(C.DISCORD, {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({content: msg.slice(0,1990)}),
+      body: JSON.stringify({content:msg.slice(0,1990)}),
     });
   } catch(e){}
 }
 
-// ── SESSION STATE ─────────────────────────────────────────────
+// ── SESSION ───────────────────────────────────────────────────
 const session = {
-  dailyLossUsd:     0,
-  consecLosses:     0,
-  tradesThisHour:   0,
-  hourResetAt:      Date.now() + 3600000,
-  killed:           false,
-  killReason:       '',
-  openPositions:    new Map(),   // mint → position
-  watchedTokens:    new Map(),   // mint → tokenState
-  blacklist:        new Set(),   // mints that got stopped out
-  keypair:          null,
-  connection:       null,
-  startBal:         0,
+  keypair:        null,
+  connection:     null,
+  startBal:       0,
+  openPositions:  new Map(),   // mint → position
+  watchedCoins:   new Map(),   // mint → coinState
+  blacklist:      new Set(),
+  tradesThisHour: 0,
+  hourResetAt:    Date.now() + 3600000,
+  totalPnl:       0,
+  wins:           0,
+  losses:         0,
 };
 
-function checkKillSwitch(reason) {
-  if(session.killed) return true;
-  // Daily loss limit removed — trade freely
-  if(session.consecLosses >= C.MAX_CONSEC_LOSSES) {
-    session.killed = true;
-    session.killReason = `${C.MAX_CONSEC_LOSSES} consecutive losses`;
-  }
-  if(session.killed) {
-    log('KILL SWITCH', session.killReason);
-    discord(`🛑 **KILL SWITCH** — ${session.killReason}`);
-  }
-  return session.killed;
-}
-
-function checkTradeLimit() {
-  const now = Date.now();
-  if(now > session.hourResetAt) {
+function canTrade() {
+  if(Date.now() > session.hourResetAt) {
     session.tradesThisHour = 0;
-    session.hourResetAt = now + 3600000;
+    session.hourResetAt = Date.now() + 3600000;
   }
-  return session.tradesThisHour < C.MAX_TRADES_PER_HOUR;
+  return session.openPositions.size < C.MAX_OPEN &&
+         session.tradesThisHour < C.MAX_PER_HOUR;
 }
 
-// ── SOL BALANCE ───────────────────────────────────────────────
-async function getSolBalance() {
-  try {
-    const bal = await session.connection.getBalance(session.keypair.publicKey);
-    return bal / LAMPORTS_PER_SOL;
-  } catch(e) { return 0; }
+// ── SOLANA UTILS ──────────────────────────────────────────────
+async function getSolBal() {
+  try { return (await session.connection.getBalance(session.keypair.publicKey)) / LAMPORTS_PER_SOL; }
+  catch(e) { return 0; }
 }
 
-async function getTokenBalance(mint) {
+async function getTokenBal(mint) {
   try {
     const accts = await session.connection.getParsedTokenAccountsByOwner(
       session.keypair.publicKey, { mint: new PublicKey(mint) }
     );
-    const acct = accts?.value?.[0];
-    if(!acct) return { ui: 0, raw: 0n, decimals: 6 };
-    const info = acct.account.data.parsed.info.tokenAmount;
-    return { ui: parseFloat(info.uiAmount||0), raw: BigInt(info.amount||0), decimals: info.decimals };
-  } catch(e) { return { ui: 0, raw: 0n, decimals: 6 }; }
+    const a = accts?.value?.[0];
+    if(!a) return { ui:0, raw:0n, dec:6 };
+    const i = a.account.data.parsed.info.tokenAmount;
+    return { ui: parseFloat(i.uiAmount||0), raw: BigInt(i.amount||0), dec: i.decimals };
+  } catch(e) { return { ui:0, raw:0n, dec:6 }; }
 }
 
 // ── JUPITER ───────────────────────────────────────────────────
-async function jupiterQuote(inMint, outMint, amountLamports, slippageBps) {
+async function jupQuote(inMint, outMint, amount, slipBps) {
   try {
-    const r = await fetch(
-      `${C.JUPITER_API}/quote?inputMint=${inMint}&outputMint=${outMint}&amount=${amountLamports}&slippageBps=${slippageBps}`
-    );
+    const r = await fetch(`${C.JUPITER_API}/quote?inputMint=${inMint}&outputMint=${outMint}&amount=${amount}&slippageBps=${slipBps}`);
     if(!r.ok) return null;
     const q = await r.json();
-    if(!q.outAmount) return null;
-    return q;
+    return q.outAmount ? q : null;
   } catch(e) { return null; }
 }
 
-async function jupiterSwap(quote) {
+async function jupSwap(quote, attempt=1) {
   try {
     const r = await fetch(`${C.JUPITER_API}/swap`, {
       method:'POST', headers:{'Content-Type':'application/json'},
@@ -173,7 +144,7 @@ async function jupiterSwap(quote) {
         userPublicKey:       session.keypair.publicKey.toString(),
         wrapAndUnwrapSol:    true,
         dynamicSlippage:     { minBps:50, maxBps:C.SLIPPAGE_BPS },
-        prioritizationFeeLamports: 300000,
+        prioritizationFeeLamports: 500000, // 0.0005 SOL priority — fast execution
       }),
     });
     if(!r.ok) return null;
@@ -183,443 +154,318 @@ async function jupiterSwap(quote) {
     const buf = Buffer.from(d.swapTransaction,'base64');
     const tx  = VersionedTransaction.deserialize(buf);
     tx.sign([session.keypair]);
-    const sig = await session.connection.sendRawTransaction(tx.serialize(),{skipPreflight:true,maxRetries:3});
 
-    // Confirm
-    const end = Date.now()+20000;
-    while(Date.now()<end) {
+    const sig = await session.connection.sendRawTransaction(tx.serialize(), {
+      skipPreflight: true,
+      maxRetries:    3,
+    });
+
+    // Fast confirm loop
+    const end = Date.now() + 15000;
+    while(Date.now() < end) {
       const s = await session.connection.getSignatureStatuses([sig]);
       const v = s?.value?.[0];
       if(v?.err) return null;
-      if(v?.confirmationStatus==='confirmed'||v?.confirmationStatus==='finalized') return sig;
-      await new Promise(r=>setTimeout(r,400));
+      if(v?.confirmationStatus === 'confirmed' || v?.confirmationStatus === 'finalized') return sig;
+      await new Promise(r=>setTimeout(r,300));
     }
     return null;
+  } catch(e) {
+    if(attempt < 3) { await new Promise(r=>setTimeout(r,200)); return jupSwap(quote, attempt+1); }
+    return null;
+  }
+}
+
+// ── PRICE FEED ────────────────────────────────────────────────
+// Use DexScreener for price + liquidity data on graduated coins
+
+const priceCache = new Map(); // mint → { price, liq, ts }
+
+async function getPrice(mint) {
+  try {
+    const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+    if(!r.ok) return null;
+    const d = await r.json();
+    // Only care about Raydium pairs (graduated coins)
+    const pairs = (d.pairs||[]).filter(p => p.dexId === 'raydium' && parseFloat(p.liquidity?.usd||0) > 0);
+    if(!pairs.length) return null;
+    // Pick highest liquidity pair
+    pairs.sort((a,b) => parseFloat(b.liquidity?.usd||0) - parseFloat(a.liquidity?.usd||0));
+    const p = pairs[0];
+    const price = parseFloat(p.priceUsd||0);
+    const liq   = parseFloat(p.liquidity?.usd||0);
+    if(!price) return null;
+    priceCache.set(mint, { price, liq, ts: Date.now() });
+    return { price, liq };
   } catch(e) { return null; }
 }
 
-function priceImpactPct(quote) {
-  return parseFloat(quote.priceImpactPct||0) * 100;
-}
-
-// ── TOKEN STATE TRACKER ───────────────────────────────────────
-// Tracks lifecycle of each new token for absorption scoring
-
-function initTokenState(mint, launchPrice) {
+// ── COIN STATE ────────────────────────────────────────────────
+function makeCoinState(mint, price, liq) {
   return {
     mint,
-    launchTime:     Date.now(),
-    launchPrice,
-    currentPrice:   launchPrice,
-    localHigh:      launchPrice,
-    localLow:       launchPrice,
-    pumpPct:        0,
-    dumpPct:        0,
-    dumpDetectedAt: null,
-    priceAfterDump: null,
-    buyCount:       0,
-    sellCount:      0,
-    buyersAfterDump: 0,
-    creatorMint:    null,
-    recentPrices:   [launchPrice],
-    phase:          'watching',  // watching → pumped → dumped → absorbing → traded
-    score:          0,
+    firstSeen:   Date.now(),
+    prices:      [{ p: price, t: Date.now() }],  // rolling price history
+    price,
+    liq,
+    ticksUp:     0,
+    ticksDown:   0,
+    phase:       'watching', // watching → momentum → entered → done
   };
 }
 
-function updateTokenState(state, price, isBuy, isSell, isCreator) {
-  state.currentPrice = price;
-  state.recentPrices.push(price);
-  if(state.recentPrices.length > 50) state.recentPrices.shift();
+function updateCoin(state, price, liq) {
+  const prev = state.price;
+  state.price = price;
+  state.liq   = liq;
+  state.prices.push({ p: price, t: Date.now() });
+  if(state.prices.length > 20) state.prices.shift();
 
-  if(isBuy)  state.buyCount++;
-  if(isSell) state.sellCount++;
-
-  if(price > state.localHigh) state.localHigh = price;
-  if(price < state.localLow)  state.localLow  = price;
-
-  // Pump detection
-  if(state.launchPrice > 0) {
-    state.pumpPct = ((state.localHigh - state.launchPrice) / state.launchPrice) * 100;
-  }
-
-  // Phase transitions
-  if(state.phase === 'watching' && state.pumpPct >= C.MIN_PUMP_PCT) {
-    state.phase = 'pumped';
-    log('WATCHING', `${state.mint.slice(0,12)}... pumped ${state.pumpPct.toFixed(0)}%`);
-  }
-
-  if(state.phase === 'pumped' && state.localHigh > 0) {
-    const dumpFromHigh = ((state.localHigh - price) / state.localHigh) * 100;
-    if(dumpFromHigh >= C.MIN_DUMP_PCT) {
-      state.dumpPct = dumpFromHigh;
-      if(!state.dumpDetectedAt) {
-        state.dumpDetectedAt = Date.now();
-        state.priceAfterDump = price;
-        state.buyersAfterDump = 0;
-        state.phase = 'dumped';
-        log('DUMP DETECTED', `${state.mint.slice(0,12)}... dump ${state.dumpPct.toFixed(0)}% from high`);
-      }
-    }
-  }
-
-  if(state.phase === 'dumped') {
-    if(isBuy) state.buyersAfterDump++;
-    const holdSecs = (Date.now() - state.dumpDetectedAt) / 1000;
-
-    // Price still making new lows = not absorbed yet
-    if(price < state.priceAfterDump) {
-      state.priceAfterDump = price;
-    }
-
-    if(holdSecs >= C.PRICE_HOLD_SECS && state.buyersAfterDump >= C.MIN_NEW_BUYERS) {
-      state.phase = 'absorbing';
-    }
-  }
+  if(price > prev)      { state.ticksUp++;   state.ticksDown = 0; }
+  else if(price < prev) { state.ticksDown++; state.ticksUp   = 0; }
 }
 
-// ── ABSORPTION SCORE ──────────────────────────────────────────
-function calcAbsorptionScore(state) {
-  let score = 0;
-  const reasons = [];
-
-  // 1. Dump size quality (15-35% is ideal = 25 pts)
-  if(state.dumpPct >= C.MIN_DUMP_PCT && state.dumpPct <= C.MAX_DUMP_PCT) {
-    score += 25;
-    reasons.push(`dump ${state.dumpPct.toFixed(0)}% ✓`);
-  } else if(state.dumpPct < C.MIN_DUMP_PCT) {
-    reasons.push(`dump too small ${state.dumpPct.toFixed(0)}%`);
-  } else {
-    score += 10;
-    reasons.push(`dump large ${state.dumpPct.toFixed(0)}%`);
-  }
-
-  // 2. Pump quality (40-150% = 20 pts)
-  if(state.pumpPct >= C.MIN_PUMP_PCT && state.pumpPct <= C.MAX_PUMP_PCT) {
-    score += 20;
-    reasons.push(`pump ${state.pumpPct.toFixed(0)}% ✓`);
-  } else if(state.pumpPct > C.MAX_PUMP_PCT) {
-    score += 10;
-    reasons.push(`pump very high ${state.pumpPct.toFixed(0)}%`);
-  }
-
-  // 3. New buyers after dump (15 pts)
-  if(state.buyersAfterDump >= C.MIN_NEW_BUYERS) {
-    const bonus = Math.min(state.buyersAfterDump * 3, 15);
-    score += bonus;
-    reasons.push(`${state.buyersAfterDump} buyers after dump ✓`);
-  } else {
-    reasons.push(`only ${state.buyersAfterDump} buyers after dump`);
-  }
-
-  // 4. Price held above dump low (15 pts)
-  const holdSecs = state.dumpDetectedAt ? (Date.now()-state.dumpDetectedAt)/1000 : 0;
-  if(holdSecs >= C.PRICE_HOLD_SECS) {
-    score += 15;
-    reasons.push(`held ${holdSecs.toFixed(0)}s ✓`);
-  }
-
-  // 5. Buy/sell ratio improving (10 pts)
-  const totalTx = state.buyCount + state.sellCount;
-  if(totalTx > 0) {
-    const buyRatio = state.buyCount / totalTx;
-    if(buyRatio > 0.6) { score += 10; reasons.push(`buy ratio ${(buyRatio*100).toFixed(0)}% ✓`); }
-    else if(buyRatio > 0.4) { score += 5; }
-  }
-
-  // 6. Token age reasonable (5 pts)
-  const ageSecs = (Date.now()-state.launchTime)/1000;
-  if(ageSecs >= C.MIN_TOKEN_AGE_SECS && ageSecs <= C.MAX_TOKEN_AGE_SECS) {
-    score += 5;
-    reasons.push(`age ${ageSecs.toFixed(0)}s ✓`);
-  } else if(ageSecs > C.MAX_TOKEN_AGE_SECS) {
-    reasons.push(`too old ${ageSecs.toFixed(0)}s`);
-    score -= 10;
-  }
-
-  // 7. Price recovering from dump low (10 pts)
-  if(state.priceAfterDump > 0 && state.currentPrice > state.priceAfterDump) {
-    const recovery = ((state.currentPrice-state.priceAfterDump)/state.priceAfterDump)*100;
-    if(recovery > 5) { score += 10; reasons.push(`recovering +${recovery.toFixed(0)}% ✓`); }
-    else score += 5;
-  }
-
-  state.score = Math.max(0, Math.min(100, score));
-  return { score: state.score, reasons };
+function getMomentumPct(state) {
+  // % gain over last 10 seconds
+  const now      = Date.now();
+  const cutoff   = now - 10000;
+  const recent   = state.prices.filter(p => p.t >= cutoff);
+  if(recent.length < 2) return 0;
+  const oldest   = recent[0].p;
+  const newest   = recent[recent.length-1].p;
+  return oldest > 0 ? ((newest - oldest) / oldest) * 100 : 0;
 }
 
-// ── BUY LOGIC ─────────────────────────────────────────────────
-async function attemptBuy(state) {
-  if(checkKillSwitch()) return;
-  if(!checkTradeLimit()) { log('WARN','Trade limit reached this hour'); return; }
-  if(session.openPositions.size >= C.MAX_OPEN_TRADES) { log('WARN','Max open trades reached'); return; }
-  if(session.blacklist.has(state.mint)) { log('WARN',`${state.mint.slice(0,12)}... is blacklisted`); return; }
+// ── BUY ───────────────────────────────────────────────────────
+async function enterTrade(mint, state) {
+  if(!canTrade()) return;
+  if(session.blacklist.has(mint)) return;
 
-  const solBal = await getSolBalance();
-  const tradeSizeUsd = Math.min(C.TRADE_SIZE_USD, C.MAX_TRADE_SIZE_USD);
-  const tradeSizeSol = tradeSizeUsd / C.SOL_PRICE_USD;
-  const tradeLamports = Math.floor(tradeSizeSol * LAMPORTS_PER_SOL);
+  const solBal     = await getSolBal();
+  const tradeSol   = C.TRADE_SIZE_USD / C.SOL_PRICE_USD;
+  const lamports   = Math.floor(tradeSol * LAMPORTS_PER_SOL);
 
-  if(solBal < tradeSizeSol + 0.005) {
-    log('WARN', `Low SOL balance: ${solBal.toFixed(4)} — need ${(tradeSizeSol+0.005).toFixed(4)}`);
+  if(solBal < tradeSol + 0.005) {
+    log('WARN', `Low balance: ${solBal.toFixed(4)} SOL`);
     return;
   }
 
-  // Get quote
-  const quote = await jupiterQuote(C.SOL_MINT, state.mint, tradeLamports, C.SLIPPAGE_BPS);
-  if(!quote) {
-    log('WARN', `No Jupiter route for ${state.mint.slice(0,12)}...`);
-    return;
-  }
+  // Final momentum check + Jupiter quote
+  const quote = await jupQuote(C.SOL_MINT, mint, lamports, C.SLIPPAGE_BPS);
+  if(!quote) { log('SKIP', `${mint.slice(0,10)} — no Jupiter route`); return; }
 
-  const impact = priceImpactPct(quote);
+  const impact = parseFloat(quote.priceImpactPct||0) * 100;
   if(impact > C.MAX_PRICE_IMPACT_PCT) {
-    log('WARN', `Price impact ${impact.toFixed(1)}% too high for ${state.mint.slice(0,12)}...`);
+    log('SKIP', `${mint.slice(0,10)} — impact ${impact.toFixed(1)}% too high`);
     return;
   }
 
-  const { score, reasons } = calcAbsorptionScore(state);
-  log('ABSORPTION SCORE', `${state.mint.slice(0,12)}... score:${score}/100 | ${reasons.join(' | ')}`);
+  const momentumPct = getMomentumPct(state);
+  log('MOMENTUM', `${mint.slice(0,10)} | ticks↑:${state.ticksUp} mom:+${momentumPct.toFixed(1)}% liq:$${(state.liq/1000).toFixed(0)}K impact:${impact.toFixed(1)}%`);
 
-  if(score < C.MIN_ABSORPTION_SCORE) {
-    log('INFO', `Score ${score} below threshold ${C.MIN_ABSORPTION_SCORE} — skip`);
-    return;
-  }
-
-  // Check minimum holders
-  const holders = getTokenPrice._holders[state.mint] || 0;
-  if(holders > 0 && holders < C.MIN_HOLDERS) {
-    log('INFO', `  Skipping — only ${holders} holders (min: ${C.MIN_HOLDERS})`);
-    return;
-  }
-
-  log('BUY SIGNAL', `${state.mint.slice(0,12)}... score:${score} impact:${impact.toFixed(1)}% holders:${holders||'?'} size:$${tradeSizeUsd}`);
+  state.phase = 'entered';
+  session.tradesThisHour++;
 
   let sig = null;
-  let entryPrice = state.currentPrice;
 
   if(C.DRY_RUN) {
-    sig = 'DRY_RUN_' + Date.now();
-    log('DRY RUN BUY', `Simulated ${tradeSizeUsd} USD → ${state.mint.slice(0,12)}... @ ~$${entryPrice.toFixed(8)}`);
+    sig = 'DRY_' + Date.now();
+    log('BUY', `[DRY] ${mint.slice(0,10)} $${C.TRADE_SIZE_USD} @ $${state.price.toFixed(8)}`);
   } else {
-    sig = await jupiterSwap(quote);
+    const t0 = Date.now();
+    sig      = await jupSwap(quote);
+    const ms = Date.now() - t0;
+
     if(!sig) {
-      log('ERROR', `Swap failed for ${state.mint.slice(0,12)}...`);
+      log('ERROR', `Buy failed: ${mint.slice(0,10)}`);
+      state.phase = 'watching';
       return;
     }
-    log('LIVE BUY', `sig:${sig} | ${state.mint.slice(0,12)}... | $${tradeSizeUsd}`);
+    log('BUY', `✅ ${mint.slice(0,10)} $${C.TRADE_SIZE_USD} @ $${state.price.toFixed(8)} | ${ms}ms | ${sig.slice(0,20)}...`);
   }
 
-  // Record position
   const tokBal = C.DRY_RUN
-    ? { ui: parseFloat(quote.outAmount) / 1e6, raw: BigInt(quote.outAmount), decimals: 6 }
-    : await getTokenBalance(state.mint);
+    ? { ui: parseFloat(quote.outAmount)/1e6, raw: BigInt(quote.outAmount), dec: 6 }
+    : await getTokenBal(mint);
 
-  session.openPositions.set(state.mint, {
-    mint:           state.mint,
-    entryPrice,
-    entryTimestamp: Date.now(),
-    tradeSizeUsd,
-    tradeSizeSol,
-    tokenAmount:    tokBal.ui,
-    tokenAmountRaw: tokBal.raw,
-    decimals:       tokBal.decimals,
+  const pos = {
+    mint,
+    entryPrice:   state.price,
+    entryTime:    Date.now(),
+    tradeSol,
+    tokenAmt:     tokBal.ui,
+    tokenRaw:     tokBal.raw,
     sig,
-    absorptionScore: score,
-    dryRun:         C.DRY_RUN,
-  });
+    dryRun:       C.DRY_RUN,
+  };
 
-  session.tradesThisHour++;
-  state.phase = 'traded';
+  session.openPositions.set(mint, pos);
 
   await discord([
-    `${C.DRY_RUN?'📋 DRY RUN':'🟢 LIVE'} **BUY** — ${state.mint.slice(0,12)}...`,
-    `Score: **${score}/100** | Impact: **${impact.toFixed(1)}%**`,
-    `Size: **$${tradeSizeUsd}** | Pump: **${state.pumpPct.toFixed(0)}%** → Dump: **${state.dumpPct.toFixed(0)}%**`,
+    `${C.DRY_RUN?'📋 DRY':'⚡ LIVE'} **BUY** — \`${mint.slice(0,12)}\``,
+    `💸 $${C.TRADE_SIZE_USD} | Price: $${state.price.toFixed(8)} | Liq: $${(state.liq/1000).toFixed(0)}K`,
+    `📈 Momentum: +${momentumPct.toFixed(1)}% | Ticks↑: ${state.ticksUp} | Impact: ${impact.toFixed(1)}%`,
+    `⏱ Riding for **${C.HOLD_SECS}s** max`,
   ].join('\n'));
 
-  // Start exit monitor
-  monitorPosition(state.mint);
+  // Start fast exit monitor
+  monitorExit(mint);
 }
 
-// ── EXIT LOGIC ────────────────────────────────────────────────
-async function monitorPosition(mint) {
+// ── EXIT ──────────────────────────────────────────────────────
+async function monitorExit(mint) {
   const pos = session.openPositions.get(mint);
   if(!pos) return;
 
-  log('INFO', `Monitoring ${mint.slice(0,12)}... TP:+${C.TAKE_PROFIT_PCT}% SL:-${C.STOP_LOSS_PCT}% max:${C.MAX_HOLD_SECS}s`);
+  const CHECK_MS = 1000; // check every 1s for fast exit
+  let checks = 0;
 
-  const CHECK_INTERVAL = 1500; // check every 1.5s
-  const startTime = Date.now();
+  const timer = setInterval(async () => {
+    checks++;
+    const pos = session.openPositions.get(mint);
+    if(!pos) { clearInterval(timer); return; }
 
-  const monitor = setInterval(async () => {
-    const p = session.openPositions.get(mint);
-    if(!p) { clearInterval(monitor); return; }
+    const heldMs   = Date.now() - pos.entryTime;
+    const heldSecs = heldMs / 1000;
+    let roi        = 0;
+    let exitReason = null;
 
-    const holdMs   = Date.now() - p.entryTimestamp;
-    const holdSecs = holdMs / 1000;
-
-    // Get current price via Jupiter quote
-    let exitReason   = null;
-    let canGetQuote  = false;
-    let roi          = 0;
-
-    // Get current value by quoting a sell of our token balance back to SOL
+    // Get current sell value
     try {
-      if(p.tokenAmountRaw && p.tokenAmountRaw > 0n) {
-        const sellQuote = await jupiterQuote(mint, C.SOL_MINT, p.tokenAmountRaw.toString(), C.SLIPPAGE_BPS);
-        if(sellQuote && sellQuote.outAmount) {
-          canGetQuote = true;
-          const currentValueSol = parseFloat(sellQuote.outAmount) / LAMPORTS_PER_SOL;
-          // ROI based on what we'd actually get back vs what we spent
-          roi = ((currentValueSol - p.tradeSizeSol) / p.tradeSizeSol) * 100;
-        }
-      } else if(!C.DRY_RUN) {
-        // Try to get token balance if we don't have it
-        const bal = await getTokenBalance(mint);
-        if(bal.raw > 0n) {
-          const sellQuote = await jupiterQuote(mint, C.SOL_MINT, bal.raw.toString(), C.SLIPPAGE_BPS);
-          if(sellQuote?.outAmount) {
-            canGetQuote = true;
-            const currentValueSol = parseFloat(sellQuote.outAmount) / LAMPORTS_PER_SOL;
-            roi = ((currentValueSol - p.tradeSizeSol) / p.tradeSizeSol) * 100;
-          }
+      if(pos.tokenRaw > 0n) {
+        const sq = await jupQuote(mint, C.SOL_MINT, pos.tokenRaw.toString(), C.SLIPPAGE_BPS);
+        if(sq?.outAmount) {
+          const solBack = parseFloat(sq.outAmount) / LAMPORTS_PER_SOL;
+          roi = ((solBack - pos.tradeSol) / pos.tradeSol) * 100;
         }
       }
-    } catch(e) {}
+    } catch(e){}
 
-    // Check exit conditions
-    if(holdSecs >= C.MAX_HOLD_SECS)      exitReason = 'timeout';
-    else if(roi >= C.TAKE_PROFIT_PCT)    exitReason = 'take_profit';
-    else if(roi <= -C.STOP_LOSS_PCT)     exitReason = 'stop_loss';
-    else if(!canGetQuote && holdSecs > 10) exitReason = 'no_route';
-
-    // Check watched token for creator dump signal
-    const watched = session.watchedTokens.get(mint);
-    if(watched?.creatorDumped) exitReason = 'creator_dumped';
+    // Exit conditions
+    if(heldSecs >= C.HOLD_SECS)       exitReason = `timeout_${C.HOLD_SECS}s`;
+    else if(roi >= C.TAKE_PROFIT_PCT)  exitReason = `tp_+${roi.toFixed(1)}%`;
+    else if(roi <= -C.STOP_LOSS_PCT)   exitReason = `sl_${roi.toFixed(1)}%`;
 
     if(exitReason) {
-      clearInterval(monitor);
-      await exitPosition(mint, exitReason, p.entryPrice * (1 + roi/100), roi);
+      clearInterval(timer);
+      await doSell(mint, exitReason, roi, heldSecs);
     }
-  }, CHECK_INTERVAL);
+  }, CHECK_MS);
 }
 
-async function exitPosition(mint, reason, currentPrice, roi) {
+async function doSell(mint, reason, roi, heldSecs) {
   const pos = session.openPositions.get(mint);
   if(!pos) return;
-
   session.openPositions.delete(mint);
 
-  const pnlUsd  = pos.tradeSizeUsd * (roi / 100);
-  const holdSec = (Date.now() - pos.entryTimestamp) / 1000;
+  const pnlUsd  = C.TRADE_SIZE_USD * (roi / 100);
   const sign    = pnlUsd >= 0 ? '+' : '';
+  const won     = pnlUsd >= 0;
 
-  log('EXIT', `${mint.slice(0,12)}... | ${reason} | roi:${sign}${roi.toFixed(1)}% | pnl:${sign}$${pnlUsd.toFixed(3)} | held:${holdSec.toFixed(0)}s`);
+  log('EXIT', `${mint.slice(0,10)} | ${reason} | ${sign}${roi.toFixed(1)}% | ${sign}$${pnlUsd.toFixed(3)} | ${heldSecs.toFixed(1)}s`);
 
-  if(!pos.dryRun && pos.tokenAmountRaw > 0n) {
-    // Try Jupiter sell — attempt 1: normal slippage
+  // Sell
+  if(!pos.dryRun && pos.tokenRaw > 0n) {
     let sold = false;
-    const sellQuote = await jupiterQuote(mint, C.SOL_MINT, pos.tokenAmountRaw.toString(), C.SLIPPAGE_BPS);
-    if(sellQuote) {
-      const sig = await jupiterSwap(sellQuote);
-      if(sig) { sold = true; log('INFO', `Sold via Jupiter: ${sig.slice(0,20)}...`); }
+
+    // Layer 1: Jupiter normal
+    const q1 = await jupQuote(mint, C.SOL_MINT, pos.tokenRaw.toString(), C.SLIPPAGE_BPS);
+    if(q1) {
+      const s1 = await jupSwap(q1);
+      if(s1) { sold = true; log('SELL', `Jupiter sell: ${s1.slice(0,20)}...`); }
     }
 
-    // Attempt 2: retry with 50% slippage
+    // Layer 2: Jupiter 50% slippage
     if(!sold) {
-      log('WARN', `Jupiter sell failed — retrying with 50% slippage`);
-      const retryQuote = await jupiterQuote(mint, C.SOL_MINT, pos.tokenAmountRaw.toString(), 5000);
-      if(retryQuote) {
-        const sig2 = await jupiterSwap(retryQuote);
-        if(sig2) { sold = true; log('INFO', `Sold via Jupiter (high slippage): ${sig2.slice(0,20)}...`); }
+      const q2 = await jupQuote(mint, C.SOL_MINT, pos.tokenRaw.toString(), 5000);
+      if(q2) {
+        const s2 = await jupSwap(q2);
+        if(s2) { sold = true; log('SELL', `Jupiter (50% slip) sell: ${s2.slice(0,20)}...`); }
       }
     }
 
-    // Attempt 3: Pump.fun PumpPortal direct sell as last resort
+    // Layer 3: PumpPortal direct sell
     if(!sold) {
-      log('WARN', `Jupiter failed — trying PumpPortal direct sell`);
+      log('WARN', `Jupiter failed — PumpPortal fallback`);
       try {
         const r = await fetch('https://pumpportal.fun/api/trade-local', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          method:'POST', headers:{'Content-Type':'application/json'},
           body: JSON.stringify({
-            publicKey:  session.keypair.publicKey.toString(),
-            action:     'sell',
+            publicKey:   session.keypair.publicKey.toString(),
+            action:      'sell',
             mint,
-            amount:     '100%',
-            slippage:   50,
+            amount:      '100%',
+            slippage:    50,
             priorityFee: 0.0005,
-            pool:       'pump',
+            pool:        'pump',
           }),
         });
         if(r.ok) {
-          const txData = await r.arrayBuffer();
-          const tx = VersionedTransaction.deserialize(new Uint8Array(txData));
+          const buf = Buffer.from(await r.arrayBuffer());
+          const tx  = VersionedTransaction.deserialize(buf);
           tx.sign([session.keypair]);
-          const sig3 = await session.connection.sendRawTransaction(tx.serialize(), {skipPreflight:true, maxRetries:3});
-          log('INFO', `PumpPortal sell tx: ${sig3?.slice(0,20)}...`);
+          const s3 = await session.connection.sendRawTransaction(tx.serialize(), {skipPreflight:true});
+          log('SELL', `PumpPortal sell: ${s3?.slice(0,20)}...`);
         }
-      } catch(e) { log('ERROR', `PumpPortal sell failed: ${e.message}`); }
+      } catch(e) { log('ERROR', `PumpPortal: ${e.message}`); }
     }
   }
 
-  // Update session stats
-  if(pnlUsd < 0) {
-    session.dailyLossUsd  += Math.abs(pnlUsd);
-    session.consecLosses++;
-    session.blacklist.add(mint); // stop loss = blacklist
-  } else {
-    session.consecLosses = 0;
-  }
+  // Stats
+  session.totalPnl += pnlUsd;
+  if(won) session.wins++; else session.losses++;
+  const wr = session.wins + session.losses > 0
+    ? ((session.wins / (session.wins+session.losses))*100).toFixed(0) : '0';
 
-  // Save trade log
   saveTrade({
-    timestamp:       new Date().toISOString(),
-    token:           mint,
-    entryPrice:      pos.entryPrice,
-    exitPrice:       currentPrice,
-    tradeSizeUsd:    pos.tradeSizeUsd,
-    pnlPct:          parseFloat(roi.toFixed(2)),
-    pnlUsd:          parseFloat(pnlUsd.toFixed(4)),
-    entryReason:     'absorption_signal',
-    exitReason:      reason,
-    absorptionScore: pos.absorptionScore,
-    holdSeconds:     parseFloat(holdSec.toFixed(1)),
-    dryRun:          pos.dryRun,
-    sig:             pos.sig,
+    ts: new Date().toISOString(),
+    mint, reason,
+    entryPrice: pos.entryPrice,
+    roi: parseFloat(roi.toFixed(2)),
+    pnlUsd: parseFloat(pnlUsd.toFixed(4)),
+    heldSecs: parseFloat(heldSecs.toFixed(1)),
+    dryRun: pos.dryRun,
   });
 
+  const bal = await getSolBal();
+
   await discord([
-    `${pnlUsd>=0?'✅':'❌'} **EXIT** — ${mint.slice(0,12)}...`,
-    `Reason: **${reason}** | ROI: **${sign}${roi.toFixed(1)}%** | PnL: **${sign}$${pnlUsd.toFixed(3)}**`,
-    `Held: **${holdSec.toFixed(0)}s** | ${pos.dryRun?'📋 DRY RUN':'💰 LIVE'}`,
+    `${won?'✅':'❌'} **${reason.toUpperCase()}** — \`${mint.slice(0,12)}\``,
+    `${sign}${roi.toFixed(1)}% | ${sign}$${pnlUsd.toFixed(3)} | held ${heldSecs.toFixed(1)}s`,
+    `📊 ${session.wins}W/${session.losses}L (${wr}%WR) | Session PnL: ${session.totalPnl>=0?'+':''}$${session.totalPnl.toFixed(2)}`,
+    `💰 Balance: ${bal.toFixed(4)} SOL`,
   ].join('\n'));
 
-  checkKillSwitch();
+  // Blacklist after stop loss
+  if(!won) session.blacklist.add(mint);
 }
 
-// ── PUMPFUN WATCHER ───────────────────────────────────────────
-// Subscribes to new token launches via Helius WebSocket
-// Then polls DexScreener for price to drive absorption scoring
+// ── GRADUATED COIN DETECTOR ───────────────────────────────────
+// Watch pump.fun migration events via Helius WS
+// A "graduation" = token migrates from bonding curve to Raydium
+
+const recentGrads = new Set(); // prevent double-processing
 
 let ws = null;
 
-function watchNewTokens() {
+function connectWS() {
   const wsUrl = C.HELIUS_WS;
-  if(!wsUrl) {
-    log('WARN','No HELIUS_API_KEY — using polling fallback');
-    startPollingFallback();
-    return;
-  }
+  if(!wsUrl) { log('WARN','No HELIUS_API_KEY — using DexScreener polling fallback'); startDexScreenerPoll(); return; }
 
-  log('INFO', 'Connecting to Helius WebSocket for new token detection...');
+  log('BOOT','Connecting to Helius WS for graduation events...');
   ws = new WebSocket(wsUrl);
 
   ws.on('open', () => {
-    log('INFO', '✅ Helius WebSocket connected');
+    log('BOOT','✅ Helius WS connected');
+    // Subscribe to pump.fun migration program
     ws.send(JSON.stringify({
       jsonrpc:'2.0', id:1,
+      method:'logsSubscribe',
+      params:[{ mentions:[C.PUMPFUN_MIGRATION] }, { commitment:'confirmed' }],
+    }));
+    // Also watch pump.fun program for any graduation signals
+    ws.send(JSON.stringify({
+      jsonrpc:'2.0', id:2,
       method:'logsSubscribe',
       params:[{ mentions:[C.PUMPFUN_PROGRAM] }, { commitment:'confirmed' }],
     }));
@@ -628,261 +474,224 @@ function watchNewTokens() {
   ws.on('message', async (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
-      if(msg.id===1) { log('INFO',`Subscribed to pump.fun events`); return; }
       if(!msg.params?.result?.value) return;
 
-      const { logs, signature } = msg.params.result.value;
+      const { signature, logs } = msg.params.result.value;
+      if(!signature || recentGrads.has(signature)) return;
+
       const logStr = (logs||[]).join(' ');
 
-      // Only process creates, and only if we have room for more tokens
-      if(session.watchedTokens.size < 15 &&
-         (logStr.includes('InitializeMint') || logStr.includes('MintTo')) &&
-         sigQueue.length < 5) {
-        processNewTokenSig(signature);
+      // Look for migration/graduation signals
+      const isGrad = logStr.includes('WithdrawLiquidity') ||
+                     logStr.includes('MigrateToAMM') ||
+                     logStr.includes('RaydiumMigration') ||
+                     logStr.includes('migrat') ||
+                     logStr.includes('Migrate');
+
+      if(!isGrad) return;
+      recentGrads.add(signature);
+      if(recentGrads.size > 200) {
+        const first = recentGrads.values().next().value;
+        recentGrads.delete(first);
       }
+
+      log('TICK', `Graduation event detected: ${signature.slice(0,20)}...`);
+      // Slight delay then fetch the mint from the tx
+      setTimeout(() => fetchGradMint(signature), 1000);
     } catch(e){}
   });
 
-  ws.on('error', e => log('ERROR','WS: '+e.message));
+  ws.on('error', e => log('ERROR',`WS: ${e.message}`));
   ws.on('close', code => {
-    log('INFO', `WS closed (${code}) — reconnect in 5s`);
-    setTimeout(watchNewTokens, 5000);
+    log('WARN', `WS closed (${code}) — reconnect in 3s`);
+    setTimeout(connectWS, 3000);
   });
 
   setInterval(() => { if(ws?.readyState===WebSocket.OPEN) ws.ping(); }, 20000);
 }
 
-// Queue of sigs to process — batch them to avoid RPC spam
-const sigQueue = [];
-let sigQueueRunning = false;
-
-async function processNewTokenSig(sig) {
-  if(!sig) return;
-  sigQueue.push(sig);
-  if(!sigQueueRunning) drainSigQueue();
-}
-
-async function drainSigQueue() {
-  sigQueueRunning = true;
-  while(sigQueue.length > 0) {
-    // Cap watched tokens
-    if(session.watchedTokens.size >= 15) { sigQueue.length = 0; break; }
-
-    const sig = sigQueue.shift();
-    try {
-      const tx = await session.connection.getParsedTransaction(sig, {
-        maxSupportedTransactionVersion:0, commitment:'confirmed'
-      });
-      if(!tx) { await new Promise(r=>setTimeout(r,500)); continue; }
-
-      for(const b of (tx.meta?.postTokenBalances||[])) {
-        const mint = b.mint;
-        if(!mint) continue;
-
-        // Skip known tokens and stables
-        const IGNORE = new Set([
-          'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
-          'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
-          C.SOL_MINT,
-        ]);
-        if(IGNORE.has(mint)) continue;
-        if(session.watchedTokens.has(mint) || session.blacklist.has(mint)) continue;
-
-        const price = await getTokenPrice(mint);
-        // Only watch cheap meme coins, skip stables/established tokens
-        if(!price || price > 0.05) continue;
-
-        const state = initTokenState(mint, price);
-        session.watchedTokens.set(mint, state);
-        log('WATCHING', `New token: ${mint.slice(0,12)}... @ $${price.toFixed(8)}`);
-        startTokenMonitor(mint);
-        break;
-      }
-    } catch(e){}
-
-    // Rate limit: 1 RPC call per 2 seconds max
-    await new Promise(r=>setTimeout(r,2000));
-  }
-  sigQueueRunning = false;
-}
-
-async function getTokenPrice(mint) {
+async function fetchGradMint(sig) {
   try {
-    const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
-    if(r.ok) {
-      const d = await r.json();
-      const pair = d?.pairs?.[0];
-      const price = parseFloat(pair?.priceUsd||0);
-      if(price > 0) {
-        // Cache holder count on the pair
-        if(pair) getTokenPrice._holders = getTokenPrice._holders || {};
-        if(pair) getTokenPrice._holders[mint] = parseInt(pair.holders || pair.info?.holders || 0);
-        return price;
-      }
+    const tx = await session.connection.getParsedTransaction(sig, {
+      maxSupportedTransactionVersion:0, commitment:'confirmed'
+    });
+    if(!tx) return;
+
+    // Extract mint from token balances
+    for(const b of (tx.meta?.postTokenBalances||[])) {
+      const mint = b.mint;
+      if(!mint) continue;
+
+      // Skip known tokens
+      const SKIP = new Set([
+        'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+        'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+        C.SOL_MINT,
+      ]);
+      if(SKIP.has(mint)) continue;
+      if(session.watchedCoins.has(mint) || session.blacklist.has(mint)) continue;
+
+      log('TICK', `Graduated coin: ${mint.slice(0,12)}... — checking price`);
+      await watchCoin(mint);
+      break;
     }
   } catch(e){}
-  try {
-    const q = await jupiterQuote(mint, C.SOL_MINT, '1000000', 5000);
-    if(q) return (parseFloat(q.outAmount)/1e9) * C.SOL_PRICE_USD / (1000000/1e6);
-  } catch(e){}
-  return null;
-}
-getTokenPrice._holders = {};
-
-// ── TOKEN PRICE MONITOR ───────────────────────────────────────
-const tokenMonitors = new Map();
-
-function startTokenMonitor(mint) {
-  if(tokenMonitors.has(mint)) return;
-
-  // Stagger start time by token count to spread out DexScreener requests
-  const staggerMs = (tokenMonitors.size % 8) * 1000;
-
-  const interval = setInterval(async () => {
-    const state = session.watchedTokens.get(mint);
-    if(!state || state.phase === 'traded' || checkKillSwitch()) {
-      clearInterval(interval);
-      tokenMonitors.delete(mint);
-      return;
-    }
-
-    // Check age limit
-    const ageSecs = (Date.now()-state.launchTime)/1000;
-    if(ageSecs > C.MAX_TOKEN_AGE_SECS) {
-      clearInterval(interval);
-      tokenMonitors.delete(mint);
-      session.watchedTokens.delete(mint);
-      return;
-    }
-
-    const price = await getTokenPrice(mint);
-    if(!price) return;
-
-    // Simulate buy/sell detection based on price movement
-    const lastPrice = state.currentPrice;
-    const isBuy  = price >= lastPrice;
-    const isSell = price < lastPrice;
-
-    updateTokenState(state, price, isBuy, isSell, false);
-
-    // Log watching state (only interesting phases)
-    if(state.phase !== 'watching' || state.pumpPct > 20) {
-      log('WATCHING', `${mint.slice(0,12)}... $${price.toFixed(8)} | pump:${state.pumpPct.toFixed(0)}% | phase:${state.phase}`);
-    }
-
-    // Check if ready for absorption buy
-    if(state.phase === 'absorbing' && session.openPositions.size < C.MAX_OPEN_TRADES) {
-      await attemptBuy(state);
-    }
-
-  }, 8000); // 8s between checks to avoid DexScreener rate limits
-
-  tokenMonitors.set(mint, interval);
 }
 
-// ── POLLING FALLBACK ──────────────────────────────────────────
-// When no Helius key, scan DexScreener new pairs
-async function startPollingFallback() {
-  log('INFO', 'Starting DexScreener polling fallback...');
+// ── DEXSCREENER POLLING FALLBACK ──────────────────────────────
+// If no Helius key, poll DexScreener for new Raydium pairs with
+// pump.fun origin (high volume, just listed)
 
-  setInterval(async () => {
+async function startDexScreenerPoll() {
+  log('BOOT', 'Starting DexScreener new pairs polling...');
+
+  const poll = async () => {
     try {
+      // Get latest Raydium pairs — newest first
       const r = await fetch('https://api.dexscreener.com/token-profiles/latest/v1');
       if(!r.ok) return;
-      const d = await r.json();
+      const d    = await r.json();
       const pairs = Array.isArray(d) ? d : (d.pairs||[]);
 
-      for(const pair of pairs.slice(0,10)) {
+      for(const pair of pairs.slice(0,20)) {
         if(pair.chainId !== 'solana') continue;
         const mint = pair.tokenAddress || pair.baseToken?.address;
-        if(!mint || session.watchedTokens.has(mint) || session.blacklist.has(mint)) continue;
+        if(!mint) continue;
+        if(session.watchedCoins.has(mint) || session.blacklist.has(mint)) continue;
 
-        const price = parseFloat(pair.priceUsd || 0);
-        if(!price) continue;
-
-        const state = initTokenState(mint, price);
-        session.watchedTokens.set(mint, state);
-        log('WATCHING', `New token (poll): ${mint.slice(0,12)}... @ $${price.toFixed(8)}`);
-        startTokenMonitor(mint);
+        await watchCoin(mint);
       }
     } catch(e){}
-  }, 5000);
+  };
+
+  poll();
+  setInterval(poll, 8000); // poll every 8s
 }
 
-// ── STATUS LOGGER ─────────────────────────────────────────────
-function startStatusLogger() {
-  setInterval(async () => {
-    if(session.killed) return;
-    const bal     = await getSolBalance();
-    const pnl     = (bal - session.startBal) * C.SOL_PRICE_USD;
-    const sign    = pnl >= 0 ? '+' : '';
-    const open    = session.openPositions.size;
-    const watched = session.watchedTokens.size;
+// ── WATCH A GRADUATED COIN ────────────────────────────────────
+async function watchCoin(mint) {
+  if(session.watchedCoins.size >= 20) return;
+  if(session.watchedCoins.has(mint)) return;
 
-    log('INFO', `━━ Status ━━ bal:${bal.toFixed(4)} SOL | pnl:${sign}$${pnl.toFixed(2)} | open:${open} | watching:${watched} | trades/hr:${session.tradesThisHour}/${C.MAX_TRADES_PER_HOUR} | losses:${session.consecLosses}/${C.MAX_CONSEC_LOSSES}`);
+  const data = await getPrice(mint);
+  if(!data) return;
+  if(data.liq < C.MIN_LIQUIDITY_USD) {
+    log('SKIP', `${mint.slice(0,10)} liq too low: $${data.liq.toFixed(0)}`);
+    return;
+  }
+
+  const state = makeCoinState(mint, data.price, data.liq);
+  session.watchedCoins.set(mint, state);
+  log('TICK', `Watching: ${mint.slice(0,10)} @ $${data.price.toFixed(8)} liq:$${(data.liq/1000).toFixed(1)}K`);
+
+  startCoinTicker(mint);
+}
+
+// ── FAST PRICE TICKER ─────────────────────────────────────────
+// Poll each watched coin every 1.5s for momentum detection
+
+function startCoinTicker(mint) {
+  const ticker = setInterval(async () => {
+    const state = session.watchedCoins.get(mint);
+    if(!state) { clearInterval(ticker); return; }
+
+    // Remove old coins (>3 min)
+    if(Date.now() - state.firstSeen > 180000) {
+      session.watchedCoins.delete(mint);
+      clearInterval(ticker);
+      return;
+    }
+
+    // Don't track if we already entered or blacklisted
+    if(state.phase === 'entered' || state.phase === 'done' || session.blacklist.has(mint)) {
+      clearInterval(ticker);
+      session.watchedCoins.delete(mint);
+      return;
+    }
+
+    const data = await getPrice(mint);
+    if(!data) return;
+
+    updateCoin(state, data.price, data.liq);
+
+    const mom = getMomentumPct(state);
+
+    // Log interesting coins
+    if(state.ticksUp >= 2 || mom > 3) {
+      log('TICK', `${mint.slice(0,10)} $${data.price.toFixed(8)} ticks↑:${state.ticksUp} mom:${mom>=0?'+':''}${mom.toFixed(1)}% liq:$${(data.liq/1000).toFixed(1)}K`);
+    }
+
+    // ── MOMENTUM ENTRY CHECK ─────────────────────────────────
+    if(!canTrade()) return;
+    if(session.openPositions.has(mint)) return;
+
+    const passedMomentum = state.ticksUp >= C.MIN_PRICE_TICKS_UP;
+    const passedMomPct   = mom >= C.MIN_MOMENTUM_PCT;
+    const passedLiq      = data.liq >= C.MIN_LIQUIDITY_USD;
+
+    if(passedMomentum && passedMomPct && passedLiq) {
+      log('MOMENTUM', `🚀 ${mint.slice(0,10)} ENTER — ticks↑:${state.ticksUp} mom:+${mom.toFixed(1)}% liq:$${(data.liq/1000).toFixed(1)}K`);
+      await enterTrade(mint, state);
+    }
+
+  }, 1500); // 1.5s ticker — fast enough to catch momentum
+}
+
+// ── STATUS ────────────────────────────────────────────────────
+function startStatus() {
+  setInterval(async () => {
+    const bal  = await getSolBal();
+    const pnl  = session.totalPnl;
+    const sign = pnl >= 0 ? '+' : '';
+    const wr   = session.wins + session.losses > 0
+      ? ((session.wins/(session.wins+session.losses))*100).toFixed(0) : '0';
+
+    log('INFO', `━━ ${bal.toFixed(4)} SOL | pnl:${sign}$${pnl.toFixed(2)} | ${session.wins}W/${session.losses}L (${wr}%WR) | open:${session.openPositions.size} | watching:${session.watchedCoins.size} | t/hr:${session.tradesThisHour}`);
   }, 30000);
 }
 
 // ── MAIN ──────────────────────────────────────────────────────
 async function main() {
   console.log('\n╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  🎯 SNIPER EXIT ABSORPTION BOT v1.0                          ║');
-  console.log(`║  ${C.DRY_RUN ? '📋 DRY RUN MODE — no real trades' : '⚠️  LIVE MODE — real money'}                       ║`);
+  console.log('║  🚀 MOMENTUM RIDER v1.0 — Graduated Coin Scalper            ║');
+  console.log(`║  ${C.DRY_RUN ? '📋 DRY RUN' : '⚡ LIVE — REAL MONEY'}                                    ║`);
   console.log('╚══════════════════════════════════════════════════════════════╝\n');
 
-  // Validate
-  if(!C.PRIVATE_KEY) { log('ERROR','PRIVATE_KEY not set — cannot start'); process.exit(1); }
+  if(!C.PRIVATE_KEY) { log('ERROR','PRIVATE_KEY not set'); process.exit(1); }
 
-  // Init wallet
   try {
     session.keypair = Keypair.fromSecretKey(bs58.decode(C.PRIVATE_KEY));
     log('BOOT', `Wallet: ${session.keypair.publicKey.toString()}`);
-  } catch(e) { log('ERROR','Invalid PRIVATE_KEY: '+e.message); process.exit(1); }
+  } catch(e) { log('ERROR','Bad PRIVATE_KEY'); process.exit(1); }
 
-  session.connection = new Connection(C.HELIUS_RPC, {commitment:'confirmed'});
-  session.startBal   = await getSolBalance();
+  session.connection = new Connection(C.HELIUS_RPC, { commitment:'confirmed' });
+  session.startBal   = await getSolBal();
 
   log('BOOT', `Balance: ${session.startBal.toFixed(4)} SOL ($${(session.startBal*C.SOL_PRICE_USD).toFixed(2)})`);
-  log('BOOT', `Mode: ${C.DRY_RUN ? 'DRY RUN' : 'LIVE TRADING'}`);
-  log('BOOT', `TP:+${C.TAKE_PROFIT_PCT}% SL:-${C.STOP_LOSS_PCT}% Hold:${C.MAX_HOLD_SECS}s Score:${C.MIN_ABSORPTION_SCORE}`);
-  log('BOOT', `Max consec losses: ${C.MAX_CONSEC_LOSSES}`);
+  log('BOOT', `Mode: ${C.DRY_RUN ? 'DRY RUN' : '⚡ LIVE'}`);
+  log('BOOT', `TP:+${C.TAKE_PROFIT_PCT}% SL:-${C.STOP_LOSS_PCT}% Hold:${C.HOLD_SECS}s`);
+  log('BOOT', `Momentum: ${C.MIN_PRICE_TICKS_UP} ticks↑ + ${C.MIN_MOMENTUM_PCT}% in 10s | Min liq: $${C.MIN_LIQUIDITY_USD}`);
 
-  if(C.DRY_RUN) {
-    log('BOOT', '🟡 DRY RUN — set DRY_RUN=false to enable live trading');
-  } else {
-    log('BOOT', '🔴 LIVE TRADING ENABLED — real money at risk');
-    await discord('🔴 **LIVE TRADING STARTED** — Sniper Absorption Bot');
-  }
+  if(!C.DRY_RUN && session.startBal < 0.02) { log('ERROR','Balance too low'); process.exit(1); }
 
-  if(!C.DRY_RUN && session.startBal < 0.01) {
-    log('ERROR','Balance too low — fund wallet first'); process.exit(1);
-  }
-  if(C.DRY_RUN && session.startBal < 0.01) {
-    log('BOOT', '⚠️  Wallet empty but DRY RUN is on — continuing (no real trades)');
-  }
-
-  watchNewTokens();
-  startStatusLogger();
+  connectWS();
+  startStatus();
 
   await discord([
-    `🎯 **Sniper Absorption Bot ONLINE**`,
-    `Mode: **${C.DRY_RUN?'DRY RUN':'⚠️ LIVE'}** | Wallet: \`${session.keypair.publicKey.toString().slice(0,16)}...\``,
-    `TP:+${C.TAKE_PROFIT_PCT}% SL:-${C.STOP_LOSS_PCT}% Hold:${C.MAX_HOLD_SECS}s Score:≥${C.MIN_ABSORPTION_SCORE}`,
-    `Trade size:$${C.TRADE_SIZE_USD} Max loss/day:$${C.MAX_DAILY_LOSS_USD}`,
+    `🚀 **MOMENTUM RIDER v1.0 ONLINE**`,
+    `Mode: **${C.DRY_RUN?'DRY RUN':'⚡ LIVE'}** | $${C.TRADE_SIZE_USD}/trade`,
+    `TP:+${C.TAKE_PROFIT_PCT}% SL:-${C.STOP_LOSS_PCT}% Hold:${C.HOLD_SECS}s`,
+    `Entry: ${C.MIN_PRICE_TICKS_UP} ticks↑ + +${C.MIN_MOMENTUM_PCT}% momentum`,
+    `💰 ${session.startBal.toFixed(4)} SOL`,
   ].join('\n'));
 
-  log('BOOT', '✅ Bot running — watching for absorption setups...');
+  log('BOOT','✅ Watching for graduated coins with momentum...');
 }
 
 process.on('SIGINT', async () => {
-  log('INFO', 'Shutting down...');
-  // Close all open positions on exit
-  for(const [mint] of session.openPositions) {
-    await exitPosition(mint, 'shutdown', 0, 0);
-  }
-  await discord('🔴 **Sniper Bot OFFLINE**');
+  log('INFO','Shutting down...');
+  await discord('🔴 Momentum Rider OFFLINE');
   process.exit(0);
 });
-
-process.on('unhandledRejection', e => log('ERROR','Unhandled: '+e.message));
-main().catch(e => { log('ERROR','Fatal: '+e.message); process.exit(1); });
+process.on('unhandledRejection', e => log('ERROR',`Unhandled: ${e.message}`));
+main().catch(e => { log('ERROR',`Fatal: ${e.message}`); process.exit(1); });
