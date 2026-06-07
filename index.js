@@ -20,10 +20,10 @@ const C = {
   DISCORD:        process.env.DISCORD_WEBHOOK_URL || '',
 
   // Trade
-  TRADE_SIZE_USD:   parseFloat(process.env.TRADE_SIZE_USD)  || 5,
-  TAKE_PROFIT_PCT:  parseFloat(process.env.TAKE_PROFIT_PCT) || 15,   // +15% = exit
+  TRADE_SIZE_USD:   parseFloat(process.env.TRADE_SIZE_USD)  || 10,
+  TAKE_PROFIT_PCT:  parseFloat(process.env.TAKE_PROFIT_PCT) || 40,   // +40% = exit
   STOP_LOSS_PCT:    parseFloat(process.env.STOP_LOSS_PCT)   || 12,   // -12% = exit
-  HOLD_SECS:        parseInt(process.env.HOLD_SECS)         || 20,   // 20s max hold
+  HOLD_SECS:        parseInt(process.env.HOLD_SECS)         || 600,  // 10 min max hold
   MAX_OPEN:         parseInt(process.env.MAX_OPEN)          || 1,
   MAX_PER_HOUR:     parseInt(process.env.MAX_PER_HOUR)      || 30,
 
