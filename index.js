@@ -43,6 +43,7 @@ const C = {
   MIN_NEW_BUYERS:         parseInt(process.env.MIN_NEW_BUYERS_AFTER_DUMP)  || 3,
   PRICE_HOLD_SECS:        parseInt(process.env.PRICE_HOLD_SECONDS)         || 15,
   MAX_PRICE_IMPACT_PCT:   parseFloat(process.env.MAX_PRICE_IMPACT_PERCENT) || 5,
+  MIN_HOLDERS:            parseInt(process.env.MIN_HOLDERS)               || 15,
   SLIPPAGE_BPS:           parseInt(process.env.SLIPPAGE_BPS)               || 2000,
 
   SOL_PRICE_USD:          parseFloat(process.env.SOL_PRICE_USD)            || 96,
@@ -385,7 +386,14 @@ async function attemptBuy(state) {
     return;
   }
 
-  log('BUY SIGNAL', `${state.mint.slice(0,12)}... score:${score} impact:${impact.toFixed(1)}% size:$${tradeSizeUsd}`);
+  // Check minimum holders
+  const holders = getTokenPrice._holders[state.mint] || 0;
+  if(holders > 0 && holders < C.MIN_HOLDERS) {
+    log('INFO', `  Skipping — only ${holders} holders (min: ${C.MIN_HOLDERS})`);
+    return;
+  }
+
+  log('BUY SIGNAL', `${state.mint.slice(0,12)}... score:${score} impact:${impact.toFixed(1)}% holders:${holders||'?'} size:$${tradeSizeUsd}`);
 
   let sig = null;
   let entryPrice = state.currentPrice;
@@ -510,15 +518,49 @@ async function exitPosition(mint, reason, currentPrice, roi) {
   log('EXIT', `${mint.slice(0,12)}... | ${reason} | roi:${sign}${roi.toFixed(1)}% | pnl:${sign}$${pnlUsd.toFixed(3)} | held:${holdSec.toFixed(0)}s`);
 
   if(!pos.dryRun && pos.tokenAmountRaw > 0n) {
-    // Try to sell
+    // Try Jupiter sell — attempt 1: normal slippage
+    let sold = false;
     const sellQuote = await jupiterQuote(mint, C.SOL_MINT, pos.tokenAmountRaw.toString(), C.SLIPPAGE_BPS);
     if(sellQuote) {
       const sig = await jupiterSwap(sellQuote);
-      if(!sig) {
-        // Retry once with higher slippage
-        const retryQuote = await jupiterQuote(mint, C.SOL_MINT, pos.tokenAmountRaw.toString(), 5000);
-        if(retryQuote) await jupiterSwap(retryQuote);
+      if(sig) { sold = true; log('INFO', `Sold via Jupiter: ${sig.slice(0,20)}...`); }
+    }
+
+    // Attempt 2: retry with 50% slippage
+    if(!sold) {
+      log('WARN', `Jupiter sell failed — retrying with 50% slippage`);
+      const retryQuote = await jupiterQuote(mint, C.SOL_MINT, pos.tokenAmountRaw.toString(), 5000);
+      if(retryQuote) {
+        const sig2 = await jupiterSwap(retryQuote);
+        if(sig2) { sold = true; log('INFO', `Sold via Jupiter (high slippage): ${sig2.slice(0,20)}...`); }
       }
+    }
+
+    // Attempt 3: Pump.fun PumpPortal direct sell as last resort
+    if(!sold) {
+      log('WARN', `Jupiter failed — trying PumpPortal direct sell`);
+      try {
+        const r = await fetch('https://pumpportal.fun/api/trade-local', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            publicKey:  session.keypair.publicKey.toString(),
+            action:     'sell',
+            mint,
+            amount:     '100%',
+            slippage:   50,
+            priorityFee: 0.0005,
+            pool:       'pump',
+          }),
+        });
+        if(r.ok) {
+          const txData = await r.arrayBuffer();
+          const tx = VersionedTransaction.deserialize(new Uint8Array(txData));
+          tx.sign([session.keypair]);
+          const sig3 = await session.connection.sendRawTransaction(tx.serialize(), {skipPreflight:true, maxRetries:3});
+          log('INFO', `PumpPortal sell tx: ${sig3?.slice(0,20)}...`);
+        }
+      } catch(e) { log('ERROR', `PumpPortal sell failed: ${e.message}`); }
     }
   }
 
@@ -666,21 +708,26 @@ async function drainSigQueue() {
 
 async function getTokenPrice(mint) {
   try {
-    // Try DexScreener
     const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
     if(r.ok) {
       const d = await r.json();
-      const price = parseFloat(d?.pairs?.[0]?.priceUsd||0);
-      if(price > 0) return price;
+      const pair = d?.pairs?.[0];
+      const price = parseFloat(pair?.priceUsd||0);
+      if(price > 0) {
+        // Cache holder count on the pair
+        if(pair) getTokenPrice._holders = getTokenPrice._holders || {};
+        if(pair) getTokenPrice._holders[mint] = parseInt(pair.holders || pair.info?.holders || 0);
+        return price;
+      }
     }
   } catch(e){}
   try {
-    // Fallback: Jupiter quote tiny amount to get price
     const q = await jupiterQuote(mint, C.SOL_MINT, '1000000', 5000);
     if(q) return (parseFloat(q.outAmount)/1e9) * C.SOL_PRICE_USD / (1000000/1e6);
   } catch(e){}
   return null;
 }
+getTokenPrice._holders = {};
 
 // ── TOKEN PRICE MONITOR ───────────────────────────────────────
 const tokenMonitors = new Map();
