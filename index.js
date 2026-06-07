@@ -650,6 +650,9 @@ const tokenMonitors = new Map();
 function startTokenMonitor(mint) {
   if(tokenMonitors.has(mint)) return;
 
+  // Stagger start time by token count to spread out DexScreener requests
+  const staggerMs = (tokenMonitors.size % 8) * 1000;
+
   const interval = setInterval(async () => {
     const state = session.watchedTokens.get(mint);
     if(!state || state.phase === 'traded' || checkKillSwitch()) {
@@ -677,15 +680,17 @@ function startTokenMonitor(mint) {
 
     updateTokenState(state, price, isBuy, isSell, false);
 
-    // Log watching state
-    log('WATCHING', `${mint.slice(0,12)}... $${price.toFixed(8)} | pump:${state.pumpPct.toFixed(0)}% | phase:${state.phase}`);
+    // Log watching state (only interesting phases)
+    if(state.phase !== 'watching' || state.pumpPct > 20) {
+      log('WATCHING', `${mint.slice(0,12)}... $${price.toFixed(8)} | pump:${state.pumpPct.toFixed(0)}% | phase:${state.phase}`);
+    }
 
     // Check if ready for absorption buy
     if(state.phase === 'absorbing' && session.openPositions.size < C.MAX_OPEN_TRADES) {
       await attemptBuy(state);
     }
 
-  }, 3000); // check every 3s
+  }, 8000); // 8s between checks to avoid DexScreener rate limits
 
   tokenMonitors.set(mint, interval);
 }
@@ -764,8 +769,11 @@ async function main() {
     await discord('🔴 **LIVE TRADING STARTED** — Sniper Absorption Bot');
   }
 
-  if(session.startBal < 0.01) {
+  if(!C.DRY_RUN && session.startBal < 0.01) {
     log('ERROR','Balance too low — fund wallet first'); process.exit(1);
+  }
+  if(C.DRY_RUN && session.startBal < 0.01) {
+    log('BOOT', '⚠️  Wallet empty but DRY RUN is on — continuing (no real trades)');
   }
 
   watchNewTokens();
