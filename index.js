@@ -45,7 +45,6 @@ const C = {
 
   get HELIUS_RPC(){ return this.HELIUS_API_KEY ? `https://mainnet.helius-rpc.com/?api-key=${this.HELIUS_API_KEY}` : 'https://api.mainnet-beta.solana.com'; },
   get HELIUS_WS() { return this.HELIUS_API_KEY ? `wss://mainnet.helius-rpc.com/?api-key=${this.HELIUS_API_KEY}` : null; },
-  DASHBOARD_PORT: parseInt(process.env.DASHBOARD_PORT) || 3000,
 };
 
 // ── LOGGER ────────────────────────────────────────────────────
@@ -82,54 +81,6 @@ async function discord(msg) {
       body: JSON.stringify({content:msg.slice(0,1990)}),
     });
   } catch(e){}
-}
-
-// ── DASHBOARD BROADCAST SERVER ───────────────────────────────
-const http = require('http');
-const { WebSocketServer } = require('ws');
-
-const dashboardClients = new Set();
-let   dashboardServer  = null;
-
-function startDashboard() {
-  // Serve the HTML dashboard
-  const htmlServer = http.createServer((req, res) => {
-    if(req.url === '/' || req.url === '/index.html') {
-      res.writeHead(200, {'Content-Type':'text/html'});
-      fs.createReadStream(path.join(__dirname, 'dashboard.html')).pipe(res);
-    } else {
-      res.writeHead(404); res.end();
-    }
-  });
-
-  dashboardServer = new WebSocketServer({ server: htmlServer });
-
-  dashboardServer.on('connection', (ws) => {
-    dashboardClients.add(ws);
-    // Send current state immediately on connect
-    ws.send(JSON.stringify({ type:'state', data:{
-      bal:    session.startBal,
-      pnl:    session.totalPnl,
-      wins:   session.wins,
-      losses: session.losses,
-      watching: [...session.watchedCoins.keys()],
-      open:   [...session.openPositions.entries()].map(([mint,p]) => ({mint, entryPrice:p.entryPrice, tradeSol:p.tradeSol})),
-    }}));
-    ws.on('close', () => dashboardClients.delete(ws));
-    ws.on('error', () => dashboardClients.delete(ws));
-  });
-
-  htmlServer.listen(C.DASHBOARD_PORT, () => {
-    log('BOOT', `Dashboard: http://localhost:${C.DASHBOARD_PORT}`);
-  });
-}
-
-function broadcast(type, data) {
-  if(dashboardClients.size === 0) return;
-  const msg = JSON.stringify({ type, data, ts: Date.now() });
-  for(const client of dashboardClients) {
-    try { if(client.readyState === 1) client.send(msg); } catch(e){}
-  }
 }
 
 // ── SESSION ───────────────────────────────────────────────────
@@ -360,7 +311,6 @@ async function enterTrade(mint, state) {
       return;
     }
     log('BUY', `✅ ${mint.slice(0,10)} $${C.TRADE_SIZE_USD} @ $${state.price.toFixed(8)} | ${ms}ms | ${sig.slice(0,20)}...`);
-    broadcast('buy', { mint, price: state.price, sizeUsd: C.TRADE_SIZE_USD, ms, sig });
   }
 
   const tokBal = C.DRY_RUN
@@ -443,7 +393,6 @@ async function doSell(mint, reason, roi, heldSecs) {
   const won     = pnlUsd >= 0;
 
   log('EXIT', `${mint.slice(0,10)} | ${reason} | ${sign}${roi.toFixed(1)}% | ${sign}$${pnlUsd.toFixed(3)} | ${heldSecs.toFixed(1)}s`);
-  broadcast('exit', { mint, reason, roi: parseFloat(roi.toFixed(2)), pnlUsd: parseFloat(pnlUsd.toFixed(3)), heldSecs: parseFloat(heldSecs.toFixed(1)), won });
 
   // Sell
   if(!pos.dryRun && pos.tokenRaw > 0n) {
@@ -633,7 +582,6 @@ async function fetchGradMint(sig) {
 
       pendingMints.add(mint);
       log('TICK', `Graduated coin: ${mint.slice(0,12)}... — checking price`);
-      broadcast('graduation', { mint });
       watchCoin(mint).finally(() => pendingMints.delete(mint));
       break;
     }
@@ -685,7 +633,6 @@ async function watchCoin(mint) {
       const state = makeCoinState(mint, data.price, data.liq);
       session.watchedCoins.set(mint, state);
       log('TICK', `✅ Watching: ${mint.slice(0,10)} @ $${data.price.toFixed(8)} liq:$${(data.liq/1000).toFixed(1)}K`);
-      broadcast('watching', { mint, price: data.price, liq: data.liq });
       startCoinTicker(mint);
       return;
     }
@@ -730,7 +677,6 @@ function startCoinTicker(mint) {
     if(state.ticksUp >= 2 || mom > 3) {
       log('TICK', `${mint.slice(0,10)} $${data.price.toFixed(8)} ticks↑:${state.ticksUp} mom:${mom>=0?'+':''}${mom.toFixed(1)}% liq:$${(data.liq/1000).toFixed(1)}K`);
     }
-    broadcast('tick', { mint, price: data.price, liq: data.liq, ticksUp: state.ticksUp, mom: parseFloat(mom.toFixed(2)) });
 
     // ── MOMENTUM ENTRY CHECK ─────────────────────────────────
     if(!canTrade()) return;
@@ -738,11 +684,11 @@ function startCoinTicker(mint) {
 
     const passedMomentum = state.ticksUp >= C.MIN_PRICE_TICKS_UP;
     const passedMomPct   = mom >= C.MIN_MOMENTUM_PCT;
-    const passedLiq      = data.liq >= C.MIN_LIQUIDITY_USD;
+    // If liq is 0 it means we got price from Jupiter (unknown liq) — let Jupiter quote decide
+    const passedLiq      = data.liq === 0 || data.liq >= C.MIN_LIQUIDITY_USD;
 
     if(passedMomentum && passedMomPct && passedLiq) {
       log('MOMENTUM', `🚀 ${mint.slice(0,10)} ENTER — ticks↑:${state.ticksUp} mom:+${mom.toFixed(1)}% liq:$${(data.liq/1000).toFixed(1)}K`);
-      broadcast('momentum', { mint, ticksUp: state.ticksUp, mom: parseFloat(mom.toFixed(2)), liq: data.liq });
       await enterTrade(mint, state);
     }
 
@@ -786,7 +732,6 @@ async function main() {
 
   if(!C.DRY_RUN && session.startBal < 0.02) { log('ERROR','Balance too low'); process.exit(1); }
 
-  startDashboard();
   connectWS();
   startStatus();
 
