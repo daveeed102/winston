@@ -331,7 +331,8 @@ async function enterTrade(mint, state) {
   session.openPositions.set(mint, pos);
 
   await discord([
-    `${C.DRY_RUN?'📋 DRY':'⚡ LIVE'} **BUY** — \`${mint.slice(0,12)}\``,
+    `${C.DRY_RUN?'📋 DRY':'⚡ LIVE'} **BUY** — \`${mint}\``,
+    `🔗 https://dexscreener.com/solana/${mint}`,
     `💸 $${C.TRADE_SIZE_USD} | Price: $${state.price.toFixed(8)} | Liq: $${(state.liq/1000).toFixed(0)}K`,
     `📈 Momentum: +${momentumPct.toFixed(1)}% | Ticks↑: ${state.ticksUp} | Impact: ${impact.toFixed(1)}%`,
     `⏱ Riding for **${C.HOLD_SECS}s** max`,
@@ -395,49 +396,66 @@ async function doSell(mint, reason, roi, heldSecs) {
 
   // Sell
   if(!pos.dryRun && pos.tokenRaw > 0n) {
-    let sold = false;
+    let sold   = false;
+    let attempt = 0;
+    const MAX_ATTEMPTS = 30;
 
-    // Layer 1: Jupiter normal
-    const q1 = await jupQuote(mint, C.SOL_MINT, pos.tokenRaw.toString(), C.SLIPPAGE_BPS);
-    if(q1) {
-      const s1 = await jupSwap(q1);
-      if(s1) { sold = true; log('SELL', `Jupiter sell: ${s1.slice(0,20)}...`); }
-    }
+    while(!sold && attempt < MAX_ATTEMPTS) {
+      attempt++;
+      log('SELL', `Sell attempt ${attempt}/${MAX_ATTEMPTS} for ${mint.slice(0,12)}...`);
 
-    // Layer 2: Jupiter 50% slippage
-    if(!sold) {
-      const q2 = await jupQuote(mint, C.SOL_MINT, pos.tokenRaw.toString(), 5000);
-      if(q2) {
-        const s2 = await jupSwap(q2);
-        if(s2) { sold = true; log('SELL', `Jupiter (50% slip) sell: ${s2.slice(0,20)}...`); }
-      }
-    }
-
-    // Layer 3: PumpPortal direct sell
-    if(!sold) {
-      log('WARN', `Jupiter failed — PumpPortal fallback`);
+      // Layer 1: Jupiter with escalating slippage
+      const slipBps = attempt <= 5 ? C.SLIPPAGE_BPS :
+                      attempt <= 10 ? 4000 :
+                      attempt <= 20 ? 5000 : 9900; // near 100% slippage last resort
       try {
-        const r = await fetch('https://pumpportal.fun/api/trade-local', {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({
-            publicKey:   session.keypair.publicKey.toString(),
-            action:      'sell',
-            mint,
-            amount:      '100%',
-            slippage:    50,
-            priorityFee: 0.0005,
-            pool:        'pump',
-          }),
-        });
-        if(r.ok) {
-          const buf = Buffer.from(await r.arrayBuffer());
-          const tx  = VersionedTransaction.deserialize(buf);
-          tx.sign([session.keypair]);
-          const s3 = await session.connection.sendRawTransaction(tx.serialize(), {skipPreflight:true});
-          log('SELL', `PumpPortal sell: ${s3?.slice(0,20)}...`);
+        const q = await jupQuote(mint, C.SOL_MINT, pos.tokenRaw.toString(), slipBps);
+        if(q) {
+          const sig = await jupSwap(q);
+          if(sig) {
+            sold = true;
+            log('SELL', `✅ Jupiter sold (attempt ${attempt}, slip:${slipBps}bps): ${sig.slice(0,20)}...`);
+            break;
+          }
         }
-      } catch(e) { log('ERROR', `PumpPortal: ${e.message}`); }
+      } catch(e) {}
+
+      // Layer 2 (every 3rd attempt): PumpPortal direct
+      if(!sold && attempt % 3 === 0) {
+        try {
+          log('SELL', `PumpPortal attempt ${attempt}...`);
+          const r = await fetch('https://pumpportal.fun/api/trade-local', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({
+              publicKey:   session.keypair.publicKey.toString(),
+              action:      'sell',
+              mint,
+              amount:      '100%',
+              slippage:    50,
+              priorityFee: 0.001, // higher priority fee to get in fast
+              pool:        'pump',
+            }),
+          });
+          if(r.ok) {
+            const buf = Buffer.from(await r.arrayBuffer());
+            const tx  = VersionedTransaction.deserialize(buf);
+            tx.sign([session.keypair]);
+            const sig = await session.connection.sendRawTransaction(tx.serialize(), {
+              skipPreflight: true, maxRetries: 5
+            });
+            if(sig) {
+              sold = true;
+              log('SELL', `✅ PumpPortal sold (attempt ${attempt}): ${sig.slice(0,20)}...`);
+              break;
+            }
+          }
+        } catch(e) { log('WARN', `PumpPortal attempt ${attempt}: ${e.message}`); }
+      }
+
+      if(!sold) await new Promise(r => setTimeout(r, 500)); // retry every 500ms
     }
+
+    if(!sold) log('ERROR', `SELL FAILED after ${MAX_ATTEMPTS} attempts — tokens may be stuck: ${mint}`);
   }
 
   // Stats
@@ -459,7 +477,8 @@ async function doSell(mint, reason, roi, heldSecs) {
   const bal = await getSolBal();
 
   await discord([
-    `${won?'✅':'❌'} **${reason.toUpperCase()}** — \`${mint.slice(0,12)}\``,
+    `${won?'✅':'❌'} **${reason.toUpperCase()}** — \`${mint}\``,
+    `🔗 https://dexscreener.com/solana/${mint}`,
     `${sign}${roi.toFixed(1)}% | ${sign}$${pnlUsd.toFixed(3)} | held ${heldSecs.toFixed(1)}s`,
     `📊 ${session.wins}W/${session.losses}L (${wr}%WR) | Session PnL: ${session.totalPnl>=0?'+':''}$${session.totalPnl.toFixed(2)}`,
     `💰 Balance: ${bal.toFixed(4)} SOL`,
