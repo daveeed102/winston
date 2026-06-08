@@ -1,0 +1,1069 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MOMENTUM RIDER — Live Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:       #020408;
+    --panel:    #050d14;
+    --border:   #0a2a3a;
+    --green:    #00ff88;
+    --red:      #ff3355;
+    --yellow:   #ffcc00;
+    --cyan:     #00ccff;
+    --purple:   #cc44ff;
+    --text:     #7ab8d4;
+    --dim:      #2a4a5a;
+    --glow-g:   0 0 20px #00ff8877;
+    --glow-r:   0 0 20px #ff335577;
+    --glow-c:   0 0 20px #00ccff77;
+  }
+
+  * { margin:0; padding:0; box-sizing:border-box; }
+
+  body {
+    background: var(--bg);
+    font-family: 'Share Tech Mono', monospace;
+    color: var(--text);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Scanline overlay */
+  body::before {
+    content:'';
+    position: fixed; inset: 0;
+    background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.03) 2px, rgba(0,0,0,0.03) 4px);
+    pointer-events: none;
+    z-index: 1000;
+  }
+
+  /* Grid background */
+  body::after {
+    content:'';
+    position: fixed; inset: 0;
+    background-image:
+      linear-gradient(rgba(0,204,255,0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,204,255,0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .layout {
+    position: relative;
+    z-index: 1;
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 16px;
+    display: grid;
+    grid-template-rows: auto auto 1fr;
+    gap: 12px;
+    min-height: 100vh;
+  }
+
+  /* ── HEADER ── */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 20px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    clip-path: polygon(0 0, calc(100% - 20px) 0, 100% 20px, 100% 100%, 20px 100%, 0 calc(100% - 20px));
+  }
+
+  .logo {
+    font-family: 'Orbitron', monospace;
+    font-size: 22px;
+    font-weight: 900;
+    letter-spacing: 4px;
+    color: var(--cyan);
+    text-shadow: var(--glow-c);
+  }
+
+  .logo span { color: var(--green); text-shadow: var(--glow-g); }
+
+  .header-stats {
+    display: flex;
+    gap: 32px;
+    align-items: center;
+  }
+
+  .stat {
+    text-align: center;
+  }
+  .stat-label {
+    font-size: 9px;
+    letter-spacing: 2px;
+    color: var(--dim);
+    text-transform: uppercase;
+  }
+  .stat-val {
+    font-family: 'Orbitron', monospace;
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--cyan);
+  }
+  .stat-val.green { color: var(--green); text-shadow: var(--glow-g); }
+  .stat-val.red   { color: var(--red);   text-shadow: var(--glow-r); }
+
+  .connection-dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: var(--red);
+    box-shadow: 0 0 8px var(--red);
+    animation: pulse 2s infinite;
+    transition: background 0.3s, box-shadow 0.3s;
+  }
+  .connection-dot.connected {
+    background: var(--green);
+    box-shadow: 0 0 12px var(--green);
+  }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+  /* ── STATS ROW ── */
+  .stats-row {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 12px;
+  }
+
+  .stat-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    padding: 14px 18px;
+    position: relative;
+    overflow: hidden;
+    clip-path: polygon(0 0, calc(100% - 12px) 0, 100% 12px, 100% 100%, 12px 100%, 0 calc(100% - 12px));
+  }
+
+  .stat-card::before {
+    content:'';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--cyan), transparent);
+    opacity: 0.5;
+  }
+
+  .sc-label {
+    font-size: 9px;
+    letter-spacing: 2px;
+    color: var(--dim);
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+
+  .sc-val {
+    font-family: 'Orbitron', monospace;
+    font-size: 24px;
+    font-weight: 700;
+    color: var(--cyan);
+    transition: color 0.3s, text-shadow 0.3s;
+  }
+
+  .sc-val.flash-green { color: var(--green); text-shadow: var(--glow-g); }
+  .sc-val.flash-red   { color: var(--red);   text-shadow: var(--glow-r); }
+
+  /* ── MAIN GRID ── */
+  .main-grid {
+    display: grid;
+    grid-template-columns: 1fr 340px;
+    gap: 12px;
+  }
+
+  .left-col { display: flex; flex-direction: column; gap: 12px; }
+
+  /* ── PANEL BASE ── */
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    padding: 0;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .panel-header {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 9px;
+    letter-spacing: 3px;
+    color: var(--dim);
+    text-transform: uppercase;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .panel-header::before {
+    content:'';
+    width: 6px; height: 6px;
+    background: var(--cyan);
+    box-shadow: 0 0 8px var(--cyan);
+    clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
+  }
+
+  /* ── GRADUATION RADAR ── */
+  .radar-panel {
+    height: 220px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  #radar-canvas {
+    width: 100%;
+    height: calc(100% - 36px);
+    display: block;
+  }
+
+  /* ── WATCHING COINS ── */
+  .coins-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 8px;
+    padding: 12px;
+    min-height: 120px;
+  }
+
+  .coin-card {
+    border: 1px solid var(--border);
+    padding: 12px 14px;
+    position: relative;
+    overflow: hidden;
+    animation: slideIn 0.4s cubic-bezier(0.16,1,0.3,1);
+    background: rgba(0,204,255,0.03);
+    transition: border-color 0.3s;
+  }
+
+  .coin-card.hot   { border-color: rgba(255,204,0,0.4); background: rgba(255,204,0,0.04); }
+  .coin-card.entry { border-color: var(--green); background: rgba(0,255,136,0.06); animation: entryPulse 0.6s ease; }
+
+  @keyframes slideIn {
+    from { opacity:0; transform: translateX(-20px); }
+    to   { opacity:1; transform: translateX(0); }
+  }
+
+  @keyframes entryPulse {
+    0%   { box-shadow: 0 0 0 rgba(0,255,136,0); }
+    50%  { box-shadow: 0 0 30px rgba(0,255,136,0.4); }
+    100% { box-shadow: 0 0 0 rgba(0,255,136,0); }
+  }
+
+  .coin-mint {
+    font-size: 11px;
+    color: var(--cyan);
+    letter-spacing: 1px;
+    margin-bottom: 8px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .coin-price {
+    font-family: 'Orbitron', monospace;
+    font-size: 14px;
+    font-weight: 700;
+    color: white;
+    margin-bottom: 6px;
+  }
+
+  .momentum-bar-wrap {
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+    margin-bottom: 6px;
+  }
+
+  .momentum-bar {
+    height: 100%;
+    background: var(--green);
+    transition: width 0.5s ease;
+    border-radius: 2px;
+    box-shadow: 0 0 6px var(--green);
+  }
+
+  .coin-meta {
+    display: flex;
+    justify-content: space-between;
+    font-size: 10px;
+    color: var(--dim);
+  }
+
+  .ticks-up { color: var(--green); }
+  .mom-pct  { color: var(--yellow); }
+
+  /* ── ACTIVE POSITION ── */
+  .position-card {
+    margin: 12px;
+    border: 1px solid var(--green);
+    padding: 16px;
+    background: rgba(0,255,136,0.05);
+    position: relative;
+    overflow: hidden;
+    animation: posAppear 0.5s cubic-bezier(0.16,1,0.3,1);
+  }
+
+  @keyframes posAppear {
+    from { opacity:0; transform: scaleY(0.8); }
+    to   { opacity:1; transform: scaleY(1); }
+  }
+
+  .pos-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+  }
+
+  .pos-label {
+    font-family: 'Orbitron', monospace;
+    font-size: 11px;
+    letter-spacing: 2px;
+    color: var(--green);
+    text-shadow: var(--glow-g);
+  }
+
+  .pos-timer {
+    font-family: 'Orbitron', monospace;
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--yellow);
+  }
+
+  .pos-mint {
+    font-size: 11px;
+    color: var(--cyan);
+    margin-bottom: 10px;
+    word-break: break-all;
+  }
+
+  .pos-roi {
+    font-family: 'Orbitron', monospace;
+    font-size: 32px;
+    font-weight: 900;
+    text-align: center;
+    margin: 8px 0;
+    transition: color 0.3s, text-shadow 0.3s;
+  }
+
+  .pos-roi.pos { color: var(--green); text-shadow: 0 0 30px #00ff8899; }
+  .pos-roi.neg { color: var(--red);   text-shadow: 0 0 30px #ff335599; }
+
+  .tp-sl {
+    display: flex;
+    justify-content: space-between;
+    font-size: 10px;
+    color: var(--dim);
+    margin-top: 8px;
+  }
+
+  /* Progress bar for hold time */
+  .hold-bar-wrap {
+    height: 3px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+    margin-top: 10px;
+  }
+  .hold-bar {
+    height: 100%;
+    background: linear-gradient(90deg, var(--green), var(--yellow));
+    border-radius: 2px;
+    transition: width 1s linear;
+    box-shadow: 0 0 8px var(--yellow);
+  }
+
+  /* ── DOLLAR SIGNS ANIMATION ── */
+  .dollar-container {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 999;
+    overflow: hidden;
+  }
+
+  .dollar-sign {
+    position: absolute;
+    font-family: 'Orbitron', monospace;
+    font-weight: 900;
+    color: var(--green);
+    text-shadow: 0 0 20px var(--green);
+    animation: dollarFloat linear forwards;
+    pointer-events: none;
+    user-select: none;
+  }
+
+  @keyframes dollarFloat {
+    0%   { opacity:1; transform: translateY(0) rotate(0deg) scale(1); }
+    100% { opacity:0; transform: translateY(-300px) rotate(20deg) scale(0.5); }
+  }
+
+  /* ── FEED ── */
+  .feed-wrap {
+    padding: 0 12px 12px;
+    height: 260px;
+    overflow-y: auto;
+    scroll-behavior: smooth;
+  }
+
+  .feed-wrap::-webkit-scrollbar { width: 3px; }
+  .feed-wrap::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  .feed-item {
+    padding: 7px 10px;
+    border-left: 2px solid var(--border);
+    margin-bottom: 4px;
+    font-size: 11px;
+    opacity: 0;
+    animation: feedIn 0.3s ease forwards;
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+  }
+
+  @keyframes feedIn {
+    from { opacity:0; transform: translateX(-10px); }
+    to   { opacity:1; transform: translateX(0); }
+  }
+
+  .feed-item.grad    { border-color: var(--purple); color: var(--purple); }
+  .feed-item.watch   { border-color: var(--cyan);   color: var(--cyan); }
+  .feed-item.mom     { border-color: var(--yellow);  color: var(--yellow); }
+  .feed-item.buy     { border-color: var(--green);  color: var(--green); font-weight: bold; }
+  .feed-item.exit-w  { border-color: var(--green);  color: var(--green); }
+  .feed-item.exit-l  { border-color: var(--red);    color: var(--red); }
+
+  .feed-time { color: var(--dim); font-size: 10px; flex-shrink: 0; }
+
+  /* ── TRADE HISTORY ── */
+  .trade-list {
+    padding: 0 12px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 400px;
+    overflow-y: auto;
+  }
+
+  .trade-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    font-size: 11px;
+    animation: feedIn 0.3s ease forwards;
+    background: rgba(255,255,255,0.02);
+  }
+
+  .trade-item.win  { border-left: 3px solid var(--green); }
+  .trade-item.loss { border-left: 3px solid var(--red); }
+
+  .trade-mint { color: var(--cyan); font-size: 10px; max-width: 120px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .trade-pnl  { font-family: 'Orbitron', monospace; font-weight: 700; font-size: 13px; }
+  .trade-pnl.pos { color: var(--green); }
+  .trade-pnl.neg { color: var(--red); }
+  .trade-reason { color: var(--dim); font-size: 10px; }
+
+  /* ── GRADUATION ANIMATION ── */
+  .grad-flash {
+    position: fixed;
+    inset: 0;
+    background: radial-gradient(ellipse at center, rgba(204,68,255,0.15) 0%, transparent 70%);
+    pointer-events: none;
+    z-index: 998;
+    opacity: 0;
+    animation: gradFlash 1.5s ease forwards;
+  }
+
+  @keyframes gradFlash {
+    0%  { opacity:0; }
+    20% { opacity:1; }
+    100%{ opacity:0; }
+  }
+
+  /* ── EMPTY STATE ── */
+  .empty-state {
+    padding: 24px;
+    text-align: center;
+    color: var(--dim);
+    font-size: 11px;
+    letter-spacing: 2px;
+  }
+
+  /* ── BUY EXPLOSION ── */
+  @keyframes buyExplode {
+    0%  { transform: scale(1); }
+    30% { transform: scale(1.05); }
+    100%{ transform: scale(1); }
+  }
+
+  .buy-flash {
+    animation: buyExplode 0.4s ease;
+  }
+</style>
+</head>
+<body>
+
+<div class="dollar-container" id="dollarContainer"></div>
+
+<div class="layout">
+
+  <!-- HEADER -->
+  <header>
+    <div class="logo">MOMENTUM<span>RIDER</span></div>
+    <div class="header-stats">
+      <div class="stat">
+        <div class="stat-label">Session PnL</div>
+        <div class="stat-val green" id="hdr-pnl">+$0.00</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Win Rate</div>
+        <div class="stat-val" id="hdr-wr">—</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Balance</div>
+        <div class="stat-val" id="hdr-bal">— SOL</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <div class="connection-dot" id="conn-dot"></div>
+        <span style="font-size:10px;letter-spacing:1px;" id="conn-label">OFFLINE</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- STATS ROW -->
+  <div class="stats-row">
+    <div class="stat-card">
+      <div class="sc-label">Total Trades</div>
+      <div class="sc-val" id="s-trades">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="sc-label">Wins</div>
+      <div class="sc-val flash-green" id="s-wins">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="sc-label">Losses</div>
+      <div class="sc-val" id="s-losses">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="sc-label">Watching</div>
+      <div class="sc-val" id="s-watching">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="sc-label">Grads Detected</div>
+      <div class="sc-val" id="s-grads">0</div>
+    </div>
+  </div>
+
+  <!-- MAIN GRID -->
+  <div class="main-grid">
+    <div class="left-col">
+
+      <!-- ACTIVE POSITION -->
+      <div class="panel" id="pos-panel" style="display:none;">
+        <div class="panel-header">ACTIVE POSITION</div>
+        <div class="position-card" id="pos-card">
+          <div class="pos-header">
+            <div class="pos-label">● RIDING</div>
+            <div class="pos-timer" id="pos-timer">0s</div>
+          </div>
+          <div class="pos-mint" id="pos-mint">—</div>
+          <div class="pos-roi pos" id="pos-roi">+0.00%</div>
+          <div class="tp-sl">
+            <span>TP: <span style="color:var(--green)">+35%</span></span>
+            <span>SL: <span style="color:var(--red)">-45%</span></span>
+            <span>MAX: <span style="color:var(--yellow)">5min</span></span>
+          </div>
+          <div class="hold-bar-wrap">
+            <div class="hold-bar" id="hold-bar" style="width:0%"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- GRADUATION RADAR -->
+      <div class="panel radar-panel">
+        <div class="panel-header">GRADUATION RADAR</div>
+        <canvas id="radar-canvas"></canvas>
+      </div>
+
+      <!-- WATCHING COINS -->
+      <div class="panel">
+        <div class="panel-header">WATCHING COINS</div>
+        <div class="coins-grid" id="coins-grid">
+          <div class="empty-state">SCANNING FOR GRADUATED COINS...</div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- RIGHT COL -->
+    <div style="display:flex;flex-direction:column;gap:12px;">
+
+      <!-- LIVE FEED -->
+      <div class="panel" style="flex:1;">
+        <div class="panel-header">LIVE FEED</div>
+        <div class="feed-wrap" id="feed"></div>
+      </div>
+
+      <!-- TRADE HISTORY -->
+      <div class="panel">
+        <div class="panel-header">TRADE HISTORY</div>
+        <div class="trade-list" id="trade-list">
+          <div class="empty-state" style="padding:16px;">NO TRADES YET</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<script>
+// ── STATE ─────────────────────────────────────────────────────
+const state = {
+  connected: false,
+  pnl: 0, wins: 0, losses: 0, bal: 0,
+  grads: 0, watching: {},
+  position: null,
+  posStartTime: null,
+  trades: [],
+};
+
+// ── WS CONNECTION ──────────────────────────────────────────────
+const WS_URL = `ws://${location.host}`;
+let ws, reconnectTimer;
+
+function connect() {
+  ws = new WebSocket(WS_URL);
+
+  ws.onopen = () => {
+    state.connected = true;
+    document.getElementById('conn-dot').classList.add('connected');
+    document.getElementById('conn-label').textContent = 'LIVE';
+    addFeed('watch', 'Connected to bot');
+  };
+
+  ws.onmessage = (e) => {
+    try { handleMsg(JSON.parse(e.data)); } catch(err){}
+  };
+
+  ws.onclose = () => {
+    state.connected = false;
+    document.getElementById('conn-dot').classList.remove('connected');
+    document.getElementById('conn-label').textContent = 'RECONNECTING';
+    reconnectTimer = setTimeout(connect, 3000);
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+function handleMsg(msg) {
+  const { type, data } = msg;
+
+  if(type === 'state') {
+    state.bal    = data.bal || 0;
+    state.wins   = data.wins || 0;
+    state.losses = data.losses || 0;
+    updateStats();
+    return;
+  }
+
+  if(type === 'graduation') {
+    state.grads++;
+    triggerGradFlash(data.mint);
+    addFeed('grad', `GRADUATED: ${data.mint.slice(0,16)}...`);
+    updateStats();
+  }
+
+  if(type === 'watching') {
+    state.watching[data.mint] = { ...data, ticksUp: 0, mom: 0 };
+    renderCoins();
+    addFeed('watch', `Watching: ${data.mint.slice(0,16)}... @ $${data.price.toFixed(8)}`);
+    document.getElementById('s-watching').textContent = Object.keys(state.watching).length;
+  }
+
+  if(type === 'tick') {
+    if(state.watching[data.mint]) {
+      state.watching[data.mint] = { ...state.watching[data.mint], ...data };
+      updateCoinCard(data.mint);
+    }
+  }
+
+  if(type === 'momentum') {
+    if(state.watching[data.mint]) {
+      state.watching[data.mint].hot = true;
+    }
+    updateCoinCard(data.mint);
+    addFeed('mom', `🚀 MOMENTUM: ${data.mint.slice(0,16)}... +${data.mom}% | ${data.ticksUp} ticks↑`);
+  }
+
+  if(type === 'buy') {
+    state.position = { ...data, startTime: Date.now() };
+    state.posStartTime = Date.now();
+    showPosition(data);
+    spawnDollars();
+    addFeed('buy', `BUY: ${data.mint} @ $${data.price.toFixed(8)} | $${data.sizeUsd} | ${data.ms}ms`);
+    // Mark that coin as entering
+    if(state.watching[data.mint]) {
+      const card = document.querySelector(`[data-mint="${data.mint}"]`);
+      if(card) card.classList.add('entry');
+    }
+  }
+
+  if(type === 'exit') {
+    clearPosition(data);
+    state.pnl += data.pnlUsd;
+    if(data.won) state.wins++; else state.losses++;
+    addTrade(data);
+    const sign = data.pnlUsd >= 0 ? '+' : '';
+    addFeed(data.won ? 'exit-w' : 'exit-l',
+      `${data.won ? '✅' : '❌'} EXIT: ${data.mint.slice(0,16)}... | ${sign}${data.roi}% | ${sign}$${data.pnlUsd} | ${data.heldSecs}s`);
+    if(data.won) spawnDollars(true);
+    updateStats();
+    // Remove from watching
+    delete state.watching[data.mint];
+    renderCoins();
+  }
+}
+
+// ── STATS ─────────────────────────────────────────────────────
+function updateStats() {
+  const sign = state.pnl >= 0 ? '+' : '';
+  const pnlEl = document.getElementById('hdr-pnl');
+  pnlEl.textContent = `${sign}$${state.pnl.toFixed(2)}`;
+  pnlEl.className = 'stat-val ' + (state.pnl >= 0 ? 'green' : 'red');
+
+  const total = state.wins + state.losses;
+  const wr = total > 0 ? Math.round(state.wins/total*100) : 0;
+  document.getElementById('hdr-wr').textContent = total ? `${wr}%` : '—';
+  document.getElementById('hdr-bal').textContent = `${state.bal.toFixed(3)} SOL`;
+
+  document.getElementById('s-trades').textContent = total;
+  document.getElementById('s-wins').textContent   = state.wins;
+  document.getElementById('s-losses').textContent = state.losses;
+  document.getElementById('s-grads').textContent  = state.grads;
+}
+
+// ── COINS ─────────────────────────────────────────────────────
+function renderCoins() {
+  const grid = document.getElementById('coins-grid');
+  const mints = Object.keys(state.watching);
+  document.getElementById('s-watching').textContent = mints.length;
+
+  if(!mints.length) {
+    grid.innerHTML = '<div class="empty-state">SCANNING FOR GRADUATED COINS...</div>';
+    return;
+  }
+
+  // Only add new cards, update existing
+  mints.forEach(mint => {
+    if(!document.querySelector(`[data-mint="${mint}"]`)) {
+      const d = state.watching[mint];
+      const card = document.createElement('div');
+      card.className = 'coin-card' + (d.hot ? ' hot' : '');
+      card.dataset.mint = mint;
+      card.innerHTML = coinCardHTML(mint, d);
+      grid.appendChild(card);
+      // Remove empty state
+      const empty = grid.querySelector('.empty-state');
+      if(empty) empty.remove();
+    }
+  });
+}
+
+function updateCoinCard(mint) {
+  const card = document.querySelector(`[data-mint="${mint}"]`);
+  const d    = state.watching[mint];
+  if(!card || !d) return;
+
+  card.querySelector('.coin-price').textContent = `$${d.price?.toFixed(8) || '—'}`;
+  const momPct = Math.min(Math.max(d.mom || 0, 0), 30);
+  card.querySelector('.momentum-bar').style.width = `${(momPct/30)*100}%`;
+  card.querySelector('.ticks-up').textContent  = `↑${d.ticksUp || 0}`;
+  card.querySelector('.mom-pct').textContent   = `+${(d.mom||0).toFixed(1)}%`;
+  if(d.hot) card.classList.add('hot');
+}
+
+function coinCardHTML(mint, d) {
+  const momPct = Math.min(Math.max(d.mom || 0, 0), 30);
+  return `
+    <div class="coin-mint" title="${mint}">${mint}</div>
+    <div class="coin-price">$${d.price?.toFixed(8) || '—'}</div>
+    <div class="momentum-bar-wrap">
+      <div class="momentum-bar" style="width:${(momPct/30)*100}%"></div>
+    </div>
+    <div class="coin-meta">
+      <span class="ticks-up">↑${d.ticksUp || 0}</span>
+      <span class="mom-pct">+${(d.mom||0).toFixed(1)}%</span>
+      <span>$${((d.liq||0)/1000).toFixed(1)}K liq</span>
+    </div>
+  `;
+}
+
+// ── POSITION ──────────────────────────────────────────────────
+const MAX_HOLD = 300; // 5 min
+
+function showPosition(data) {
+  const panel = document.getElementById('pos-panel');
+  panel.style.display = 'block';
+  document.getElementById('pos-mint').textContent  = data.mint;
+  document.getElementById('pos-roi').textContent   = '+0.00%';
+  document.getElementById('pos-roi').className     = 'pos-roi pos';
+  document.getElementById('hold-bar').style.width  = '0%';
+}
+
+function clearPosition(data) {
+  document.getElementById('pos-panel').style.display = 'none';
+  state.position = null;
+}
+
+// Update position ROI from ticks
+setInterval(() => {
+  if(!state.position) return;
+  const heldSecs = (Date.now() - state.posStartTime) / 1000;
+  const pct      = Math.min((heldSecs / MAX_HOLD) * 100, 100);
+  document.getElementById('pos-timer').textContent = `${Math.round(heldSecs)}s`;
+  document.getElementById('hold-bar').style.width  = `${pct}%`;
+
+  // Check tick for roi update
+  const d = state.watching[state.position.mint];
+  if(d && d.price && state.position.price) {
+    const roi = ((d.price - state.position.price) / state.position.price) * 100;
+    const sign = roi >= 0 ? '+' : '';
+    const roiEl = document.getElementById('pos-roi');
+    roiEl.textContent = `${sign}${roi.toFixed(2)}%`;
+    roiEl.className   = `pos-roi ${roi >= 0 ? 'pos' : 'neg'}`;
+  }
+}, 500);
+
+// ── FEED ──────────────────────────────────────────────────────
+function addFeed(cls, text) {
+  const feed = document.getElementById('feed');
+  const now  = new Date();
+  const ts   = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}:${String(now.getSeconds()).padStart(2,'0')}`;
+  const item = document.createElement('div');
+  item.className = `feed-item ${cls}`;
+  item.innerHTML = `<span class="feed-time">${ts}</span><span>${text}</span>`;
+  feed.appendChild(item);
+  // Keep last 100
+  while(feed.children.length > 100) feed.removeChild(feed.firstChild);
+  feed.scrollTop = feed.scrollHeight;
+}
+
+// ── TRADE HISTORY ─────────────────────────────────────────────
+function addTrade(data) {
+  const list = document.getElementById('trade-list');
+  const empty = list.querySelector('.empty-state');
+  if(empty) empty.remove();
+
+  const sign = data.pnlUsd >= 0 ? '+' : '';
+  const item = document.createElement('div');
+  item.className = `trade-item ${data.won ? 'win' : 'loss'}`;
+  item.innerHTML = `
+    <div>
+      <div class="trade-mint">${data.mint}</div>
+      <div class="trade-reason">${data.reason} · ${data.heldSecs}s</div>
+    </div>
+    <div class="trade-pnl ${data.pnlUsd>=0?'pos':'neg'}">${sign}$${Math.abs(data.pnlUsd).toFixed(2)}</div>
+  `;
+  list.insertBefore(item, list.firstChild);
+  while(list.children.length > 20) list.removeChild(list.lastChild);
+  state.trades.push(data);
+}
+
+// ── DOLLAR SIGNS ──────────────────────────────────────────────
+function spawnDollars(big=false) {
+  const container = document.getElementById('dollarContainer');
+  const count = big ? 30 : 15;
+  for(let i=0;i<count;i++) {
+    setTimeout(() => {
+      const el = document.createElement('div');
+      el.className = 'dollar-sign';
+      el.textContent = '$';
+      const size = big ? (24 + Math.random()*40) : (16 + Math.random()*24);
+      el.style.fontSize  = `${size}px`;
+      el.style.left      = `${Math.random()*100}vw`;
+      el.style.top       = `${60 + Math.random()*40}vh`;
+      el.style.animationDuration = `${0.8 + Math.random()*1.2}s`;
+      el.style.animationDelay   = `${Math.random()*0.3}s`;
+      container.appendChild(el);
+      setTimeout(() => el.remove(), 2500);
+    }, i * 60);
+  }
+}
+
+// ── GRADUATION FLASH ──────────────────────────────────────────
+function triggerGradFlash(mint) {
+  const flash = document.createElement('div');
+  flash.className = 'grad-flash';
+  document.body.appendChild(flash);
+  setTimeout(() => flash.remove(), 1600);
+}
+
+// ── RADAR CANVAS ──────────────────────────────────────────────
+const canvas = document.getElementById('radar-canvas');
+const ctx    = canvas.getContext('2d');
+let   radarAngle   = 0;
+const radarBlips   = [];
+
+function resizeCanvas() {
+  canvas.width  = canvas.offsetWidth;
+  canvas.height = canvas.offsetHeight;
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+function addRadarBlip(mint) {
+  const cx = canvas.width / 2;
+  const cy = canvas.height / 2;
+  const r  = Math.random() * (Math.min(cx,cy) * 0.8);
+  const a  = radarAngle + (Math.random() * 0.4 - 0.2);
+  radarBlips.push({
+    x: cx + Math.cos(a) * r,
+    y: cy + Math.sin(a) * r,
+    age: 0,
+    label: mint.slice(0,8),
+  });
+  if(radarBlips.length > 20) radarBlips.shift();
+}
+
+function drawRadar() {
+  const w  = canvas.width;
+  const h  = canvas.height;
+  const cx = w / 2;
+  const cy = h / 2;
+  const R  = Math.min(cx, cy) * 0.9;
+
+  ctx.clearRect(0,0,w,h);
+
+  // Background
+  ctx.fillStyle = '#010810';
+  ctx.fillRect(0,0,w,h);
+
+  // Concentric rings
+  for(let i=1;i<=4;i++) {
+    ctx.beginPath();
+    ctx.arc(cx, cy, R*i/4, 0, Math.PI*2);
+    ctx.strokeStyle = 'rgba(0,204,255,0.12)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  // Cross lines
+  ctx.strokeStyle = 'rgba(0,204,255,0.08)';
+  ctx.beginPath(); ctx.moveTo(cx,cy-R); ctx.lineTo(cx,cy+R); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx-R,cy); ctx.lineTo(cx+R,cy); ctx.stroke();
+
+  // Sweep gradient
+  const sweep = ctx.createConicalGradient ? null : null;
+  // Manual sweep arc
+  const sweepLen = Math.PI * 0.4;
+  for(let i=0;i<60;i++) {
+    const a0 = radarAngle - sweepLen * (i/60);
+    const alpha = (1 - i/60) * 0.25;
+    ctx.beginPath();
+    ctx.moveTo(cx,cy);
+    ctx.arc(cx, cy, R, a0 - 0.05, a0 + 0.05);
+    ctx.closePath();
+    ctx.fillStyle = `rgba(0,255,136,${alpha})`;
+    ctx.fill();
+  }
+
+  // Sweep line
+  ctx.beginPath();
+  ctx.moveTo(cx,cy);
+  ctx.lineTo(cx + Math.cos(radarAngle)*R, cy + Math.sin(radarAngle)*R);
+  ctx.strokeStyle = 'rgba(0,255,136,0.9)';
+  ctx.lineWidth = 2;
+  ctx.shadowColor = '#00ff88';
+  ctx.shadowBlur = 8;
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  // Blips
+  radarBlips.forEach(b => {
+    b.age++;
+    const fade = Math.max(0, 1 - b.age/120);
+    if(fade <= 0) return;
+
+    // Ping ring
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, 3 + (b.age%30)*0.3, 0, Math.PI*2);
+    ctx.strokeStyle = `rgba(0,255,136,${fade*0.5})`;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // Dot
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, 3, 0, Math.PI*2);
+    ctx.fillStyle = `rgba(0,255,136,${fade})`;
+    ctx.shadowColor = '#00ff88';
+    ctx.shadowBlur = 8;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+
+    // Label
+    ctx.fillStyle = `rgba(0,204,255,${fade*0.8})`;
+    ctx.font = '9px Share Tech Mono';
+    ctx.fillText(b.label, b.x + 6, b.y - 4);
+  });
+
+  // Center dot
+  ctx.beginPath();
+  ctx.arc(cx,cy,4,0,Math.PI*2);
+  ctx.fillStyle = '#00ccff';
+  ctx.shadowColor = '#00ccff';
+  ctx.shadowBlur = 12;
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  radarAngle += 0.02;
+  requestAnimationFrame(drawRadar);
+}
+
+drawRadar();
+
+// Add blip on graduation
+const origHandleMsg = handleMsg;
+window._handleMsg = handleMsg;
+// Patch graduation to also add blip
+const _h = handleMsg;
+window.handleMsg = (msg) => {
+  _h(msg);
+  if(msg.type === 'graduation') addRadarBlip(msg.data.mint);
+};
+// Replace global
+ws?.addEventListener && null; // ws not set yet, patched below
+
+// ── RECONNECT PATCH ───────────────────────────────────────────
+// Override connect to use patched handler
+const _connect = connect;
+function connectPatched() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => {
+    state.connected = true;
+    document.getElementById('conn-dot').classList.add('connected');
+    document.getElementById('conn-label').textContent = 'LIVE';
+    addFeed('watch', 'Connected to bot');
+  };
+  ws.onmessage = (e) => {
+    try { window.handleMsg(JSON.parse(e.data)); } catch(err){}
+  };
+  ws.onclose = () => {
+    state.connected = false;
+    document.getElementById('conn-dot').classList.remove('connected');
+    document.getElementById('conn-label').textContent = 'RECONNECTING';
+    setTimeout(connectPatched, 3000);
+  };
+  ws.onerror = () => ws.close();
+}
+
+connectPatched();
+</script>
+</body>
+</html>
